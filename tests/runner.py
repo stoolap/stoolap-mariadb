@@ -223,7 +223,22 @@ class ServerCtx:
             f"--loose-stoolap-dsn={self.dsn}",
             "--innodb-buffer-pool-size=64M",
             "--innodb-flush-log-at-trx-commit=2",
+            # Pin server charset/collation for portability across distros.
+            # Brew MariaDB defaults to utf8mb4/utf8mb4_general_ci; Debian/
+            # Ubuntu apt builds default to latin1/latin1_swedish_ci, which
+            # silently changes how the ci-collation fixtures behave (the
+            # accent-fold tests in case_02 expect 'e' = 'é' under
+            # utf8mb4_general_ci's MariaDB-specific folding rules).
+            "--character-set-server=utf8mb4",
+            "--collation-server=utf8mb4_general_ci",
         ]
+        # mariadbd refuses to run as root unless --user is explicit;
+        # GitHub-hosted runners use the `runner` user so they don't trip
+        # this guard, but Docker containers (and any local dev setup
+        # that runs as root) do. Allow --user override via env so the
+        # same runner.py works in both worlds.
+        if os.geteuid() == 0:
+            argv.append(f"--user={os.environ.get('MARIADBD_USER', 'root')}")
         self.proc = subprocess.Popen(argv,
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL,

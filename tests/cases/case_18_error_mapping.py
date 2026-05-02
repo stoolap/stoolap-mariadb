@@ -88,39 +88,43 @@ INSERT INTO conf_t VALUES (1, 1);
                   "SELECT * FROM no_such_table_for_real_t", 1146)
 
     h.section("Concurrency / locking -> ER_LOCK_DEADLOCK (1213)")
-    # Session A holds an in-flight UPDATE on conf_t row 1; session B
-    # tries to UPDATE the same row and stoolap emits "row N has
-    # uncommitted changes from transaction M".
-    a = h.run_async("""
-START TRANSACTION;
-UPDATE conf_t SET n = 2 WHERE id = 1;
-SELECT SLEEP(0.4);
-COMMIT;
-""")
-    time.sleep(0.05)
-    conn_b, cur_b = h.open_session(autocommit=False)
+    # Open A first and let it hold an in-flight UPDATE on row 1; A
+    # never commits within the section so the row stays locked.
+    # Then B (a separate connection in autocommit mode) tries to
+    # UPDATE the same row and must see ER_LOCK_DEADLOCK (1213,
+    # SQLSTATE 40001). Avoiding the run_async/sleep race makes the
+    # test deterministic across runners (real Linux, macOS, Docker
+    # emulation), where subprocess spawn timing was flipping which
+    # session won the row.
+    conn_a, cur_a = h.open_session(autocommit=False)
+    cur_a.execute("START TRANSACTION")
+    cur_a.execute("UPDATE conf_t SET n = 2 WHERE id = 1")
     try:
-        cur_b.execute("START TRANSACTION")
+        b_errno = None
+        b_msg = ""
+        conn_b, cur_b = h.open_session(autocommit=True)
         try:
             cur_b.execute("UPDATE conf_t SET n = 3 WHERE id = 1")
-            cur_b.execute("COMMIT")
-            h._fail("concurrent UPDATE conflict surfaces as 1213",
-                    "no error from session B (expected deadlock-class)")
         except mysql.connector.Error as e:
-            if e.errno == 1213:
-                h._pass("concurrent UPDATE conflict surfaces as 1213")
-            else:
-                h._fail("concurrent UPDATE conflict surfaces as 1213",
-                        f"expected: errno 1213",
-                        f"actual:   errno {e.errno}: {e}")
+            b_errno = e.errno
+            b_msg = str(e)
+        finally:
+            cur_b.close()
+            conn_b.close()
+
+        if b_errno == 1213:
+            h._pass("concurrent UPDATE conflict surfaces as 1213")
+        else:
+            h._fail("concurrent UPDATE conflict surfaces as 1213",
+                    f"expected: errno 1213",
+                    f"actual:   errno {b_errno}: {b_msg}")
+    finally:
         try:
-            cur_b.execute("ROLLBACK")
+            cur_a.execute("ROLLBACK")
         except Exception:
             pass
-    finally:
-        cur_b.close()
-        conn_b.close()
-    a.wait()
+        cur_a.close()
+        conn_a.close()
 
     h.section("Drift detector: Stoolap_unmapped_errors stayed at baseline")
     final_unmapped = _unmapped(h)

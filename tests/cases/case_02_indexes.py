@@ -194,7 +194,12 @@ INSERT INTO comp_so VALUES ('apple',2),('Apple',4),('berry',5);
         "SELECT comp_ci.s, comp_ci.n FROM comp_so "
         "JOIN comp_ci FORCE INDEX(ix) "
         "ON comp_ci.s = comp_so.s AND comp_ci.n = comp_so.n "
-        "ORDER BY comp_ci.s, comp_ci.n")
+        # Add a binary DESC tiebreaker so ci-equivalent rows (apple
+        # vs APPLE) land in a deterministic order across platforms.
+        # Without it, macOS happens to surface lowercase first; Linux
+        # MariaDB puts uppercase first. Both are SQL-correct under ci
+        # ORDER BY, but the assertion below pins a literal sequence.
+        "ORDER BY comp_ci.s, comp_ci.n, BINARY(comp_ci.s) DESC")
     # ci('apple') matches s in {apple, APPLE}; AND n filters:
     #   so('apple',2) -> {(apple,2),(APPLE,2)}
     #   so('Apple',4) -> {(apple,4)}

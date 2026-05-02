@@ -307,11 +307,20 @@ class Harness:
 
         def wait(self, timeout: Optional[float] = None) -> str:
             if self._output is None:
+                # Don't use Popen.communicate() here. We intentionally
+                # closed stdin in __init__ (so the subprocess sees EOF
+                # and starts processing while the test sleeps). On
+                # Linux, communicate() iterates stdin in its poll loop
+                # and raises ValueError("I/O operation on closed file");
+                # macOS is more forgiving and lets it through. Read
+                # stdout directly and wait on the process instead.
                 try:
-                    out, _ = self.proc.communicate(timeout=timeout)
+                    out = self.proc.stdout.read() if self.proc.stdout else ""
+                    self.proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
-                    out, _ = self.proc.communicate()
+                    self.proc.wait()
+                    out = ""
                 self._output = out or ""
             return self._output
 
