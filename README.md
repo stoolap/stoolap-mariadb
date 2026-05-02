@@ -308,16 +308,20 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 
 ### Prerequisites
 
-1. MariaDB 11.4 server-internal headers. On macOS via Homebrew:
+1. **MariaDB 11.4 server-internal headers.** `cmake/FindMariaDB.cmake`
+   auto-discovers the install across the common layouts:
 
-   ```sh
-   brew install mariadb@11.4
-   ```
+   | Platform | Install command | Auto-detected at |
+   | --- | --- | --- |
+   | macOS (Homebrew) | `brew install mariadb@11.4` | `/opt/homebrew/opt/mariadb@11.4` (Apple Silicon) or `/usr/local/opt/mariadb@11.4` (Intel) |
+   | Debian / Ubuntu | `sudo apt-get install mariadb-server libmariadbd-dev` (after enabling MariaDB's official repo at https://r.mariadb.com/downloads/mariadb_repo_setup) | `/usr/include/mysql/server/private/` |
+   | Red Hat / Fedora | `sudo dnf install mariadb-server mariadb-server-devel` | `/usr/include/mariadb/server/private/` |
+   | Source build | `cmake --install build --prefix "$PREFIX"` from a MariaDB checkout, then `-DMariaDB_ROOT="$PREFIX"` | wherever `$PREFIX/include/mysql/server/private/handler.h` lives |
 
-   That ships everything under
-   `/opt/homebrew/opt/mariadb@11.4/include/mysql/server`.
+   The find module also tries `mariadb_config --prefix` as a last resort.
+   Pass `-DMariaDB_ROOT=/explicit/path` to override discovery.
 
-2. A release build of Stoolap with the FFI feature:
+2. **A release build of Stoolap with the FFI feature:**
 
    ```sh
    cd ../stoolap
@@ -329,38 +333,36 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 ### Compile
 
 ```sh
-cmake -S . -B build \
-  -DMariaDB_ROOT=/opt/homebrew/opt/mariadb@11.4 \
-  -DSTOOLAP_DIR=../stoolap
+cmake -S . -B build -DSTOOLAP_DIR=../stoolap
 cmake --build build -j
 ```
 
-`MARIADB_PREFIX` remains accepted as a backwards-compatible alias. If building
-MariaDB from source, install it to a prefix first (`cmake --install build
---prefix "$PREFIX"`), then pass `-DMariaDB_ROOT="$PREFIX"` so the headers live
-under `include/mysql/server/private/`.
+`MariaDB_ROOT` only needs to be passed if auto-discovery missed your install.
+The legacy `MARIADB_PREFIX` is accepted as a backwards-compatible alias.
 
-The output is `build/ha_stoolap.so` (.so on Linux, .so with
-`SUFFIX ".so"` on macOS too. The MariaDB plugin loader looks for the
-literal `.so` extension on Mach-O modules).
+The output is `build/ha_stoolap.so` (`.so` on Linux; on macOS the
+target also uses the `.so` suffix because the MariaDB plugin loader
+looks for a literal `.so` extension on Mach-O modules).
 
 ### Build-flag rationale
 
 Already encoded in `CMakeLists.txt`, but worth knowing:
 
-- `DBUG_OFF`, `NDEBUG` are defined. Brew's `mariadbd` is a release
-  build and does not export `_db_keyword_` etc.; any `DBUG_*` macro in
-  our headers would fail to dlopen.
+- `DBUG_OFF`, `NDEBUG` are defined. Distribution `mariadbd` binaries are
+  release builds and do not export `_db_keyword_` etc.; any `DBUG_*` macro
+  in our headers would fail to `dlopen`.
 - No `-fvisibility=hidden`. The `maria_declare_plugin` macro emits
   `_maria_plugin_interface_version_` and `_maria_plugin_declarations_`
   without `visibility("default")`, so they vanish under hidden
   visibility and the server reports "Can't find symbol".
 - No `-fno-rtti`. MariaDB's `field.h` uses `dynamic_cast` inside
   inline `DBUG_ASSERT`s.
-- `sql_class.h` is intentionally avoided in the row-pump translation
-  unit; it transitively pulls `wsrep/*.hpp`, which the brewed headers
-  reference via `WITH_WSREP=1` in `my_config.h` but do not ship.
-  `sql_print_*` are declared in `log.h`, which is enough.
+- `sql_class.h` is intentionally avoided in the hot translation units;
+  it transitively pulls `wsrep/*.hpp`, which Homebrew's MariaDB
+  references via `WITH_WSREP=1` in `my_config.h` but does not ship.
+  We vendor those headers under `third_party/` so the build works on
+  any layout (apt, brew, source). `sql_print_*` is declared in `log.h`,
+  which is enough for the row-pump TU.
 - macOS link: `-undefined dynamic_lookup`. Linux link:
   `-Wl,--unresolved-symbols=ignore-in-shared-libs`. Server symbols
   resolve at `dlopen` time inside `mariadbd`.
@@ -370,8 +372,12 @@ Already encoded in `CMakeLists.txt`, but worth knowing:
 ## Install
 
 ```sh
-cp build/ha_stoolap.so /opt/homebrew/opt/mariadb@11.4/lib/plugin/
+sudo install -m 0755 build/ha_stoolap.so "$(mariadb_config --plugindir)/"
 ```
+
+`mariadb_config --plugindir` resolves to `/opt/homebrew/opt/mariadb@11.4/lib/plugin`
+on macOS (Brew), `/usr/lib/mysql/plugin` on Debian/Ubuntu, `/usr/lib64/mysql/plugin`
+on Red Hat/Fedora. CMake also exposes the discovered path as `MariaDB_PLUGIN_DIR`.
 
 Plugin maturity is `MariaDB_PLUGIN_MATURITY_ALPHA`. The server default
 is GAMMA, so start `mariadbd` with `--plugin-maturity=alpha`:
@@ -426,16 +432,23 @@ Session-level (`SET SESSION ...`):
 
 ### Smoke test (isolated datadir)
 
+Assumes `mariadbd` / `mariadb` / `mariadb-install-db` / `mariadb_config`
+are on `PATH`. On Homebrew that means
+`brew --prefix mariadb@11.4`/bin is on `PATH`; on apt/dnf installs the
+binaries land in `/usr/sbin` and `/usr/bin` directly.
+
 ```sh
+PLUGIN_DIR="$(mariadb_config --plugindir)"
 rm -rf /tmp/stoolap-test-data
-/opt/homebrew/opt/mariadb@11.4/bin/mariadb-install-db --no-defaults \
+
+mariadb-install-db --no-defaults \
   --datadir=/tmp/stoolap-test-data \
   --auth-root-authentication-method=normal
 
-/opt/homebrew/opt/mariadb@11.4/bin/mariadbd --no-defaults \
+mariadbd --no-defaults \
   --datadir=/tmp/stoolap-test-data \
   --socket=/tmp/stoolap-test.sock --skip-networking \
-  --plugin-dir=/opt/homebrew/opt/mariadb@11.4/lib/plugin \
+  --plugin-dir="$PLUGIN_DIR" \
   --plugin-maturity=alpha &
 
 mariadb --no-defaults -S /tmp/stoolap-test.sock -uroot -e \
@@ -445,6 +458,10 @@ mariadb --no-defaults -S /tmp/stoolap-test.sock -uroot -e \
 `--no-defaults` is essential: a `mysqlx-bind-address` from a different
 MariaDB install in `/etc/my.cnf` or `~/.my.cnf` will crash 11.4 at
 startup.
+
+The Python test runner (`tests/runner.py`) automates this dance and
+spawns its own private `mariadbd`; you only need the manual smoke test
+when validating an install layout.
 
 ## Testing
 

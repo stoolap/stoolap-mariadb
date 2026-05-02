@@ -95,7 +95,7 @@ jobs:
           if-no-files-found: error
 
   test-macos:
-    name: Test on macOS (${{ matrix.version_label }}, MariaDB ${{ env.MARIADB_VERSION }})
+    name: Test on macOS (${{ matrix.version_label }}, MariaDB 11.4)
     needs: build-lib
     runs-on: macos-latest
     strategy:
@@ -151,7 +151,7 @@ jobs:
           if-no-files-found: ignore
 
   test-linux:
-    name: Test on Ubuntu (${{ matrix.version_label }}, MariaDB ${{ env.MARIADB_VERSION }})
+    name: Test on Ubuntu (${{ matrix.version_label }}, MariaDB 11.4)
     needs: build-lib
     runs-on: ubuntu-latest
     strategy:
