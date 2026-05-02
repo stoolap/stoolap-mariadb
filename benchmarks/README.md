@@ -15,7 +15,11 @@ timings let us report:
 - **min**: best-case latency (warm cache, no contention)
 - **median**: the typical case
 - **p95**: tail latency
-- **ops/s**: thoughput derived from the median
+- **ops/s**: throughput derived from the median
+- **score_us**: 10% trimmed median per side when there are at least
+  20 samples; plain median otherwise. Ratios, SCORE, and baseline
+  checks use this value so sub-50us operations do not turn scheduler
+  noise into fake wins.
 
 Each operation also has its EXPLAIN captured once. Cases where STOOLAP
 is slower than InnoDB get their EXPLAIN dumped at the end so we can
@@ -29,7 +33,7 @@ test runner does this:
 ```sh
 # Brings up an isolated mariadbd on /tmp/stoolap-test.sock and leaves
 # it running for repeated runs.
-KEEP_RUNNING=1 tests/run_all.sh 14_scale
+KEEP_RUNNING=1 python3 tests/runner.py 14_scale
 ```
 
 Then:
@@ -51,19 +55,21 @@ rm -f /tmp/stoolap-test.sock /tmp/stoolap-test.pid
 
 The bench can compare the current run against a committed baseline
 (`benchmarks/baseline.json`). It exits non-zero if any operation
-breaks one of two budgets:
+breaks a budget. Ratios use a 10% tie band: STOOLAP wins at
+`InnoDB / STOOLAP >= 1.10`, InnoDB wins at `<= 0.90`, and everything
+between is tied.
 
-- **Win regression**: an operation where STOOLAP was faster than InnoDB
-  in the baseline now has a STOOLAP median that grew by more than
-  `--win-regress-pct` percent (default: 15%).
-- **Loss worsened**: an operation where STOOLAP was slower than InnoDB
-  in the baseline now has a worse `InnoDB / STOOLAP` ratio by more
-  than `--loss-worsen-pct` percent (default: 10%). A loss recovering
-  toward parity is *not* an alert.
+- **Win regression**: a baseline STOOLAP win has `score_us` grow by
+  more than `--win-regress-pct` percent.
+- **Tie regression**: a baseline tie either has STOOLAP `score_us`
+  grow beyond the threshold, or crosses into an InnoDB win.
+- **Loss deepened**: a baseline InnoDB win crosses below `0.80x`.
 
 ```sh
-# Regenerate the baseline (commit the result):
-python3 benchmarks/bench.py --write-baseline benchmarks/baseline.json
+# Regenerate the baseline on the canonical machine (commit the result):
+python3 benchmarks/bench.py \
+  --write-baseline benchmarks/baseline.json \
+  --update-baseline-i-promise
 
 # CI gate:
 python3 benchmarks/bench.py --check benchmarks/baseline.json

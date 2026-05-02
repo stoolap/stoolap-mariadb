@@ -29,6 +29,7 @@
 #include "stoolap_bridge.h"
 #include "stoolap_packet.h"
 #include "stoolap_thd_context.h"
+#include "stoolap_thd_inspect.h"
 
 #include <cctype>
 #include <chrono>
@@ -44,15 +45,6 @@ namespace stoolap_mariadb {
 class Engine;
 }
 extern stoolap_mariadb::Engine g_engine;
-
-// Defined in ha_stoolap.cc. Returns 1 when the session has set
-// stoolap_trust_binary_strings = ON, opting into ci-collation bypass.
-extern "C" int stoolap_thd_trust_binary_strings(THD* thd);
-
-// Defined in ha_stoolap.cc. Returns 1 when the session has set
-// stoolap_explain_pushdown = ON; the factory then runs EXPLAIN of the
-// pushed SQL through stoolap and dumps the plan to the server log.
-extern "C" int stoolap_thd_explain_pushdown(THD* thd);
 
 // Defined in ha_stoolap.cc. Same logic external_lock uses to register
 // the engine with MariaDB's tx manager and open a stoolap tx when the
@@ -75,42 +67,6 @@ extern int report_stoolap_error(const char* msg);
 // ... on column X" message, returns the matching MariaDB key index so
 // the handler can publish errkey for ON DUPLICATE KEY / REPLACE.
 extern unsigned guess_errkey(const char* msg, TABLE_SHARE* share);
-
-// Exposed to ha_stoolap.cc (which intentionally doesn't include sql_lex.h
-// to keep wsrep header dependencies minimal). Reports whether the THD's
-// outermost SELECT has an explicit LIMIT clause; rnd_init uses this to
-// pick between Tier 3 buffered scan and the streaming row pump.
-extern "C" int stoolap_thd_has_explicit_limit(THD* thd) {
-    if (!thd || !thd->lex) return 0;
-    SELECT_LEX* sel = thd->lex->first_select_lex();
-    if (!sel) return 0;
-    return sel->limit_params.explicit_limit ? 1 : 0;
-}
-
-// Exposed to ha_stoolap.cc::cond_push so it can route UPDATE/DELETE
-// through the direct path without including sql_class.h.
-extern "C" int stoolap_thd_is_update_or_delete(THD* thd) {
-    if (!thd || !thd->lex) return 0;
-    const int cmd = thd->lex->sql_command;
-    return (cmd == SQLCOM_UPDATE || cmd == SQLCOM_DELETE) ? 1 : 0;
-}
-
-// Exposed to ha_stoolap.cc::start_bulk_insert. Returns 1 when the
-// INSERT shape needs MariaDB to drive per-row dup-key recovery:
-// INSERT IGNORE (ignore=1, drop conflicting rows + emit warnings),
-// REPLACE (DUP_REPLACE, delete-then-insert per dup), and
-// INSERT ... ON DUPLICATE KEY UPDATE (DUP_UPDATE, update-existing
-// per dup). For these the bulk batching path is unsafe: stoolap's
-// stmt_exec_batch is all-or-nothing, so a single dup aborts the
-// whole batch and the caller-side recovery never gets to run --
-// silently dropping every non-conflicting row in the batch.
-extern "C" int stoolap_thd_needs_per_row_dup_handling(THD* thd) {
-    if (!thd || !thd->lex) return 0;
-    if (thd->lex->ignore) return 1;
-    if (thd->lex->duplicates == DUP_REPLACE) return 1;
-    if (thd->lex->duplicates == DUP_UPDATE) return 1;
-    return 0;
-}
 
 // Brewed mariadbd doesn't ship the my_print_error_service struct that
 // `mysql/plugin.h` rewires my_error / my_printf_error through, so we undef

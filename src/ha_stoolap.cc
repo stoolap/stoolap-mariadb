@@ -24,6 +24,7 @@
 #include "stoolap_thd_context.h"
 #include "stoolap_packet.h"
 #include "ha_stoolap_select.h"
+#include "stoolap_thd_inspect.h"
 
 #include <cctype>
 #include <cstdio>
@@ -38,30 +39,6 @@
 // We declare it locally to avoid pulling in sql_class.h (which would drag
 // wsrep headers brew doesn't ship).
 extern "C" LEX_STRING* thd_query_string(MYSQL_THD thd);
-
-// Defined in ha_stoolap_select.cc. Returns 1 when the THD's outermost
-// SELECT has an explicit LIMIT clause -- signals rnd_init to keep the
-// streaming path so MariaDB can stop early instead of paying the cost of
-// fetch_all materialising the whole result.
-extern "C" int stoolap_thd_has_explicit_limit(MYSQL_THD thd);
-
-// Defined in ha_stoolap.cc itself but exposed for cond_push: returns 1
-// when stoolap_trust_binary_strings session var is on.
-extern "C" int stoolap_thd_trust_binary_strings(MYSQL_THD thd);
-
-// Defined in ha_stoolap_select.cc: classifies the current statement as
-// SQLCOM_UPDATE or SQLCOM_DELETE without dragging sql_class.h into this
-// translation unit. Returns 1 if so, 0 otherwise.
-extern "C" int stoolap_thd_is_update_or_delete(MYSQL_THD thd);
-
-// Defined in ha_stoolap_select.cc: returns 1 when the current INSERT
-// statement is INSERT IGNORE, REPLACE, or INSERT ... ON DUPLICATE KEY
-// UPDATE -- shapes where MariaDB needs to see per-row dup callbacks
-// to drive its recovery (skip / replace / update). start_bulk_insert
-// uses this to opt out of bulk batching, since stoolap's batch is
-// all-or-nothing and would silently drop the rest of the batch on
-// the first dup.
-extern "C" int stoolap_thd_needs_per_row_dup_handling(MYSQL_THD thd);
 
 // Externally visible so the direct DML helper in ha_stoolap_select.cc can
 // gate its eligibility check on `tl->table->file->ht == stoolap_hton`.
@@ -374,8 +351,8 @@ int map_stoolap_error(const char* msg) {
     enum Anchor : uint8_t { PREFIX, CONTAINS };
     struct Pattern {
         std::string_view needle;
-        int              ha_err;
-        Anchor           anchor;
+        int ha_err;
+        Anchor anchor;
     };
     auto matches = [&](const Pattern& p) {
         if (p.anchor == PREFIX) {
@@ -391,8 +368,8 @@ int map_stoolap_error(const char* msg) {
     // "does not exist" which would otherwise route to NO_SUCH_TABLE).
     static constexpr Pattern kTable[] = {
         // ---- Constraint violations (DUP_KEY) ---------------------------
-        {"primary key constraint failed",    HA_ERR_FOUND_DUPP_KEY,    PREFIX},
-        {"unique constraint failed",         HA_ERR_FOUND_DUPP_KEY,    PREFIX},
+        {"primary key constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
+        {"unique constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
 
         // ---- Foreign key violation -------------------------------------
         {"foreign key constraint violation", HA_ERR_NO_REFERENCED_ROW, PREFIX},
@@ -400,37 +377,37 @@ int map_stoolap_error(const char* msg) {
         // ---- NOT NULL / CHECK (no specific HA_ERR; surface as 1296
         //      with the stoolap text via report_stoolap_error). Keep
         //      anchored so future similar messages don't match by accident.
-        {"not null constraint failed",       HA_ERR_GENERIC,           PREFIX},
-        {"CHECK constraint failed",          HA_ERR_GENERIC,           PREFIX},
+        {"not null constraint failed", HA_ERR_GENERIC, PREFIX},
+        {"CHECK constraint failed", HA_ERR_GENERIC, PREFIX},
 
         // ---- Table / view lifecycle ------------------------------------
         // "table 'X' already exists" / "view 'X' already exists" /
         // "index 'X' already exists" all map to the same MariaDB error.
-        {"' already exists",                 HA_ERR_TABLE_EXIST,       CONTAINS},
+        {"' already exists", HA_ERR_TABLE_EXIST, CONTAINS},
         // "table 'X' not found" / "view 'X' not found" /
         // "table or view 'X' not found"; "doesn't exist" doesn't appear
         // in stoolap's error.rs but is plumbed in via MariaDB's frame.
-        {"' not found",                      HA_ERR_NO_SUCH_TABLE,     CONTAINS},
+        {"' not found", HA_ERR_NO_SUCH_TABLE, CONTAINS},
 
         // ---- Concurrency / locking -------------------------------------
         // "row N has uncommitted changes from transaction M" (write
         // conflict against an in-flight tx) and the truncate-blocked
         // variant "cannot truncate table: active transactions have
         // uncommitted changes". Both map to deadlock-class for client retry.
-        {"uncommitted changes",              HA_ERR_LOCK_DEADLOCK,     CONTAINS},
-        {"write conflict",                   HA_ERR_LOCK_DEADLOCK,     CONTAINS},
+        {"uncommitted changes", HA_ERR_LOCK_DEADLOCK, CONTAINS},
+        {"write conflict", HA_ERR_LOCK_DEADLOCK, CONTAINS},
         // "failed to acquire lock: ..." -- lock-wait timeout class. (We
         // don't currently distinguish DEADLOCK vs LOCK_WAIT_TIMEOUT
         // because stoolap doesn't expose the wait/abort distinction over
         // the FFI yet; both surface as 40001 SQLSTATE.)
-        {"failed to acquire lock",           HA_ERR_LOCK_DEADLOCK,     PREFIX},
+        {"failed to acquire lock", HA_ERR_LOCK_DEADLOCK, PREFIX},
 
         // ---- Capability errors (stoolap declines a request that
         //      MariaDB asked for, e.g. "only DML supported in tx").
         //      Surface as ER_ILLEGAL_HA so apps can distinguish from
         //      runtime failures.
-        {"not supported",                    HA_ERR_UNSUPPORTED,       CONTAINS},
-        {"unsupported",                      HA_ERR_UNSUPPORTED,       CONTAINS},
+        {"not supported", HA_ERR_UNSUPPORTED, CONTAINS},
+        {"unsupported", HA_ERR_UNSUPPORTED, CONTAINS},
     };
     for (const Pattern& p : kTable) {
         if (matches(p)) return p.ha_err;
@@ -1722,6 +1699,7 @@ int ha_stoolap::flush_bulk_buffer() {
         if (!msg || !*msg) msg = stoolap_errmsg(db_for_prepare);
         sql_print_error("stoolap: batch INSERT failed: %s",
                         msg ? msg : "(no detail)");
+        invalidate_records_cache();
         int err = report_stoolap_error(msg);
         if (err == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = guess_errkey(msg, table->s);
@@ -1729,7 +1707,7 @@ int ha_stoolap::flush_bulk_buffer() {
         }
         return err;
     }
-    adjust_records_cache(affected);
+    apply_count_delta(affected);
     return 0;
 }
 
@@ -1903,7 +1881,7 @@ int ha_stoolap::write_row(const uchar* buf) {
                     errkey = last_dup_key_;
                 }
             } else {
-                adjust_records_cache(affected);
+                apply_count_delta(affected);
             }
         }
     }
@@ -2057,7 +2035,7 @@ int ha_stoolap::delete_row(const uchar* buf) {
         } else if (affected == 0) {
             err = HA_ERR_RECORD_DELETED;
         } else {
-            adjust_records_cache(-affected);
+            apply_count_delta(-affected);
         }
     }
 
@@ -2168,7 +2146,7 @@ int ha_stoolap::direct_delete_rows(ha_rows* delete_rows) {
     if (affected > static_cast<ha_rows>(INT64_MAX)) {
         invalidate_records_cache();
     } else {
-        adjust_records_cache(-static_cast<int64_t>(affected));
+        apply_count_delta(-static_cast<int64_t>(affected));
     }
     if (delete_rows) *delete_rows = affected;
     return 0;
@@ -2221,7 +2199,7 @@ int ha_stoolap::pre_direct_delete_rows() {
     if (affected > static_cast<ha_rows>(INT64_MAX)) {
         invalidate_records_cache();
     } else {
-        adjust_records_cache(-static_cast<int64_t>(affected));
+        apply_count_delta(-static_cast<int64_t>(affected));
     }
     return 0;
 }
@@ -2245,13 +2223,7 @@ int ha_stoolap::delete_all_rows() {
         sql_print_error("stoolap: TRUNCATE failed: %s", msg);
         return report_stoolap_error(msg);
     }
-    // TRUNCATE empties the table -- the count is now exactly zero. Update
-    // both the handler-local cache and the engine-global one so concurrent
-    // handlers don't see a stale non-zero value.
-    cached_records_ = 0;
-    cached_records_valid_ = true;
-    stats.records = 0;
-    g_engine.records_set(stoolap_table_, 0);
+    set_count_exact(0);
     // AUTO_INCREMENT reservations are now stale: stoolap's MAX for this
     // table dropped to 0 (NULL), but the process-wide allocator may still
     // reflect the pre-truncate counter.
@@ -3402,6 +3374,19 @@ void ha_stoolap::adjust_records_cache(int64_t delta) {
     g_engine.records_invalidate(stoolap_table_);
 }
 
+void ha_stoolap::apply_count_delta(int64_t delta) {
+    adjust_records_cache(delta);
+}
+
+void ha_stoolap::set_count_exact(uint64_t value) {
+    cached_records_ = static_cast<ha_rows>(value);
+    cached_records_valid_ = true;
+    stats.records = cached_records_;
+    if (!stoolap_table_.empty()) {
+        g_engine.records_set(stoolap_table_, value);
+    }
+}
+
 ha_rows ha_stoolap::cached_records() {
     // Lookup order: handler-local (this handler) -> tx-local for active
     // transactions, or engine-global for autocommit -> live COUNT(*).
@@ -3411,6 +3396,13 @@ ha_rows ha_stoolap::cached_records() {
     if (stoolap_table_.empty()) return stats.records;
 
     THD* thd = ha_thd();
+    // Some optimizer/statistics callers reach records() before MariaDB has
+    // taken the handler through external_lock(). That means the normal
+    // statement registration path may not have opened the session's Stoolap
+    // transaction yet. If this is an explicit transaction, register here too
+    // so COUNT(*) observes the same snapshot/own-writes view the later row
+    // access path will use; otherwise a pre-lock stats probe can silently
+    // seed planning with an autocommit-visible count.
     if (thd && thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)) {
         if (register_trx(thd) != 0) return stats.records;
     }
@@ -3803,25 +3795,17 @@ struct st_mysql_storage_engine stoolap_storage_engine = {
 // bytes and a relaxed atomic load on aarch64 is just a plain load -- the
 // status reader doesn't synchronise with writers, and approximate counts
 // are fine for SHOW STATUS.
+#define STATUS_LONGLONG(name, member)                                 \
+    {name, reinterpret_cast<char*>(&stoolap_mariadb::g_stats.member), \
+     SHOW_LONGLONG}
+
 static struct st_mysql_show_var stoolap_status_vars[] = {
-    {"Stoolap_pushdown_hits",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.pushdown_hits),
-     SHOW_LONGLONG},
-    {"Stoolap_pushdown_misses",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.pushdown_misses),
-     SHOW_LONGLONG},
-    {"Stoolap_direct_modify_hits",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.direct_modify_hits),
-     SHOW_LONGLONG},
-    {"Stoolap_records_live_counts",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.records_live_counts),
-     SHOW_LONGLONG},
-    {"Stoolap_buffered_scans",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.buffered_scans),
-     SHOW_LONGLONG},
-    {"Stoolap_buffered_rows",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.buffered_rows),
-     SHOW_LONGLONG},
+    STATUS_LONGLONG("Stoolap_pushdown_hits", pushdown_hits),
+    STATUS_LONGLONG("Stoolap_pushdown_misses", pushdown_misses),
+    STATUS_LONGLONG("Stoolap_direct_modify_hits", direct_modify_hits),
+    STATUS_LONGLONG("Stoolap_records_live_counts", records_live_counts),
+    STATUS_LONGLONG("Stoolap_buffered_scans", buffered_scans),
+    STATUS_LONGLONG("Stoolap_buffered_rows", buffered_rows),
     // Drift detector for the error mapping table. Bumped every time
     // map_stoolap_error degrades a non-empty stoolap message to
     // HA_ERR_GENERIC -- which means stoolap reworded an error and our
@@ -3829,36 +3813,22 @@ static struct st_mysql_show_var stoolap_status_vars[] = {
     // text via ER_GET_ERRMSG (1296), but the SQLSTATE class is wrong.
     // case_18_error_mapping.py asserts this stays at 0 across every
     // known error class.
-    {"Stoolap_unmapped_errors",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.unmapped_errors),
-     SHOW_LONGLONG},
+    STATUS_LONGLONG("Stoolap_unmapped_errors", unmapped_errors),
     // PERF DEBUG: aggregate nanoseconds per phase across all pushed
     // SELECTs. Divide by Stoolap_perf_query_count (or _next_row_count
     // for next_row_ns) to read off per-query / per-row averages. Always
     // on; cost is two clock_gettime calls per phase, ~20ns total.
-    {"Stoolap_perf_factory_setup_ns",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.perf_factory_setup_ns),
-     SHOW_LONGLONG},
-    {"Stoolap_perf_eager_query_ns",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.perf_eager_query_ns),
-     SHOW_LONGLONG},
-    {"Stoolap_perf_init_scan_ns",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.perf_init_scan_ns),
-     SHOW_LONGLONG},
-    {"Stoolap_perf_next_row_ns",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.perf_next_row_ns),
-     SHOW_LONGLONG},
-    {"Stoolap_perf_end_scan_ns",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.perf_end_scan_ns),
-     SHOW_LONGLONG},
-    {"Stoolap_perf_query_count",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.perf_query_count),
-     SHOW_LONGLONG},
-    {"Stoolap_perf_next_row_count",
-     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.perf_next_row_count),
-     SHOW_LONGLONG},
+    STATUS_LONGLONG("Stoolap_perf_factory_setup_ns", perf_factory_setup_ns),
+    STATUS_LONGLONG("Stoolap_perf_eager_query_ns", perf_eager_query_ns),
+    STATUS_LONGLONG("Stoolap_perf_init_scan_ns", perf_init_scan_ns),
+    STATUS_LONGLONG("Stoolap_perf_next_row_ns", perf_next_row_ns),
+    STATUS_LONGLONG("Stoolap_perf_end_scan_ns", perf_end_scan_ns),
+    STATUS_LONGLONG("Stoolap_perf_query_count", perf_query_count),
+    STATUS_LONGLONG("Stoolap_perf_next_row_count", perf_next_row_count),
     {nullptr, nullptr, SHOW_UNDEF},
 };
+
+#undef STATUS_LONGLONG
 
 maria_declare_plugin(stoolap){
     MYSQL_STORAGE_ENGINE_PLUGIN,

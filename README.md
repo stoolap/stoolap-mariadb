@@ -55,6 +55,14 @@ Recent releases focus on:
 
 ## Architecture
 
+Subsystem design rationale lives in block comments next to the code it
+explains; the source-layout table below names the entry-point files. The
+records-cache invariants live around `cached_records()` /
+`ThdContext::record_counts_`; the direct-DML error contract lives in
+`try_direct_modify`'s error path; the per-THD clone rule lives on
+`ThdContext::db()`. Upstream-coordination drafts live under
+[`docs/upstream/`](docs/upstream/).
+
 ```
                  +-------------------------------+
                  |     mariadbd (GPL-2.0)        |
@@ -98,6 +106,8 @@ src/
                             active transaction, prepared bulk-INSERT
                             cache, AUTO_INCREMENT cache with engine
                             epoch invalidation.
+  stoolap_thd_inspect.{h,cc} Small sql_class.h-dependent THD inspectors
+                            kept out of the hot handler translation unit.
   stoolap_packet.h          Inline parsers for Stoolap's packed
                             fetch_all binary buffer.
 third_party/                Vendored MariaDB-required headers
@@ -320,10 +330,15 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 
 ```sh
 cmake -S . -B build \
-  -DMARIADB_PREFIX=/opt/homebrew/opt/mariadb@11.4 \
+  -DMariaDB_ROOT=/opt/homebrew/opt/mariadb@11.4 \
   -DSTOOLAP_DIR=../stoolap
 cmake --build build -j
 ```
+
+`MARIADB_PREFIX` remains accepted as a backwards-compatible alias. If building
+MariaDB from source, install it to a prefix first (`cmake --install build
+--prefix "$PREFIX"`), then pass `-DMariaDB_ROOT="$PREFIX"` so the headers live
+under `include/mysql/server/private/`.
 
 The output is `build/ha_stoolap.so` (.so on Linux, .so with
 `SUFFIX ".so"` on macOS too. The MariaDB plugin loader looks for the
@@ -395,6 +410,7 @@ Session-level (`SET SESSION ...`):
 | `Stoolap_pushdown_hits`           | Whole-query plans accepted by the factory. |
 | `Stoolap_pushdown_misses`         | Plans that fell back to the row pump.    |
 | `Stoolap_direct_modify_hits`      | UPDATE / DELETE that took the direct path. |
+| `Stoolap_records_live_counts`     | `cached_records()` had to issue a live MVCC-visible `COUNT(*)`. |
 | `Stoolap_buffered_scans`          | `rnd_init` calls that used `fetch_all`.  |
 | `Stoolap_buffered_rows`           | Rows delivered through the buffered path. |
 | `Stoolap_unmapped_errors`         | Stoolap error strings the plugin couldn't classify (degraded to ER_GET_ERRMSG 1296). Non-zero means the error-mapping table in `map_stoolap_error` has fallen behind stoolap's wording — see `case_18_error_mapping`. |

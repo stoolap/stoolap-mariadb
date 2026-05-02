@@ -13,14 +13,16 @@ plugin's overhead vs. the embedded engine is measurable. Same schema,
 same row count, same iteration tiers.
 
 Each operation is timed per-iteration (after a warmup) so we can report
-min / median / mean / p95 instead of just average. EXPLAIN output is
-captured for every operation; cases where STOOLAP loses to InnoDB get
-their EXPLAIN dumped at the end so we can see *why*.
+min / median / mean / p95 instead of just average. Ratios and baselines use
+score_us: a 10% trimmed median per side when there are at least 20 samples,
+falling back to plain median otherwise. EXPLAIN output is captured for every
+operation; cases where STOOLAP loses to InnoDB get their EXPLAIN dumped at
+the end so we can see *why*.
 
 Connects to the running test mariadbd at /tmp/stoolap-test.sock by
 default. Easiest way to bring one up:
 
-    KEEP_RUNNING=1 tests/run_all.sh 14_scale   # starts on the socket
+    KEEP_RUNNING=1 python3 tests/runner.py 14_scale   # starts on the socket
 
 Then:
 
@@ -151,6 +153,16 @@ class Result:
     def median_us(self): return statistics.median(self.samples) if self.samples else 0.0
     @property
     def mean_us(self):   return statistics.fmean(self.samples) if self.samples else 0.0
+    @property
+    def score_us(self):
+        if not self.samples:
+            return 0.0
+        if len(self.samples) < 20:
+            return self.median_us
+        ordered = sorted(self.samples)
+        trim = max(1, len(ordered) // 10)
+        trimmed = ordered[trim:-trim]
+        return statistics.median(trimmed or ordered)
     @property
     def p95_us(self):
         if not self.samples:
@@ -589,15 +601,32 @@ def fmt_us(v: float) -> str:
     return f"{v:>15.3f}"
 
 
+def ratio_value(stoolap_us: float, innodb_us: float) -> float:
+    if stoolap_us <= 0 or innodb_us <= 0:
+        return 0.0
+    return innodb_us / stoolap_us
+
+
+def classify_ratio(ratio: float) -> str:
+    if ratio >= 1.10:
+        return "stoolap_win"
+    if ratio <= 0.90 and ratio > 0:
+        return "innodb_win"
+    return "tie"
+
+
 def fmt_ratio(stoolap_us: float, innodb_us: float) -> str:
     """Match the Go bench's ratio convention:
        Stoolap faster -> "  X.XXx"
        InnoDB faster  -> "  X.XXx*"  (asterisk marks the loser)
     """
-    if stoolap_us <= 0 or innodb_us <= 0:
+    ratio = ratio_value(stoolap_us, innodb_us)
+    if ratio <= 0:
         return f"{'-':>10}"
-    ratio = innodb_us / stoolap_us
-    if ratio >= 1.0:
+    cls = classify_ratio(ratio)
+    if cls == "tie":
+        return f"{ratio:>8.2f}x="
+    if cls == "stoolap_win":
         return f"{ratio:>9.2f}x"
     return f"{1.0 / ratio:>8.2f}x*"
 
@@ -627,7 +656,7 @@ def report(results: dict, args):
     print("Stoolap (MariaDB plugin) vs InnoDB - Benchmark")
     print(f"Configuration: {args.rows} rows, {args.iterations} iterations per test")
     print("Both engines under MariaDB 11.4 (same query parser / executor frame).")
-    print("Ratio > 1x = Stoolap faster  |  * = InnoDB faster")
+    print("Ratio >= 1.10x = Stoolap faster  |  <= 0.90x (*) = InnoDB faster")
 
     # Track which ops were rendered so we can append any leftovers in
     # an "OTHER" section (defensive: a future op added to run_engine
@@ -648,15 +677,17 @@ def report(results: dict, args):
             rendered.add(op)
             st  = results["STOOLAP"][op]
             ino = results["InnoDB"][op]
-            ratio_str = fmt_ratio(st.median_us, ino.median_us)
-            print(f"{op:<28} | {fmt_us(st.median_us)} | "
-                  f"{fmt_us(ino.median_us)} | {ratio_str}")
-            if st.median_us > 0 and ino.median_us > 0:
-                if st.median_us < ino.median_us:
+            ratio = ratio_value(st.score_us, ino.score_us)
+            ratio_str = fmt_ratio(st.score_us, ino.score_us)
+            print(f"{op:<28} | {fmt_us(st.score_us)} | "
+                  f"{fmt_us(ino.score_us)} | {ratio_str}")
+            if st.score_us > 0 and ino.score_us > 0:
+                cls = classify_ratio(ratio)
+                if cls == "stoolap_win":
                     stoolap_wins += 1
-                elif ino.median_us < st.median_us:
+                elif cls == "innodb_win":
                     innodb_wins += 1
-                    losses.append((op, ino.median_us / st.median_us, st, ino))
+                    losses.append((op, ratio, st, ino))
 
     # ---- final score line, Go-style ----
     print()
@@ -667,7 +698,8 @@ def report(results: dict, args):
     print("- Both engines under MariaDB 11.4 (same parser / executor / row pump)")
     print("- Stoolap: ha_stoolap.so plugin (Apache 2.0)")
     print("- InnoDB: bundled storage engine")
-    print("- Ratio > 1x = Stoolap faster  |  * = InnoDB faster")
+    print("- Ratios use score_us: 10% trimmed median when N >= 20, else median")
+    print("- Ratio >= 1.10x = Stoolap faster; <= 0.90x (*) = InnoDB faster")
     print(_HEADER_RULE)
 
     # ---- focused EXPLAIN dump for the loss cases ----
@@ -677,11 +709,11 @@ def report(results: dict, args):
         print(_DIVIDER)
         losses.sort(key=lambda t: t[1])
         for op, ratio, st, ino in losses:
-            delta_us = st.median_us - ino.median_us
+            delta_us = st.score_us - ino.score_us
             print(f"\n{op}")
-            print(f"  ratio:          {ratio:.2f}x* "
-                  f"(STOOLAP {st.median_us:.2f}us vs "
-                  f"InnoDB {ino.median_us:.2f}us, "
+            print(f"  ratio:          {1.0 / ratio:.2f}x* "
+                  f"(STOOLAP {st.score_us:.2f}us vs "
+                  f"InnoDB {ino.score_us:.2f}us, "
                   f"delta +{delta_us:.2f}us)")
             print(f"  STOOLAP EXPLAIN:")
             for line in (st.explain or "").splitlines():
@@ -707,20 +739,20 @@ def report(results: dict, args):
 # Baseline / loss-budget enforcement (CI)
 # --------------------------------------------------------------------------
 def write_baseline(results: dict, path: str):
-    """Snapshot the current run's medians as a JSON baseline. CI loads this
-    and compares future runs against it."""
+    """Snapshot the current run's score_us values as a JSON baseline. CI loads
+    this and compares future runs against it."""
     out = {}
     for op in results["STOOLAP"]:
         st  = results["STOOLAP"][op]
         ino = results["InnoDB"][op]
-        if st.median_us > 0 and ino.median_us > 0:
-            ratio = ino.median_us / st.median_us
-        else:
-            ratio = 1.0
+        ratio = ratio_value(st.score_us, ino.score_us) or 1.0
         out[op] = {
+            "stoolap_score_us":  round(st.score_us, 3),
+            "innodb_score_us":   round(ino.score_us, 3),
             "stoolap_median_us": round(st.median_us, 3),
             "innodb_median_us":  round(ino.median_us, 3),
             "ratio":             round(ratio, 4),
+            "classification":     classify_ratio(ratio),
         }
     with open(path, "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
@@ -730,14 +762,11 @@ def write_baseline(results: dict, path: str):
 def check_against_baseline(results: dict, baseline_path: str,
                             win_regress_pct: float,
                             loss_worsen_pct: float) -> int:
-    """Compare current medians against a baseline.
+    """Compare current score_us values against a baseline.
 
-    A 'win' in the baseline (ratio >= 1.0) becomes an alert if the current
-    STOOLAP median regresses by more than `win_regress_pct` percent.
-
-    A 'loss' in the baseline (ratio < 1.0) becomes an alert if the current
-    ratio drops by more than `loss_worsen_pct` percent (so a loss getting
-    worse trips the alert; a loss recovering does not)."""
+    Wins and ties alert on Stoolap slowdown beyond win_regress_pct. Ties also
+    alert if they cross into an InnoDB win. Existing InnoDB wins alert only
+    when the ratio deepens past 0.80x."""
     if not os.path.exists(baseline_path):
         print(f"error: baseline {baseline_path} not found.", file=sys.stderr)
         return 2
@@ -748,30 +777,42 @@ def check_against_baseline(results: dict, baseline_path: str,
     for op, base in baseline.items():
         if op not in results["STOOLAP"]:
             continue   # operation removed -- not a perf alert
-        st_now  = results["STOOLAP"][op].median_us
-        in_now  = results["InnoDB"][op].median_us
-        st_base = base["stoolap_median_us"]
+        st_now  = results["STOOLAP"][op].score_us
+        in_now  = results["InnoDB"][op].score_us
+        st_base = base.get("stoolap_score_us")
+        if st_base is None:
+            st_base = base.get("stoolap_median_us", 0)
         ratio_base = base.get("ratio", 1.0)
+        class_base = base.get("classification", classify_ratio(ratio_base))
+        ratio_now = ratio_value(st_now, in_now)
+        class_now = classify_ratio(ratio_now)
         if st_now <= 0 or st_base <= 0:
             continue
 
-        # Win in baseline -> check STOOLAP median for slowdown.
-        if ratio_base >= 1.0:
+        if class_base == "stoolap_win":
             slowdown_pct = (st_now - st_base) / st_base * 100.0
             if slowdown_pct > win_regress_pct:
                 alerts.append((
                     "WIN-REGRESSION", op,
-                    f"STOOLAP median {st_base:.1f}us -> {st_now:.1f}us "
+                    f"STOOLAP score {st_base:.1f}us -> {st_now:.1f}us "
                     f"(+{slowdown_pct:.1f}%, threshold +{win_regress_pct:.0f}%)"))
-        # Loss in baseline -> check the InnoDB/STOOLAP ratio drop.
-        else:
-            ratio_now = (in_now / st_now) if st_now > 0 else 0.0
-            ratio_drop_pct = (ratio_base - ratio_now) / ratio_base * 100.0
-            if ratio_drop_pct > loss_worsen_pct:
+        elif class_base == "tie":
+            slowdown_pct = (st_now - st_base) / st_base * 100.0
+            if slowdown_pct > win_regress_pct:
                 alerts.append((
-                    "LOSS-WORSENED", op,
+                    "TIE-STOOLAP-SLOWDOWN", op,
+                    f"STOOLAP score {st_base:.1f}us -> {st_now:.1f}us "
+                    f"(+{slowdown_pct:.1f}%, threshold +{win_regress_pct:.0f}%)"))
+            if class_now == "innodb_win":
+                alerts.append((
+                    "TIE-CROSSED-TO-INNODB", op,
+                    f"ratio {ratio_base:.2f}x -> {ratio_now:.2f}x"))
+        else:
+            if ratio_base >= 0.80 and ratio_now < 0.80:
+                alerts.append((
+                    "LOSS-DEEPENED", op,
                     f"ratio {ratio_base:.2f}x -> {ratio_now:.2f}x "
-                    f"(-{ratio_drop_pct:.1f}%, threshold -{loss_worsen_pct:.0f}%)"))
+                    "(crossed below 0.80x)"))
 
     if alerts:
         print(f"\n{len(alerts)} perf alert(s) vs baseline {baseline_path}:")
@@ -802,7 +843,10 @@ def parse_args():
                     help="after the main table, dump EXPLAIN for each "
                          "operation where InnoDB beat STOOLAP")
     ap.add_argument("--write-baseline", default=None,
-                    help="snapshot current medians + ratios to this JSON path")
+                    help="snapshot current score_us + ratios to this JSON path")
+    ap.add_argument("--update-baseline-i-promise", action="store_true",
+                    help="required with --write-baseline; confirms this run "
+                         "is on the canonical machine and intentional")
     ap.add_argument("--check", default=None,
                     metavar="BASELINE.json",
                     help="compare against a baseline. Exits 1 if a known "
@@ -812,8 +856,9 @@ def parse_args():
                     help="alert if a known WIN's STOOLAP median grew by "
                          "more than this percent (default: 15)")
     ap.add_argument("--loss-worsen-pct", type=float, default=10.0,
-                    help="alert if a known LOSS's ratio dropped by more "
-                         "than this percent (default: 10)")
+                    help="reserved for legacy baselines; current scoring "
+                         "alerts on ties crossing to InnoDB wins and losses "
+                         "crossing below 0.80x")
     ap.add_argument("--runs", type=int, default=1,
                     help="repeat the whole bench N times and keep the best "
                          "median per (engine, op). Filters one-off scheduler "
@@ -827,9 +872,9 @@ def parse_args():
 
 def merge_best(per_run: List[dict]) -> dict:
     """Given results from N runs, return one merged set of Result objects
-    where each (engine, op) is the run whose median was the smallest. We
-    pick by median rather than by min so the merged samples reflect a
-    representative distribution, not a tail-trimmed one."""
+    where each (engine, op) is the run whose score_us was the smallest. We
+    pick by score rather than by min so the merged samples reflect a
+    representative distribution, not a single lucky outlier."""
     if len(per_run) == 1:
         return per_run[0]
     out = {}
@@ -839,8 +884,8 @@ def merge_best(per_run: List[dict]) -> dict:
             best = per_run[0][engine][op]
             for r in per_run[1:]:
                 cand = r.get(engine, {}).get(op)
-                if cand and cand.median_us > 0 and (
-                        best.median_us <= 0 or cand.median_us < best.median_us):
+                if cand and cand.score_us > 0 and (
+                        best.score_us <= 0 or cand.score_us < best.score_us):
                     best = cand
             out[engine][op] = best
     return out
@@ -851,11 +896,16 @@ def main():
     if not os.path.exists(args.socket):
         print(f"error: socket {args.socket} not found.", file=sys.stderr)
         print("Bring up the test server first:", file=sys.stderr)
-        print("  KEEP_RUNNING=1 tests/run_all.sh 14_scale", file=sys.stderr)
+        print("  KEEP_RUNNING=1 python3 tests/runner.py 14_scale",
+              file=sys.stderr)
         sys.exit(2)
 
     if args.runs < 1:
         print("error: --runs must be >= 1.", file=sys.stderr)
+        sys.exit(2)
+    if args.write_baseline and not args.update_baseline_i_promise:
+        print("error: --write-baseline requires "
+              "--update-baseline-i-promise", file=sys.stderr)
         sys.exit(2)
 
     per_run: List[dict] = []

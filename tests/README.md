@@ -56,6 +56,8 @@ python3 tests/runner.py 02
 | Variable          | Purpose                                                                  |
 |-------------------|--------------------------------------------------------------------------|
 | `MARIADB_PREFIX`  | Path to the MariaDB install (defaults to `/opt/homebrew/opt/mariadb@11.4`) |
+| `MARIADBD_BIN` / `MARIADB_BIN` / `MARIADB_INSTALL_DB_BIN` | Override MariaDB binary paths for distro layouts |
+| `MARIADB_PLUGIN_DIR` | Override plugin directory when it is not `$MARIADB_PREFIX/lib/plugin` |
 | `STOOLAP_PLUGIN`  | Plugin path to install (defaults to `build/ha_stoolap.so`)                |
 | `STOOLAP_DSN`     | Stoolap-side DSN. Default `memory://`. Set `file:///tmp/stoolap-test-stoolap` for an apples-to-apples InnoDB comparison |
 | `KEEP_RUNNING=1`  | Leave `mariadbd` up after tests so you can poke at the data manually     |
@@ -93,3 +95,9 @@ file stem, e.g. `case_06_pushdown` -> `stoolap_test_06_pushdown`). The
 - `run_async(script)` - background mariadb subprocess for concurrent cases
 - `sql_with_session([SET ...], stmt)` - run on a fresh connection with session vars
 - `section(name)` - print a section banner
+
+The runner snapshots `SHOW STATUS LIKE 'Stoolap_%'` before and after each case.
+Normal activity counters are allowlisted centrally; drift counters such as
+`Stoolap_unmapped_errors` must stay pinned. If a case intentionally moves a
+non-activity counter, declare `STOOLAP_COUNTERS_ALLOW_DELTA = {"CounterName"}`
+next to its `run(harness)` function.

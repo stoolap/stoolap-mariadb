@@ -354,4 +354,9 @@ private:
     /// Apply a successful INSERT/DELETE delta to local exact tx caches, or
     /// invalidate shared caches when no tx-local cache can safely own it.
     void adjust_records_cache(int64_t delta);
+    /// All count-changing mutation sites in ha_stoolap.cc MUST route through
+    /// apply_count_delta() or set_count_exact(). Direct touches of
+    /// cached_records_ / g_engine.records_* from mutation paths are bugs.
+    void apply_count_delta(int64_t delta);
+    void set_count_exact(uint64_t value);
 };

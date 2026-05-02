@@ -74,6 +74,8 @@ INSERT INTO bulk_dup VALUES (1, 1), (2, 2);
     h.assert_scalar("REPLACE: rows 3 and 4 inserted",
                     "SELECT GROUP_CONCAT(id ORDER BY id) FROM bulk_dup",
                     "1,2,3,4")
+    h.assert_scalar("REPLACE mixed count stays exact",
+                    "SELECT COUNT(*) FROM bulk_dup", "4")
 
     h.exec_stmt("DELETE FROM bulk_dup")
     h.exec_stmt("INSERT INTO bulk_dup VALUES (1, 1), (2, 2)")
@@ -86,6 +88,8 @@ INSERT INTO bulk_dup VALUES (1, 1), (2, 2);
                     "SELECT v FROM bulk_dup WHERE id = 2", "2")
     h.assert_scalar("ODKU: row 5 inserted",
                     "SELECT v FROM bulk_dup WHERE id = 5", "5")
+    h.assert_scalar("ODKU mixed count stays exact",
+                    "SELECT COUNT(*) FROM bulk_dup", "3")
 
     h.section("AUTO_INCREMENT bulk INSERT (regression: lazy db_ + bulk AI primer)")
     h.exec_script(f"""

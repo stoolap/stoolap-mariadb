@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(stoolap_mariadb CXX)
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -21,31 +23,17 @@ endif()
 # ---------------------------------------------------------------------------
 # Inputs
 #
-# MARIADB_PREFIX  Brew prefix for MariaDB 11.4, e.g. /opt/homebrew/opt/mariadb@11.4.
-#                 Defaults to mariadb_config on PATH if available.
+# MariaDB_ROOT    MariaDB install prefix. MARIADB_PREFIX is accepted as a
+#                 backwards-compatible alias.
 # STOOLAP_DIR     Path to the stoolap repo root.
 # STOOLAP_LIB_DIR Directory holding libstoolap.{dylib,so}; defaults to
 #                 ${STOOLAP_DIR}/target/release.
 # ---------------------------------------------------------------------------
 
-if(NOT DEFINED MARIADB_PREFIX)
-    find_program(MARIADB_CONFIG NAMES mariadb_config mysql_config
-                 HINTS /opt/homebrew/opt/mariadb@11.4/bin
-                       /opt/homebrew/bin
-                       /usr/local/bin)
-    if(MARIADB_CONFIG)
-        execute_process(COMMAND ${MARIADB_CONFIG} --prefix
-                        OUTPUT_VARIABLE MARIADB_PREFIX
-                        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    endif()
-endif()
-
-if(NOT MARIADB_PREFIX OR NOT EXISTS "${MARIADB_PREFIX}/include/mysql/server/private/handler.h")
-    message(FATAL_ERROR
-        "Could not find MariaDB server headers. Set -DMARIADB_PREFIX=/opt/homebrew/opt/mariadb@11.4 "
-        "(or another prefix that contains include/mysql/server/private/handler.h).")
-endif()
-
+find_package(MariaDB REQUIRED)
+set(MARIADB_PREFIX "${MariaDB_ROOT}")
+set(MARIADB_INCLUDE_DIRS ${MariaDB_INCLUDE_DIRS})
+set(MARIADB_PLUGIN_DIR "${MariaDB_PLUGIN_DIR}")
 message(STATUS "MariaDB prefix: ${MARIADB_PREFIX}")
 
 if(NOT DEFINED STOOLAP_DIR)
@@ -61,19 +49,6 @@ if(NOT EXISTS "${STOOLAP_DIR}/include/stoolap.h")
         "stoolap.h not found at ${STOOLAP_DIR}/include/stoolap.h. "
         "Set -DSTOOLAP_DIR= to the stoolap repo root.")
 endif()
-
-# ---------------------------------------------------------------------------
-# MariaDB include search path
-#
-# Order matters: server/ first so its my_global.h shadows the client copy.
-# server/private/ contains the storage-engine internal headers (handler.h,
-# sql_class.h, table.h, thr_lock.h, sql_plugin.h).
-# ---------------------------------------------------------------------------
-
-set(MARIADB_INCLUDE_DIRS
-    "${MARIADB_PREFIX}/include/mysql/server"
-    "${MARIADB_PREFIX}/include/mysql/server/private"
-)
 
 # ---------------------------------------------------------------------------
 # Compile flags expected by MariaDB plugin headers
@@ -103,6 +78,7 @@ add_library(ha_stoolap MODULE
     src/ha_stoolap_select.cc
     src/stoolap_bridge.cc
     src/stoolap_thd_context.cc
+    src/stoolap_thd_inspect.cc
 )
 
 # Brew's MariaDB 11.4 dev tarball ships sql_class.h but omits the wsrep-lib
@@ -166,12 +142,6 @@ endif()
 # Optional install target: copies the plugin into MariaDB's plugin_dir.
 # Defaults to mariadb_config --plugindir.
 # ---------------------------------------------------------------------------
-
-if(NOT DEFINED MARIADB_PLUGIN_DIR AND MARIADB_CONFIG)
-    execute_process(COMMAND ${MARIADB_CONFIG} --plugindir
-                    OUTPUT_VARIABLE MARIADB_PLUGIN_DIR
-                    OUTPUT_STRIP_TRAILING_WHITESPACE)
-endif()
 
 if(MARIADB_PLUGIN_DIR)
     message(STATUS "Plugin dir (install target): ${MARIADB_PLUGIN_DIR}")

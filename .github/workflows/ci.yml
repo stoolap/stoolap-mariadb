@@ -5,6 +5,8 @@ on:
     branches: [main]
     tags-ignore: ['**']
   pull_request:
+  schedule:
+    - cron: '23 3 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -12,16 +14,31 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  STOOLAP_VERSION: main
+  PINNED_STOOLAP_VERSION: v0.4.0
   MARIADB_VERSION: '11.4'
 
 jobs:
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: clang-format --dry-run --Werror src/*.{cc,h}
+
   # ----------------------------------------------------------------------
-  # Build libstoolap.{so,dylib} once per OS; share via artifact so the
+  # Build libstoolap.{so,dylib} once per OS/version; share via artifact so
   # plugin build / test jobs don't need a Rust toolchain.
   # ----------------------------------------------------------------------
   build-lib:
-    name: Build libstoolap (${{ matrix.target }})
+    name: Build libstoolap (${{ matrix.version_label }}, ${{ matrix.target }})
+    needs: format
     strategy:
       fail-fast: false
       matrix:
@@ -29,13 +46,27 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             lib: libstoolap.so
+            stoolap_version: main
+            version_label: main
           - os: macos-latest
             target: aarch64-apple-darwin
             lib: libstoolap.dylib
+            stoolap_version: main
+            version_label: main
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libstoolap.so
+            stoolap_version: v0.4.0
+            version_label: pinned
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: libstoolap.dylib
+            stoolap_version: v0.4.0
+            version_label: pinned
     runs-on: ${{ matrix.os }}
     steps:
       - name: Clone stoolap engine
-        run: git clone --depth 1 --branch $STOOLAP_VERSION https://github.com/stoolap/stoolap.git stoolap-engine
+        run: git clone --depth 1 --branch ${{ matrix.stoolap_version }} https://github.com/stoolap/stoolap.git stoolap-engine
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,9 +77,9 @@ jobs:
           path: |
             stoolap-engine/target
             ~/.cargo/registry
-          key: rust-${{ matrix.target }}-${{ env.STOOLAP_VERSION }}-${{ github.sha }}
+          key: rust-${{ matrix.target }}-${{ matrix.stoolap_version }}-${{ github.sha }}
           restore-keys: |
-            rust-${{ matrix.target }}-${{ env.STOOLAP_VERSION }}-
+            rust-${{ matrix.target }}-${{ matrix.stoolap_version }}-
 
       - name: Build libstoolap
         working-directory: stoolap-engine
@@ -57,21 +88,22 @@ jobs:
       - name: Upload library + header
         uses: actions/upload-artifact@v4
         with:
-          name: stoolap-${{ matrix.target }}
+          name: stoolap-${{ matrix.version_label }}-${{ matrix.target }}
           path: |
             stoolap-engine/target/release/${{ matrix.lib }}
             stoolap-engine/include/stoolap.h
           if-no-files-found: error
 
-  # ----------------------------------------------------------------------
-  # macOS build + test. Brew's mariadb@11.4 ships the server-internal
-  # headers in the same layout MARIADB_PREFIX expects, so the only setup
-  # is `brew install mariadb@11.4`.
-  # ----------------------------------------------------------------------
   test-macos:
-    name: Test on macOS (MariaDB 11.4)
+    name: Test on macOS (${{ matrix.version_label }}, MariaDB ${{ env.MARIADB_VERSION }})
     needs: build-lib
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version_label: main
+          - version_label: pinned
     steps:
       - uses: actions/checkout@v4
 
@@ -85,7 +117,7 @@ jobs:
       - name: Download libstoolap
         uses: actions/download-artifact@v4
         with:
-          name: stoolap-aarch64-apple-darwin
+          name: stoolap-${{ matrix.version_label }}-aarch64-apple-darwin
           path: stoolap-staging
 
       - name: Stage stoolap (CMakeLists layout)
@@ -97,7 +129,7 @@ jobs:
       - name: Build plugin
         run: |
           cmake -S . -B build \
-            -DMARIADB_PREFIX=$MARIADB_PREFIX \
+            -DMariaDB_ROOT=$MARIADB_PREFIX \
             -DSTOOLAP_DIR=$PWD/stoolap-fake
           cmake --build build -j
 
@@ -114,22 +146,20 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-mariadbd-err
+          name: macos-${{ matrix.version_label }}-mariadbd-err
           path: /tmp/stoolap-test.err
           if-no-files-found: ignore
 
-  # ----------------------------------------------------------------------
-  # Linux build + test. Best-effort while the Ubuntu header story
-  # stabilises -- MariaDB's apt packages don't always ship the
-  # server-internal headers (`handler.h` etc.) we need; libmariadbd-dev
-  # is the closest match. Marked continue-on-error so the macOS job
-  # gates merges until this lands cleanly.
-  # ----------------------------------------------------------------------
   test-linux:
-    name: Test on Ubuntu (MariaDB 11.4)
+    name: Test on Ubuntu (${{ matrix.version_label }}, MariaDB ${{ env.MARIADB_VERSION }})
     needs: build-lib
     runs-on: ubuntu-latest
-    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version_label: main
+          - version_label: pinned
     steps:
       - uses: actions/checkout@v4
 
@@ -141,37 +171,20 @@ jobs:
           sudo apt-get install -y mariadb-server libmariadbd-dev cmake g++ python3-pip
           sudo systemctl stop mariadb || true
           sudo systemctl disable mariadb || true
-
-      - name: Find server-internal headers
-        id: mariadb
-        run: |
-          PREFIX="$RUNNER_TEMP/mariadb-prefix"
-          mkdir -p "$PREFIX/include/mysql" "$PREFIX/lib/plugin" "$PREFIX/bin"
-          # libmariadbd-dev installs server-internal headers under
-          # /usr/include/mysql/server/. Mirror brew's MARIADB_PREFIX
-          # layout: $PREFIX/include/mysql/server/private/handler.h
-          if [ -f /usr/include/mysql/server/private/handler.h ]; then
-            ln -s /usr/include/mysql "$PREFIX/include/mysql"
-          elif [ -f /usr/include/mariadb/server/private/handler.h ]; then
-            ln -s /usr/include/mariadb "$PREFIX/include/mysql"
+          echo "MARIADB_PREFIX=/usr" >> $GITHUB_ENV
+          echo "MARIADBD_BIN=/usr/sbin/mariadbd" >> $GITHUB_ENV
+          echo "MARIADB_BIN=/usr/bin/mariadb" >> $GITHUB_ENV
+          echo "MARIADB_INSTALL_DB_BIN=/usr/bin/mariadb-install-db" >> $GITHUB_ENV
+          if [ -d /usr/lib/mysql/plugin ]; then
+            echo "MARIADB_PLUGIN_DIR=/usr/lib/mysql/plugin" >> $GITHUB_ENV
           else
-            echo "ERROR: server-internal handler.h not found in any expected location" >&2
-            echo "       Falling back to building MariaDB headers from source" >&2
-            ls -la /usr/include/mysql /usr/include/mariadb 2>&1 || true
-            exit 1
+            echo "MARIADB_PLUGIN_DIR=/usr/lib/mariadb/plugin" >> $GITHUB_ENV
           fi
-          ln -sf /usr/sbin/mariadbd          "$PREFIX/bin/mariadbd"
-          ln -sf /usr/bin/mariadb-install-db "$PREFIX/bin/mariadb-install-db"
-          ln -sf /usr/bin/mariadb            "$PREFIX/bin/mariadb"
-          for so in /usr/lib/mysql/plugin/*.so; do
-            [ -e "$so" ] && ln -sf "$so" "$PREFIX/lib/plugin/" || true
-          done
-          echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
 
       - name: Download libstoolap
         uses: actions/download-artifact@v4
         with:
-          name: stoolap-x86_64-unknown-linux-gnu
+          name: stoolap-${{ matrix.version_label }}-x86_64-unknown-linux-gnu
           path: stoolap-staging
 
       - name: Install libstoolap + stage CMakeLists layout
@@ -185,26 +198,23 @@ jobs:
       - name: Build plugin
         run: |
           cmake -S . -B build \
-            -DMARIADB_PREFIX=${{ steps.mariadb.outputs.prefix }} \
+            -DMariaDB_ROOT=$MARIADB_PREFIX \
             -DSTOOLAP_DIR=$PWD/stoolap-fake
           cmake --build build -j$(nproc)
 
       - name: Install plugin
-        run: |
-          sudo install -m 0755 build/ha_stoolap.so /usr/lib/mysql/plugin/
+        run: sudo install -m 0755 build/ha_stoolap.so $MARIADB_PLUGIN_DIR/
 
       - name: Install Python deps
         run: pip install --user mysql-connector-python
 
       - name: Run tests
-        env:
-          MARIADB_PREFIX: ${{ steps.mariadb.outputs.prefix }}
         run: python3 tests/runner.py
 
       - name: Upload server log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-mariadbd-err
+          name: linux-${{ matrix.version_label }}-mariadbd-err
           path: /tmp/stoolap-test.err
           if-no-files-found: ignore

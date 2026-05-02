@@ -16,6 +16,10 @@ Environment:
   STOOLAP_DSN           Stoolap-side DSN. Default `memory://`. Set
                         `file:///tmp/stoolap-test-stoolap` for an
                         apples-to-apples InnoDB comparison.
+  MARIADBD_BIN          Override mariadbd path.
+  MARIADB_BIN           Override mariadb client path.
+  MARIADB_INSTALL_DB_BIN Override mariadb-install-db path.
+  MARIADB_PLUGIN_DIR    Override plugin directory.
   KEEP_RUNNING=1        Leave mariadbd running after the run.
   REUSE_RUNNING=1       Don't start/stop a server -- reuse one at the
                         socket; useful for fast iteration.
@@ -32,7 +36,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CASES_DIR = REPO_ROOT / "tests" / "cases"
@@ -47,28 +51,99 @@ sys.path.insert(0, str(LIB_DIR))
 from harness import Harness  # noqa: E402
 
 
+DEFAULT_COUNTER_DELTA_ALLOWLIST = {
+    "Stoolap_pushdown_hits",
+    "Stoolap_pushdown_misses",
+    "Stoolap_direct_modify_hits",
+    "Stoolap_records_live_counts",
+    "Stoolap_buffered_scans",
+    "Stoolap_buffered_rows",
+}
+
+
+def _run_sql(mariadb_bin: str, sql: str) -> str:
+    proc = subprocess.run(
+        [mariadb_bin, "--no-defaults", "-S", SOCK, "-uroot", "-N", "-e", sql],
+        capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+    return proc.stdout or ""
+
+
+def snapshot_stoolap_counters(mariadb_bin: str) -> Dict[str, int]:
+    """Read the current Stoolap_* SHOW STATUS surface."""
+    out: Dict[str, int] = {}
+    for line in _run_sql(mariadb_bin, "SHOW STATUS LIKE 'Stoolap_%'").splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            out[parts[0]] = int(parts[1])
+        except ValueError:
+            out[parts[0]] = 0
+    return out
+
+
+def unexpected_counter_deltas(
+        before: Dict[str, int], after: Dict[str, int],
+        allowed: Iterable[str]) -> List[Tuple[str, int]]:
+    allowed_set = set(allowed)
+    unexpected = []
+    for name in sorted(set(before) | set(after)):
+        delta = after.get(name, 0) - before.get(name, 0)
+        if delta != 0 and name not in allowed_set:
+            unexpected.append((name, delta))
+    return unexpected
+
+
+def read_global_var(mariadb_bin: str, name: str) -> str:
+    for line in _run_sql(
+            mariadb_bin, f"SHOW GLOBAL VARIABLES LIKE '{name}'").splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            return parts[1]
+    return ""
+
+
+def set_global_bool(mariadb_bin: str, name: str, value: str) -> None:
+    normalized = "ON" if value.upper() in {"ON", "1", "TRUE"} else "OFF"
+    _run_sql(mariadb_bin, f"SET GLOBAL {name} = {normalized}")
+
+
 class ServerCtx:
     """Owns the spawned mariadbd. No-op if REUSE_RUNNING=1."""
 
-    def __init__(self, mariadb_prefix: str, plugin: str, dsn: str):
+    def __init__(self, mariadb_prefix: str, plugin: str, dsn: str,
+                 mariadbd_bin: Optional[str] = None,
+                 mariadb_bin: Optional[str] = None,
+                 install_db_bin: Optional[str] = None,
+                 plugin_dir: Optional[str] = None):
         self.prefix = mariadb_prefix
         self.plugin = plugin
         self.dsn    = dsn
+        self._mariadbd = mariadbd_bin
+        self._mariadb = mariadb_bin
+        self._install_db = install_db_bin
+        self._plugin_dir = plugin_dir
         self.proc:  Optional[subprocess.Popen] = None
         self.reuse = os.environ.get("REUSE_RUNNING", "0") == "1"
         self.keep  = os.environ.get("KEEP_RUNNING",  "0") == "1"
 
     @property
     def mariadbd(self) -> str:
-        return f"{self.prefix}/bin/mariadbd"
+        return self._mariadbd or f"{self.prefix}/bin/mariadbd"
 
     @property
     def mariadb(self) -> str:
-        return f"{self.prefix}/bin/mariadb"
+        return self._mariadb or f"{self.prefix}/bin/mariadb"
+
+    @property
+    def install_db(self) -> str:
+        return self._install_db or f"{self.prefix}/bin/mariadb-install-db"
 
     @property
     def plugin_dir(self) -> str:
-        return f"{self.prefix}/lib/plugin"
+        return self._plugin_dir or f"{self.prefix}/lib/plugin"
 
     def start(self) -> None:
         if self.reuse:
@@ -103,7 +178,7 @@ class ServerCtx:
         # config the same way the test mariadbd below does.
         if not any(Path(DATA).iterdir()):
             rc = subprocess.run(
-                [f"{self.prefix}/bin/mariadb-install-db",
+                [self.install_db,
                  "--no-defaults",
                  f"--datadir={DATA}",
                  "--auth-root-authentication-method=normal"],
@@ -232,7 +307,11 @@ def main() -> int:
         mariadb_prefix=os.environ.get(
             "MARIADB_PREFIX", "/opt/homebrew/opt/mariadb@11.4"),
         plugin=plugin,
-        dsn=os.environ.get("STOOLAP_DSN", "memory://"))
+        dsn=os.environ.get("STOOLAP_DSN", "memory://"),
+        mariadbd_bin=os.environ.get("MARIADBD_BIN"),
+        mariadb_bin=os.environ.get("MARIADB_BIN"),
+        install_db_bin=os.environ.get("MARIADB_INSTALL_DB_BIN"),
+        plugin_dir=os.environ.get("MARIADB_PLUGIN_DIR"))
     server.start()
 
     cases = discover_cases(args.filter)
@@ -246,6 +325,8 @@ def main() -> int:
     total_fail = 0
     total_skip = 0
     failed_files: List[str] = []
+    suite_counter_allowlist: Set[str] = set(DEFAULT_COUNTER_DELTA_ALLOWLIST)
+    suite_counter_start = snapshot_stoolap_counters(server.mariadb)
 
     try:
         for case in cases:
@@ -254,10 +335,16 @@ def main() -> int:
             harness = Harness(socket=SOCK, db=db,
                               mariadb_bin=server.mariadb,
                               errlog_path=ERRLOG)
+            mod = None
+            case_counter_start = snapshot_stoolap_counters(server.mariadb)
+            perf_trace_before = read_global_var(
+                server.mariadb, "stoolap_perf_trace")
             try:
                 mod = load_case(case)
+                case_allow = set(getattr(
+                    mod, "STOOLAP_COUNTERS_ALLOW_DELTA", set()))
+                suite_counter_allowlist.update(case_allow)
                 mod.run(harness)
-                harness.summary(case.stem)
             except Exception as e:                 # pylint: disable=broad-except
                 # Mirror bash's "subshell rc != 0" rollup.
                 print(f"runner: {case.stem} raised: {e!r}",
@@ -265,12 +352,46 @@ def main() -> int:
                 failed_files.append(case.stem)
                 harness.failed += 1
             finally:
+                # Safe because the runner is serial; revisit this restore if
+                # case execution ever becomes parallel.
+                perf_trace_after = read_global_var(
+                    server.mariadb, "stoolap_perf_trace")
+                if perf_trace_before and perf_trace_after != perf_trace_before:
+                    set_global_bool(server.mariadb, "stoolap_perf_trace",
+                                    perf_trace_before)
+
+                case_allow = set(DEFAULT_COUNTER_DELTA_ALLOWLIST)
+                if mod is not None:
+                    case_allow.update(getattr(
+                        mod, "STOOLAP_COUNTERS_ALLOW_DELTA", set()))
+                case_counter_end = snapshot_stoolap_counters(server.mariadb)
+                unexpected = unexpected_counter_deltas(
+                    case_counter_start, case_counter_end, case_allow)
+                for name, delta in unexpected:
+                    harness._fail(  # pylint: disable=protected-access
+                        f"unexpected Stoolap counter delta: {name}",
+                        f"delta: {delta}",
+                        "declare STOOLAP_COUNTERS_ALLOW_DELTA in this case "
+                        "only for intentional counter movement")
+
+                harness.summary(case.stem)
                 total_pass += harness.passed
                 total_fail += harness.failed
                 total_skip += harness.skipped
                 if harness.failed > 0 and case.stem not in failed_files:
                     failed_files.append(case.stem)
                 harness.close()
+
+        suite_counter_end = snapshot_stoolap_counters(server.mariadb)
+        suite_unexpected = unexpected_counter_deltas(
+            suite_counter_start, suite_counter_end, suite_counter_allowlist)
+        if suite_unexpected:
+            print("\n========== suite counter drift ==========")
+            for name, delta in suite_unexpected:
+                print(f"  FAIL  unexpected Stoolap counter delta: {name}")
+                print(f"          delta: {delta}")
+            total_fail += len(suite_unexpected)
+            failed_files.append("suite_counters")
     finally:
         server.stop()
 

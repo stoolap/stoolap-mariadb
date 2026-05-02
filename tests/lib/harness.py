@@ -218,47 +218,75 @@ class Harness:
     # ------------------------------------------------------------------
     # EXPLAIN-based assertions
     # ------------------------------------------------------------------
-    def _explain_text(self, sql: str) -> str:
+    def _explain_text(self, sql: str, setup: Iterable[str] = ()) -> str:
         """Return the EXPLAIN result as one big string the way `mariadb
         -ss -e 'EXPLAIN ...'` did -- tab-separated, newline per row."""
+        if setup:
+            return self.sql_with_session(setup, f"EXPLAIN {sql}")
         return self.sql(f"EXPLAIN {sql}")
 
-    def assert_pushed(self, label: str, sql: str) -> None:
-        text = self._explain_text(sql)
-        if "PUSHED SELECT" in text:
+    def _status_int(self, var_name: str) -> int:
+        value = self.status(var_name)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _assert_pushdown_counter_contract(
+            self, label: str, sql: str, text: str, marker: str,
+            before_hits: int, before_misses: int, *,
+            allow_misses: bool = False) -> None:
+        hit_delta = self._status_int("Stoolap_pushdown_hits") - before_hits
+        miss_delta = (
+            self._status_int("Stoolap_pushdown_misses") - before_misses)
+        miss_ok = allow_misses or miss_delta == 0
+        if marker in text and hit_delta >= 1 and miss_ok:
             self._pass(label)
         else:
             self._fail(label,
                        f"sql:    {sql}",
-                       f"explain: {text or '<empty>'}")
+                       f"explain: {text or '<empty>'}",
+                       f"hit_delta:  {hit_delta}",
+                       f"miss_delta: {miss_delta}")
 
-    def assert_not_pushed(self, label: str, sql: str) -> None:
-        text = self._explain_text(sql)
+    def assert_pushed(self, label: str, sql: str, *,
+                      setup: Iterable[str] = ()) -> None:
+        before_hits = self._status_int("Stoolap_pushdown_hits")
+        before_misses = self._status_int("Stoolap_pushdown_misses")
+        text = self._explain_text(sql, setup)
+        self._assert_pushdown_counter_contract(
+            label, sql, text, "PUSHED SELECT", before_hits, before_misses)
+
+    def assert_not_pushed(self, label: str, sql: str, *,
+                          setup: Iterable[str] = ()) -> None:
+        before_hits = self._status_int("Stoolap_pushdown_hits")
+        text = self._explain_text(sql, setup)
+        hit_delta = self._status_int("Stoolap_pushdown_hits") - before_hits
         if "PUSHED SELECT" not in text and "PUSHED UNION" not in text \
-                and "PUSHED DERIVED" not in text:
+                and "PUSHED DERIVED" not in text and hit_delta == 0:
             self._pass(label)
         else:
             self._fail(label,
                        f"sql:    {sql}",
-                       f"explain (was pushed): {text}")
+                       f"explain (was pushed): {text}",
+                       f"hit_delta: {hit_delta}")
 
-    def assert_pushed_union(self, label: str, sql: str) -> None:
-        text = self._explain_text(sql)
-        if "PUSHED UNION" in text:
-            self._pass(label)
-        else:
-            self._fail(label,
-                       f"sql:    {sql}",
-                       f"explain: {text or '<empty>'}")
+    def assert_pushed_union(self, label: str, sql: str, *,
+                            setup: Iterable[str] = ()) -> None:
+        before_hits = self._status_int("Stoolap_pushdown_hits")
+        before_misses = self._status_int("Stoolap_pushdown_misses")
+        text = self._explain_text(sql, setup)
+        self._assert_pushdown_counter_contract(
+            label, sql, text, "PUSHED UNION", before_hits, before_misses)
 
-    def assert_pushed_derived(self, label: str, sql: str) -> None:
-        text = self._explain_text(sql)
-        if "PUSHED DERIVED" in text:
-            self._pass(label)
-        else:
-            self._fail(label,
-                       f"sql:    {sql}",
-                       f"explain: {text or '<empty>'}")
+    def assert_pushed_derived(self, label: str, sql: str, *,
+                              setup: Iterable[str] = ()) -> None:
+        before_hits = self._status_int("Stoolap_pushdown_hits")
+        before_misses = self._status_int("Stoolap_pushdown_misses")
+        text = self._explain_text(sql, setup)
+        self._assert_pushdown_counter_contract(
+            label, sql, text, "PUSHED DERIVED", before_hits, before_misses,
+            allow_misses=True)
 
     # ------------------------------------------------------------------
     # Async / subprocess helpers (used by concurrent cases)

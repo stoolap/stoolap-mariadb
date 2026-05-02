@@ -1,0 +1,86 @@
+name: Bench Drift
+
+on:
+  schedule:
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+
+env:
+  STOOLAP_VERSION: v0.4.0
+  MARIADB_VERSION: '11.4'
+
+jobs:
+  bench-macos:
+    name: Weekly bench drift (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MariaDB ${{ env.MARIADB_VERSION }}
+        run: |
+          brew install mariadb@${{ env.MARIADB_VERSION }} cmake
+          MARIADB_PREFIX="$(brew --prefix)/opt/mariadb@${{ env.MARIADB_VERSION }}"
+          echo "MARIADB_PREFIX=$MARIADB_PREFIX" >> $GITHUB_ENV
+          echo "$MARIADB_PREFIX/bin" >> $GITHUB_PATH
+
+      - name: Clone stoolap engine
+        run: git clone --depth 1 --branch $STOOLAP_VERSION https://github.com/stoolap/stoolap.git stoolap-engine
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            stoolap-engine/target
+            ~/.cargo/registry
+          key: bench-rust-aarch64-apple-darwin-${{ env.STOOLAP_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            bench-rust-aarch64-apple-darwin-${{ env.STOOLAP_VERSION }}-
+
+      - name: Build libstoolap
+        working-directory: stoolap-engine
+        run: cargo build --release --features ffi
+
+      - name: Stage stoolap
+        run: |
+          mkdir -p stoolap-fake/include stoolap-fake/target/release
+          cp stoolap-engine/include/stoolap.h stoolap-fake/include/
+          cp stoolap-engine/target/release/libstoolap.dylib stoolap-fake/target/release/
+
+      - name: Build plugin
+        run: |
+          cmake -S . -B build \
+            -DMariaDB_ROOT=$MARIADB_PREFIX \
+            -DSTOOLAP_DIR=$PWD/stoolap-fake
+          cmake --build build -j
+
+      - name: Install Python deps
+        run: python3 -m pip install --break-system-packages --user mysql-connector-python
+
+      - name: Start test server
+        run: KEEP_RUNNING=1 python3 tests/runner.py 14_scale
+
+      - name: Check bench drift
+        run: |
+          python3 benchmarks/bench.py \
+            --iterations 100 \
+            --runs 3 \
+            --check benchmarks/baseline.json \
+            --mode warn
+
+      - name: Stop test server
+        if: always()
+        run: |
+          if [ -f /tmp/stoolap-test.pid ]; then
+            kill "$(cat /tmp/stoolap-test.pid)" || true
+          fi
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-mariadbd-err
+          path: /tmp/stoolap-test.err
+          if-no-files-found: ignore
