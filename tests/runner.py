@@ -154,14 +154,26 @@ class ServerCtx:
             print(f"runner: reusing existing server at {SOCK}")
             return
 
-        # Install the plugin into MariaDB's plugin dir.
+        # Install the plugin into MariaDB's plugin dir. Skip if the
+        # destination already exists with the same byte content as our
+        # build artifact -- that's the CI flow, where the workflow has
+        # already done a `sudo install` before invoking the runner and
+        # the runner itself doesn't have sudo. Plain "exists" isn't
+        # enough because a stale plugin from a prior run would silently
+        # mask edits; comparing sizes catches "you forgot to re-copy
+        # after rebuilding" without needing a content hash.
+        dst = f"{self.plugin_dir}/ha_stoolap.so"
         try:
-            shutil.copyfile(self.plugin,
-                            f"{self.plugin_dir}/ha_stoolap.so")
+            if (os.path.exists(dst) and
+                    os.path.getsize(dst) == os.path.getsize(self.plugin)):
+                pass  # already installed identically; CI flow
+            else:
+                shutil.copyfile(self.plugin, dst)
         except (PermissionError, OSError) as e:
             print(f"runner: cannot install plugin to {self.plugin_dir}: {e}",
                   file=sys.stderr)
-            print("runner: try sudo or REUSE_RUNNING=1", file=sys.stderr)
+            print("runner: pre-install with sudo, or set REUSE_RUNNING=1",
+                  file=sys.stderr)
             sys.exit(2)
 
         for f in (SOCK, PIDFILE):
