@@ -3795,17 +3795,23 @@ struct st_mysql_storage_engine stoolap_storage_engine = {
 // bytes and a relaxed atomic load on aarch64 is just a plain load -- the
 // status reader doesn't synchronise with writers, and approximate counts
 // are fine for SHOW STATUS.
-#define STATUS_LONGLONG(name, member)                                 \
-    {name, reinterpret_cast<char*>(&stoolap_mariadb::g_stats.member), \
-     SHOW_LONGLONG}
+//
+// We deliberately spell each row out instead of hiding the cast in a
+// macro. Function-style macros with multi-line bodies trigger
+// version-specific clang-format reformatting (LLVM 18 vs 22 disagree on
+// backslash-continuation alignment), and the format gate is a hard fail.
+// One row per counter is cheap; the alternative was a moving target.
+#define _SS_PTR(member) \
+    reinterpret_cast<char*>(&stoolap_mariadb::g_stats.member)
 
 static struct st_mysql_show_var stoolap_status_vars[] = {
-    STATUS_LONGLONG("Stoolap_pushdown_hits", pushdown_hits),
-    STATUS_LONGLONG("Stoolap_pushdown_misses", pushdown_misses),
-    STATUS_LONGLONG("Stoolap_direct_modify_hits", direct_modify_hits),
-    STATUS_LONGLONG("Stoolap_records_live_counts", records_live_counts),
-    STATUS_LONGLONG("Stoolap_buffered_scans", buffered_scans),
-    STATUS_LONGLONG("Stoolap_buffered_rows", buffered_rows),
+    {"Stoolap_pushdown_hits", _SS_PTR(pushdown_hits), SHOW_LONGLONG},
+    {"Stoolap_pushdown_misses", _SS_PTR(pushdown_misses), SHOW_LONGLONG},
+    {"Stoolap_direct_modify_hits", _SS_PTR(direct_modify_hits), SHOW_LONGLONG},
+    {"Stoolap_records_live_counts", _SS_PTR(records_live_counts),
+     SHOW_LONGLONG},
+    {"Stoolap_buffered_scans", _SS_PTR(buffered_scans), SHOW_LONGLONG},
+    {"Stoolap_buffered_rows", _SS_PTR(buffered_rows), SHOW_LONGLONG},
     // Drift detector for the error mapping table. Bumped every time
     // map_stoolap_error degrades a non-empty stoolap message to
     // HA_ERR_GENERIC -- which means stoolap reworded an error and our
@@ -3813,22 +3819,25 @@ static struct st_mysql_show_var stoolap_status_vars[] = {
     // text via ER_GET_ERRMSG (1296), but the SQLSTATE class is wrong.
     // case_18_error_mapping.py asserts this stays at 0 across every
     // known error class.
-    STATUS_LONGLONG("Stoolap_unmapped_errors", unmapped_errors),
+    {"Stoolap_unmapped_errors", _SS_PTR(unmapped_errors), SHOW_LONGLONG},
     // PERF DEBUG: aggregate nanoseconds per phase across all pushed
     // SELECTs. Divide by Stoolap_perf_query_count (or _next_row_count
     // for next_row_ns) to read off per-query / per-row averages. Always
     // on; cost is two clock_gettime calls per phase, ~20ns total.
-    STATUS_LONGLONG("Stoolap_perf_factory_setup_ns", perf_factory_setup_ns),
-    STATUS_LONGLONG("Stoolap_perf_eager_query_ns", perf_eager_query_ns),
-    STATUS_LONGLONG("Stoolap_perf_init_scan_ns", perf_init_scan_ns),
-    STATUS_LONGLONG("Stoolap_perf_next_row_ns", perf_next_row_ns),
-    STATUS_LONGLONG("Stoolap_perf_end_scan_ns", perf_end_scan_ns),
-    STATUS_LONGLONG("Stoolap_perf_query_count", perf_query_count),
-    STATUS_LONGLONG("Stoolap_perf_next_row_count", perf_next_row_count),
+    {"Stoolap_perf_factory_setup_ns", _SS_PTR(perf_factory_setup_ns),
+     SHOW_LONGLONG},
+    {"Stoolap_perf_eager_query_ns", _SS_PTR(perf_eager_query_ns),
+     SHOW_LONGLONG},
+    {"Stoolap_perf_init_scan_ns", _SS_PTR(perf_init_scan_ns), SHOW_LONGLONG},
+    {"Stoolap_perf_next_row_ns", _SS_PTR(perf_next_row_ns), SHOW_LONGLONG},
+    {"Stoolap_perf_end_scan_ns", _SS_PTR(perf_end_scan_ns), SHOW_LONGLONG},
+    {"Stoolap_perf_query_count", _SS_PTR(perf_query_count), SHOW_LONGLONG},
+    {"Stoolap_perf_next_row_count", _SS_PTR(perf_next_row_count),
+     SHOW_LONGLONG},
     {nullptr, nullptr, SHOW_UNDEF},
 };
 
-#undef STATUS_LONGLONG
+#undef _SS_PTR
 
 maria_declare_plugin(stoolap){
     MYSQL_STORAGE_ENGINE_PLUGIN,

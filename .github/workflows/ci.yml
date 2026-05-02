@@ -25,12 +25,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install clang-format
+        # Pin to clang-format-18 (Ubuntu 24.04's default `clang-format`).
+        # Different major versions disagree on edge cases (notably
+        # multi-line macro backslash alignment), so the format gate
+        # needs a fixed target. Local devs: install clang-format-18
+        # via apt, brew install llvm@18, or `docker run ubuntu:24.04`.
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format
+          sudo apt-get install -y clang-format-18
 
       - name: Check formatting
-        run: clang-format --dry-run --Werror src/*.{cc,h}
+        run: clang-format-18 --dry-run --Werror src/*.{cc,h}
 
   # ----------------------------------------------------------------------
   # Build libstoolap.{so,dylib} once per OS/version; share via artifact so

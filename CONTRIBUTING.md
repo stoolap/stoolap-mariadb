@@ -20,7 +20,11 @@ you changed. Before pushing a release-facing change, run the full suite.
   `docs/` or the memory pointer that now refers to it.
 - `Stoolap_unmapped_errors` is a drift counter, not an activity counter. Do
   not allowlist it in tests.
-- `clang-format --dry-run --Werror src/*.{cc,h}` must pass.
+- `clang-format-18 --dry-run --Werror src/*.{cc,h}` must pass. CI pins
+  clang-format-18 because different major versions disagree on edge
+  cases. Install via apt (`apt-get install clang-format-18`), Homebrew
+  (`brew install llvm@18` then use `$(brew --prefix llvm@18)/bin/clang-format`),
+  or `docker run --rm -v $PWD:/work -w /work ubuntu:24.04 sh -c 'apt update && apt install -y clang-format-18 && clang-format-18 --dry-run --Werror src/*.{cc,h}'`.
 
 ## Benchmark Baselines
 
