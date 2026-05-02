@@ -46,6 +46,12 @@ jobs:
     needs: format
     strategy:
       fail-fast: false
+      # Until upstream cuts a release that contains every FFI symbol the
+      # plugin uses (currently `stoolap_stmt_exec_batch` is in `main`
+      # only; the latest release v0.4.0 doesn't have it), the `pinned`
+      # row would fail to build. Run only `main` for now; restore the
+      # `pinned` row by adding back a v0.4.1+ entry once upstream ships
+      # one. Tracked in docs/upstream/stoolap_ffi_issue.md.
       matrix:
         include:
           - os: ubuntu-latest
@@ -58,16 +64,6 @@ jobs:
             lib: libstoolap.dylib
             stoolap_version: main
             version_label: main
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            lib: libstoolap.so
-            stoolap_version: v0.4.0
-            version_label: pinned
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            lib: libstoolap.dylib
-            stoolap_version: v0.4.0
-            version_label: pinned
     runs-on: ${{ matrix.os }}
     steps:
       - name: Clone stoolap engine
@@ -108,7 +104,6 @@ jobs:
       matrix:
         include:
           - version_label: main
-          - version_label: pinned
     steps:
       - uses: actions/checkout@v4
 
@@ -139,7 +134,13 @@ jobs:
           cmake --build build -j
 
       - name: Install plugin
-        run: install -m 0755 build/ha_stoolap.so $MARIADB_PREFIX/lib/plugin/
+        run: |
+          install -m 0755 build/ha_stoolap.so $MARIADB_PREFIX/lib/plugin/
+          # The plugin links against libstoolap.dylib via @loader_path, so
+          # the dylib must sit next to the .so in the plugin dir or dyld
+          # fails with "Library not loaded" at INSTALL PLUGIN time.
+          install -m 0755 stoolap-staging/target/release/libstoolap.dylib \
+            $MARIADB_PREFIX/lib/plugin/
 
       - name: Install Python deps
         run: python3 -m pip install --break-system-packages --user mysql-connector-python
@@ -164,7 +165,6 @@ jobs:
       matrix:
         include:
           - version_label: main
-          - version_label: pinned
     steps:
       - uses: actions/checkout@v4
 
