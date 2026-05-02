@@ -136,11 +136,22 @@ jobs:
       - name: Install plugin
         run: |
           install -m 0755 build/ha_stoolap.so $MARIADB_PREFIX/lib/plugin/
-          # The plugin links against libstoolap.dylib via @loader_path, so
-          # the dylib must sit next to the .so in the plugin dir or dyld
-          # fails with "Library not loaded" at INSTALL PLUGIN time.
+          # The plugin's INSTALL_RPATH includes @loader_path, so the
+          # dylib must sit next to the .so in the plugin dir. But dyld
+          # checks the dylib's embedded install_name (LC_ID_DYLIB)
+          # FIRST, and stoolap's release build leaves it at the
+          # absolute build path on the runner -- which doesn't exist
+          # by the time mariadbd opens us. Rewrite it to @rpath/...
+          # so dyld falls through to the plugin's @loader_path lookup.
           install -m 0755 stoolap-staging/target/release/libstoolap.dylib \
             $MARIADB_PREFIX/lib/plugin/
+          install_name_tool -id @rpath/libstoolap.dylib \
+            $MARIADB_PREFIX/lib/plugin/libstoolap.dylib
+          # Re-sign because install_name_tool invalidates the codesign
+          # blob, and macOS 14+ refuses unsigned dylibs at dlopen.
+          codesign --remove-signature \
+            $MARIADB_PREFIX/lib/plugin/libstoolap.dylib || true
+          codesign --sign - $MARIADB_PREFIX/lib/plugin/libstoolap.dylib
 
       - name: Install Python deps
         run: python3 -m pip install --break-system-packages --user mysql-connector-python
