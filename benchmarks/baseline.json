@@ -1,0 +1,267 @@
+{
+  "Aggregation (GROUP BY)": {
+    "innodb_median_us": 2174.667,
+    "ratio": 10.6363,
+    "stoolap_median_us": 204.458
+  },
+  "BETWEEN (non-indexed)": {
+    "innodb_median_us": 622.958,
+    "ratio": 2.6787,
+    "stoolap_median_us": 232.562
+  },
+  "Batch INSERT (100 rows)": {
+    "innodb_median_us": 940.0,
+    "ratio": 1.5117,
+    "stoolap_median_us": 621.812
+  },
+  "CASE expression": {
+    "innodb_median_us": 138.062,
+    "ratio": 1.19,
+    "stoolap_median_us": 116.02
+  },
+  "COALESCE + IS NOT NULL": {
+    "innodb_median_us": 547.917,
+    "ratio": 3.4218,
+    "stoolap_median_us": 160.125
+  },
+  "COUNT DISTINCT": {
+    "innodb_median_us": 76.937,
+    "ratio": 2.0325,
+    "stoolap_median_us": 37.854
+  },
+  "CROSS JOIN (limited)": {
+    "innodb_median_us": 111.104,
+    "ratio": 0.3884,
+    "stoolap_median_us": 286.041
+  },
+  "CTE + JOIN": {
+    "innodb_median_us": 9033.23,
+    "ratio": 2.7577,
+    "stoolap_median_us": 3275.646
+  },
+  "Compare with subquery": {
+    "innodb_median_us": 7149.291,
+    "ratio": 30.8381,
+    "stoolap_median_us": 231.833
+  },
+  "Complex JOIN+GROUP+HAVING": {
+    "innodb_median_us": 6385.021,
+    "ratio": 30.8984,
+    "stoolap_median_us": 206.645
+  },
+  "Correlated in SELECT": {
+    "innodb_median_us": 8871.979,
+    "ratio": 15.2075,
+    "stoolap_median_us": 583.396
+  },
+  "DELETE by ID": {
+    "innodb_median_us": 141.833,
+    "ratio": 3.1903,
+    "stoolap_median_us": 44.458
+  },
+  "DELETE complex": {
+    "innodb_median_us": 269.708,
+    "ratio": 4.2362,
+    "stoolap_median_us": 63.667
+  },
+  "DISTINCT (no ORDER)": {
+    "innodb_median_us": 111.667,
+    "ratio": 1.5393,
+    "stoolap_median_us": 72.542
+  },
+  "DISTINCT + ORDER BY": {
+    "innodb_median_us": 105.75,
+    "ratio": 1.4061,
+    "stoolap_median_us": 75.209
+  },
+  "Derived table (FROM sub)": {
+    "innodb_median_us": 2436.917,
+    "ratio": 1.7748,
+    "stoolap_median_us": 1373.084
+  },
+  "EXISTS subquery": {
+    "innodb_median_us": 5389.916,
+    "ratio": 21.6263,
+    "stoolap_median_us": 249.23
+  },
+  "Expr in WHERE (funcs)": {
+    "innodb_median_us": 782.938,
+    "ratio": 3.3732,
+    "stoolap_median_us": 232.104
+  },
+  "GROUP BY (2 columns)": {
+    "innodb_median_us": 2569.292,
+    "ratio": 5.5251,
+    "stoolap_median_us": 465.021
+  },
+  "HAVING complex": {
+    "innodb_median_us": 1629.709,
+    "ratio": 7.1518,
+    "stoolap_median_us": 227.875
+  },
+  "IN list (7 values)": {
+    "innodb_median_us": 298.896,
+    "ratio": 1.3191,
+    "stoolap_median_us": 226.583
+  },
+  "IN subquery": {
+    "innodb_median_us": 2308.75,
+    "ratio": 5.5899,
+    "stoolap_median_us": 413.02
+  },
+  "INNER JOIN": {
+    "innodb_median_us": 2022.646,
+    "ratio": 8.9738,
+    "stoolap_median_us": 225.395
+  },
+  "INSERT single": {
+    "innodb_median_us": 143.917,
+    "ratio": 3.3436,
+    "stoolap_median_us": 43.042
+  },
+  "LEFT JOIN + GROUP BY": {
+    "innodb_median_us": 42546.688,
+    "ratio": 144.9323,
+    "stoolap_median_us": 293.562
+  },
+  "LIKE contains (%50%)": {
+    "innodb_median_us": 1461.583,
+    "ratio": 4.6581,
+    "stoolap_median_us": 313.771
+  },
+  "LIKE prefix (User_1%)": {
+    "innodb_median_us": 270.916,
+    "ratio": 1.204,
+    "stoolap_median_us": 225.022
+  },
+  "Large result (no LIMIT)": {
+    "innodb_median_us": 22164.771,
+    "ratio": 2.3358,
+    "stoolap_median_us": 9489.104
+  },
+  "Math expressions": {
+    "innodb_median_us": 746.855,
+    "ratio": 2.5852,
+    "stoolap_median_us": 288.896
+  },
+  "Multi aggregates (6)": {
+    "innodb_median_us": 5372.75,
+    "ratio": 22.7338,
+    "stoolap_median_us": 236.333
+  },
+  "Multi window funcs (3)": {
+    "innodb_median_us": 6443.645,
+    "ratio": 5.1363,
+    "stoolap_median_us": 1254.521
+  },
+  "Multi-col ORDER BY (3)": {
+    "innodb_median_us": 2195.834,
+    "ratio": 4.5924,
+    "stoolap_median_us": 478.145
+  },
+  "Multiple CTEs (2)": {
+    "innodb_median_us": 770.166,
+    "ratio": 1.5625,
+    "stoolap_median_us": 492.896
+  },
+  "NOT EXISTS subquery": {
+    "innodb_median_us": 6308.437,
+    "ratio": 23.8129,
+    "stoolap_median_us": 264.917
+  },
+  "NOT IN subquery": {
+    "innodb_median_us": 6335.438,
+    "ratio": 18.4886,
+    "stoolap_median_us": 342.667
+  },
+  "Nested subquery (3 lvl)": {
+    "innodb_median_us": 44558.75,
+    "ratio": 63.3499,
+    "stoolap_median_us": 703.376
+  },
+  "OFFSET pagination (5000)": {
+    "innodb_median_us": 1007.396,
+    "ratio": 4.1354,
+    "stoolap_median_us": 243.604
+  },
+  "OR conditions (3 vals)": {
+    "innodb_median_us": 293.001,
+    "ratio": 1.2874,
+    "stoolap_median_us": 227.583
+  },
+  "SELECT * (full scan)": {
+    "innodb_median_us": 53324.438,
+    "ratio": 2.4948,
+    "stoolap_median_us": 21373.959
+  },
+  "SELECT by ID": {
+    "innodb_median_us": 52.001,
+    "ratio": 0.877,
+    "stoolap_median_us": 59.292
+  },
+  "SELECT by index (exact)": {
+    "innodb_median_us": 402.25,
+    "ratio": 1.064,
+    "stoolap_median_us": 378.062
+  },
+  "SELECT by index (range)": {
+    "innodb_median_us": 5690.812,
+    "ratio": 1.4424,
+    "stoolap_median_us": 3945.375
+  },
+  "SELECT complex": {
+    "innodb_median_us": 2517.75,
+    "ratio": 6.3646,
+    "stoolap_median_us": 395.584
+  },
+  "Scalar subquery": {
+    "innodb_median_us": 2468.146,
+    "ratio": 9.9147,
+    "stoolap_median_us": 248.938
+  },
+  "Self JOIN (same age)": {
+    "innodb_median_us": 200.541,
+    "ratio": 1.5107,
+    "stoolap_median_us": 132.75
+  },
+  "String concat (||)": {
+    "innodb_median_us": 318.937,
+    "ratio": 2.9571,
+    "stoolap_median_us": 107.854
+  },
+  "UNION ALL": {
+    "innodb_median_us": 2850.896,
+    "ratio": 22.4849,
+    "stoolap_median_us": 126.792
+  },
+  "UPDATE by ID": {
+    "innodb_median_us": 151.333,
+    "ratio": 3.179,
+    "stoolap_median_us": 47.604
+  },
+  "UPDATE complex": {
+    "innodb_median_us": 1948.417,
+    "ratio": 9.7788,
+    "stoolap_median_us": 199.249
+  },
+  "Window PARTITION BY": {
+    "innodb_median_us": 4673.854,
+    "ratio": 21.928,
+    "stoolap_median_us": 213.146
+  },
+  "Window ROWS frame": {
+    "innodb_median_us": 4118.021,
+    "ratio": 3.5372,
+    "stoolap_median_us": 1164.208
+  },
+  "Window ROW_NUMBER": {
+    "innodb_median_us": 3766.438,
+    "ratio": 6.1633,
+    "stoolap_median_us": 611.104
+  },
+  "Window ROW_NUMBER (PK)": {
+    "innodb_median_us": 3355.854,
+    "ratio": 29.6869,
+    "stoolap_median_us": 113.041
+  }
+}

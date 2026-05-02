@@ -1,0 +1,85 @@
+stoolap-mariadb
+Copyright 2026 Stoolap Contributors
+
+This product includes software developed by the Stoolap Contributors.
+The plugin source code in `src/` and the build glue at the repository
+root are licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------
+Third-party components redistributed in this repository
+------------------------------------------------------------------------
+
+This repository vendors a small set of upstream C/C++ headers required
+to compile the plugin against MariaDB 11.4. Each vendored component
+keeps its own license file. Source forms are not modified.
+
+1. wsrep-lib  (third_party/wsrep-lib/)
+   Source:    https://github.com/codership/wsrep-lib
+   Pinned at: 7010f0ab584ab9cdebb285272a0fb0ff0a5a791d
+   License:   GPL-2.0-or-later
+   Files:     include/wsrep/*.hpp (headers only)
+   Copyright: 2018-present Codership Oy <info@codership.com>
+   Licence text: third_party/wsrep-lib/COPYING and
+                 third_party/wsrep-lib/LICENSE
+
+2. wsrep-API  (third_party/wsrep-API/)
+   Source:    https://github.com/codership/wsrep-API
+   Pinned at: 65608d3f503ba9f4c170fc4e01c539be9fafd46c
+   License:   GPL-2.0-only
+   Files:     wsrep_*.h, wsrep_api.h (public C API)
+   Copyright: 2009-2024 Codership Oy <info@codership.com>
+   Licence text: third_party/wsrep-API/COPYING
+
+These headers are only used at compile time so the plugin can parse
+MariaDB's `select_handler.h` / `sql_class.h` cascade against the
+brewed binary distribution (which ships server-side wsrep glue but
+omits the `wsrep::` C++ types these headers declare). No wsrep code
+runs at execution time; the plugin does not call into wsrep, and the
+loaded `ha_stoolap.so` does not link against `libwsrep`.
+
+------------------------------------------------------------------------
+Runtime dependencies (not redistributed)
+------------------------------------------------------------------------
+
+a. MariaDB 11.4 server
+   License: GPL-2.0 (with FOSS License Exception for plugins).
+   Relationship: ha_stoolap.so is loaded at runtime by `mariadbd` via
+                 `dlopen`/`INSTALL PLUGIN`; the plugin links against
+                 the server's exported symbols.
+   See: https://mariadb.com/kb/en/mariadb-license/ and
+        https://mariadb.com/foss-license-exception/
+
+b. Stoolap (libstoolap)
+   License:  Apache License, Version 2.0.
+   Source:   https://github.com/stoolap/stoolap
+   Relationship: ha_stoolap.so links to `libstoolap.{so,dylib}` built
+                 from the `stoolap` crate with `--features ffi`.
+
+------------------------------------------------------------------------
+License compatibility
+------------------------------------------------------------------------
+
+The plugin source code is Apache-2.0. The vendored third-party headers
+are GPL-2.0. When the plugin is compiled, the resulting `ha_stoolap.so`
+combines:
+
+  - Apache-2.0 source (this project)
+  - GPL-2.0 inline functions and class layouts (vendored wsrep headers
+    and MariaDB server-internal headers consumed at compile time)
+
+MariaDB Foundation publishes a "FOSS License Exception" that explicitly
+permits Apache-2.0 plugins to link against the GPL-2.0 server. Apache
+License 2.0 is on the FOSS Exception's list of permitted licences.
+
+If you redistribute the source tree of this repository, you must:
+
+  - retain this NOTICE file,
+  - retain the LICENSE file (Apache 2.0) for the plugin sources,
+  - retain the original COPYING / LICENSE files inside
+    `third_party/*/`, which carry the GPL-2.0 terms for the vendored
+    headers.
+
+If you redistribute the compiled `ha_stoolap.so` together with a
+MariaDB binary, the combined work falls under the FOSS License
+Exception. Compile-time-only consumption of the GPL-2.0 wsrep headers
+is consistent with the headers' redistribution terms.

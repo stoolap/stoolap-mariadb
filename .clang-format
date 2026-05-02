@@ -1,0 +1,76 @@
+---
+# Matches the existing hand-rolled style of src/*.{cc,h}:
+#   - 4-space indent, no tabs
+#   - opening brace on the same line as functions / control flow
+#   - `Type* name` (left-attached pointer)
+#   - ~80 column wrap with continuation aligned under the open paren
+#   - short single-statement bodies kept on one line
+#   - C-style casts get no space (`(int) x` -> `(int)x`); we use C++ casts.
+Language:        Cpp
+BasedOnStyle:    Google
+
+IndentWidth:     4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+ColumnLimit:     80
+UseTab:          Never
+TabWidth:        4
+
+PointerAlignment:        Left
+ReferenceAlignment:      Pointer
+DerivePointerAlignment:  false
+
+AlignAfterOpenBracket:   Align
+AlignConsecutiveAssignments:
+  Enabled:               false
+AlignConsecutiveDeclarations:
+  Enabled:               false
+AlignTrailingComments:   true
+AlignEscapedNewlines:    Left
+AlignOperands:           Align
+
+AllowShortBlocksOnASingleLine:        Empty
+AllowShortCaseLabelsOnASingleLine:    false
+AllowShortFunctionsOnASingleLine:     Inline
+AllowShortIfStatementsOnASingleLine:  WithoutElse
+AllowShortLambdasOnASingleLine:       All
+AllowShortLoopsOnASingleLine:         false
+
+BreakBeforeBraces:                Attach
+BreakConstructorInitializers:     BeforeColon
+BreakInheritanceList:             BeforeColon
+BreakBeforeTernaryOperators:      true
+BreakStringLiterals:              false
+
+# Don't reflow long URL / mid-comment text every time someone touches a
+# block; keep the carefully formatted block comments stable.
+ReflowComments:                   false
+
+# Local includes first (we have a flat src/ + a vendored third_party/);
+# system headers next; trust hand-ordered grouping inside a block.
+IncludeBlocks:                    Preserve
+SortIncludes:                     Never
+
+# Preserve the visual wrap on very long string literals (error messages
+# split across lines for log readability).
+PenaltyBreakString:               1000
+
+NamespaceIndentation:             None
+# We sometimes annotate the closing brace with a parenthetical
+# explanation (`}  // namespace (re-opened so helpers below have
+# external linkage)`); FixNamespaceComments would rewrite those to
+# the canonical bare form and orphan the rest of the comment.
+FixNamespaceComments:             false
+
+SpaceAfterCStyleCast:             false
+SpaceBeforeAssignmentOperators:   true
+SpaceBeforeParens:                ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpacesBeforeTrailingComments:     2
+SpacesInAngles:                   Never
+SpacesInContainerLiterals:        false
+SpacesInCStyleCastParentheses:    false
+SpacesInParentheses:              false
+SpacesInSquareBrackets:           false
+
+Standard:                         c++17

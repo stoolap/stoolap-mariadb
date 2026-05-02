@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  STOOLAP_VERSION: v0.4.0
+  MARIADB_VERSION: '11.4'
+
+jobs:
+  # ----------------------------------------------------------------------
+  # Build libstoolap once per OS using the pinned STOOLAP_VERSION (not
+  # main, the way CI does). Shared with build-plugin via artifact.
+  # ----------------------------------------------------------------------
+  build-lib:
+    name: Build libstoolap (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libstoolap.so
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: libstoolap.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Clone stoolap engine
+        run: git clone --depth 1 --branch $STOOLAP_VERSION https://github.com/stoolap/stoolap.git stoolap-engine
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            stoolap-engine/target
+            ~/.cargo/registry
+          key: rust-${{ matrix.target }}-${{ env.STOOLAP_VERSION }}
+
+      - name: Build libstoolap
+        working-directory: stoolap-engine
+        run: cargo build --release --features ffi
+
+      - name: Upload libstoolap
+        uses: actions/upload-artifact@v4
+        with:
+          name: stoolap-${{ matrix.target }}
+          path: |
+            stoolap-engine/target/release/${{ matrix.lib }}
+            stoolap-engine/include/stoolap.h
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------------
+  # Build the plugin per OS. We sanity-check with the test runner
+  # before packaging (catches "the binary built but doesn't load")
+  # but the actual release artifact is just the .so + libstoolap +
+  # README + LICENSE, packaged as a tarball.
+  # ----------------------------------------------------------------------
+  build-plugin:
+    name: Build & package plugin (${{ matrix.platform }}-${{ matrix.arch }})
+    needs: build-lib
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: libstoolap.dylib
+            plugin: ha_stoolap.so
+            platform: darwin
+            arch: arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libstoolap.so
+            plugin: ha_stoolap.so
+            platform: linux
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MariaDB ${{ env.MARIADB_VERSION }} (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install mariadb@${{ env.MARIADB_VERSION }} cmake
+          MARIADB_PREFIX="$(brew --prefix)/opt/mariadb@${{ env.MARIADB_VERSION }}"
+          echo "MARIADB_PREFIX=$MARIADB_PREFIX" >> $GITHUB_ENV
+          echo "$MARIADB_PREFIX/bin" >> $GITHUB_PATH
+
+      - name: Install MariaDB ${{ env.MARIADB_VERSION }} (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup \
+            | sudo bash -s -- --mariadb-server-version=$MARIADB_VERSION --skip-maxscale --skip-tools
+          sudo apt-get update
+          sudo apt-get install -y mariadb-server libmariadbd-dev cmake g++ python3-pip
+          sudo systemctl stop mariadb || true
+          PREFIX="$RUNNER_TEMP/mariadb-prefix"
+          mkdir -p "$PREFIX/include/mysql" "$PREFIX/lib/plugin" "$PREFIX/bin"
+          if [ -f /usr/include/mysql/server/private/handler.h ]; then
+            ln -s /usr/include/mysql "$PREFIX/include/mysql"
+          elif [ -f /usr/include/mariadb/server/private/handler.h ]; then
+            ln -s /usr/include/mariadb "$PREFIX/include/mysql"
+          else
+            echo "ERROR: server-internal handler.h not found" >&2
+            exit 1
+          fi
+          ln -sf /usr/sbin/mariadbd          "$PREFIX/bin/mariadbd"
+          ln -sf /usr/bin/mariadb-install-db "$PREFIX/bin/mariadb-install-db"
+          ln -sf /usr/bin/mariadb            "$PREFIX/bin/mariadb"
+          for so in /usr/lib/mysql/plugin/*.so; do
+            [ -e "$so" ] && ln -sf "$so" "$PREFIX/lib/plugin/" || true
+          done
+          echo "MARIADB_PREFIX=$PREFIX" >> $GITHUB_ENV
+
+      - name: Download libstoolap
+        uses: actions/download-artifact@v4
+        with:
+          name: stoolap-${{ matrix.target }}
+          path: stoolap-staging
+
+      - name: Stage stoolap (CMakeLists layout)
+        run: |
+          mkdir -p stoolap-fake/include stoolap-fake/target/release
+          cp stoolap-staging/include/stoolap.h stoolap-fake/include/
+          cp stoolap-staging/target/release/${{ matrix.lib }} stoolap-fake/target/release/
+
+      - name: Build plugin
+        run: |
+          cmake -S . -B build \
+            -DMARIADB_PREFIX=$MARIADB_PREFIX \
+            -DSTOOLAP_DIR=$PWD/stoolap-fake
+          cmake --build build -j
+
+      - name: Install + smoke test plugin (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          install -m 0755 build/${{ matrix.plugin }} $MARIADB_PREFIX/lib/plugin/
+          python3 -m pip install --break-system-packages --user mysql-connector-python
+          python3 tests/runner.py
+
+      - name: Install + smoke test plugin (Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sudo install -m 0755 stoolap-staging/target/release/${{ matrix.lib }} /usr/local/lib/
+          sudo ldconfig
+          sudo install -m 0755 build/${{ matrix.plugin }} /usr/lib/mysql/plugin/
+          pip install --user mysql-connector-python
+          python3 tests/runner.py
+
+      - name: Package
+        run: |
+          DIST_DIR="stoolap-mariadb-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}"
+          mkdir -p "$DIST_DIR"
+          cp build/${{ matrix.plugin }}                      "$DIST_DIR/"
+          cp stoolap-staging/target/release/${{ matrix.lib }} "$DIST_DIR/"
+          cp README.md LICENSE NOTICE                         "$DIST_DIR/"
+          cat > "$DIST_DIR/INSTALL.txt" <<EOF
+          stoolap-mariadb ${{ github.ref_name }} (${{ matrix.platform }}-${{ matrix.arch }})
+
+          Built against:
+            - stoolap        ${{ env.STOOLAP_VERSION }}
+            - MariaDB Server ${{ env.MARIADB_VERSION }}.x
+
+          Install:
+            1. Copy ${{ matrix.lib }} to a directory on the system
+               library path (e.g. /usr/local/lib on Linux,
+               $(brew --prefix 2>/dev/null || echo /usr/local)/lib
+               on macOS).
+            2. Copy ${{ matrix.plugin }} to MariaDB's plugin
+               directory (mariadb_config --plugindir).
+            3. Start mariadbd with --plugin-maturity=alpha and run:
+                 INSTALL PLUGIN stoolap SONAME 'ha_stoolap.so';
+
+          See README.md for configuration, status counters, and the
+          known limitations list.
+          EOF
+          tar czf "${DIST_DIR}.tar.gz" "$DIST_DIR"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: stoolap-mariadb-${{ matrix.platform }}-${{ matrix.arch }}
+          path: stoolap-mariadb-*.tar.gz
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------------
+  # Collect every per-OS package and attach to a fresh GitHub release.
+  # ----------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: build-plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: stoolap-mariadb-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
