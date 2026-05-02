@@ -135,7 +135,14 @@ else()
         INSTALL_RPATH "$ORIGIN;${STOOLAP_LIB_DIR}"
         BUILD_WITH_INSTALL_RPATH TRUE
     )
-    target_link_options(ha_stoolap PRIVATE -Wl,--unresolved-symbols=ignore-in-shared-libs)
+    # Defer ALL unresolved server symbols (handler::ha_thd, sql_print_*,
+    # thd_test_options, my_free, etc.) to dlopen() time inside mariadbd.
+    # `ignore-in-shared-libs` only relaxes symbols imported via -lfoo
+    # entries; the server symbols are referenced directly from our .o
+    # files and need `ignore-all` to skip the link-time check. Modern
+    # Ubuntu's default linker policy is --no-undefined for shared
+    # modules, which surfaces these as link errors without this flag.
+    target_link_options(ha_stoolap PRIVATE -Wl,--unresolved-symbols=ignore-all)
 endif()
 
 # ---------------------------------------------------------------------------

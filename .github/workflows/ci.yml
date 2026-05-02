@@ -125,6 +125,19 @@ jobs:
           mkdir -p stoolap-fake/include stoolap-fake/target/release
           cp stoolap-staging/include/stoolap.h stoolap-fake/include/
           cp stoolap-staging/target/release/libstoolap.dylib stoolap-fake/target/release/
+          # Rewrite the dylib's LC_ID_DYLIB to @rpath/libstoolap.dylib
+          # BEFORE building the plugin so the linker bakes that path
+          # into the plugin's LC_LOAD_DYLIB. Otherwise the plugin
+          # records the dylib's absolute build-time path, and dyld
+          # tries to load it from there at INSTALL PLUGIN time on
+          # any other host. Re-sign because install_name_tool
+          # invalidates the codesign blob; macOS 14+ refuses unsigned
+          # dylibs at dlopen.
+          install_name_tool -id @rpath/libstoolap.dylib \
+            stoolap-fake/target/release/libstoolap.dylib
+          codesign --remove-signature \
+            stoolap-fake/target/release/libstoolap.dylib || true
+          codesign --sign - stoolap-fake/target/release/libstoolap.dylib
 
       - name: Build plugin
         run: |
@@ -135,23 +148,13 @@ jobs:
 
       - name: Install plugin
         run: |
-          install -m 0755 build/ha_stoolap.so $MARIADB_PREFIX/lib/plugin/
           # The plugin's INSTALL_RPATH includes @loader_path, so the
-          # dylib must sit next to the .so in the plugin dir. But dyld
-          # checks the dylib's embedded install_name (LC_ID_DYLIB)
-          # FIRST, and stoolap's release build leaves it at the
-          # absolute build path on the runner -- which doesn't exist
-          # by the time mariadbd opens us. Rewrite it to @rpath/...
-          # so dyld falls through to the plugin's @loader_path lookup.
-          install -m 0755 stoolap-staging/target/release/libstoolap.dylib \
+          # dylib must sit next to the .so in the plugin dir for dyld
+          # to resolve the @rpath/libstoolap.dylib reference baked
+          # into the plugin at link time (see the staging step above).
+          install -m 0755 build/ha_stoolap.so $MARIADB_PREFIX/lib/plugin/
+          install -m 0755 stoolap-fake/target/release/libstoolap.dylib \
             $MARIADB_PREFIX/lib/plugin/
-          install_name_tool -id @rpath/libstoolap.dylib \
-            $MARIADB_PREFIX/lib/plugin/libstoolap.dylib
-          # Re-sign because install_name_tool invalidates the codesign
-          # blob, and macOS 14+ refuses unsigned dylibs at dlopen.
-          codesign --remove-signature \
-            $MARIADB_PREFIX/lib/plugin/libstoolap.dylib || true
-          codesign --sign - $MARIADB_PREFIX/lib/plugin/libstoolap.dylib
 
       - name: Install Python deps
         run: python3 -m pip install --break-system-packages --user mysql-connector-python
