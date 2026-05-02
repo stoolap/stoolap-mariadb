@@ -371,9 +371,49 @@ Already encoded in `CMakeLists.txt`, but worth knowing:
 
 ## Install
 
+The plugin links against `libstoolap.{so,dylib}`, so both files have to
+land somewhere `mariadbd` can find at `dlopen` time.
+
+### Linux
+
 ```sh
+sudo install -m 0755 ../stoolap/target/release/libstoolap.so /usr/local/lib/
+sudo ldconfig
 sudo install -m 0755 build/ha_stoolap.so "$(mariadb_config --plugindir)/"
 ```
+
+`/usr/local/lib` is on `ld.so`'s default search path; `ldconfig` refreshes
+the cache. The plugin's `INSTALL_RPATH` also includes `@loader_path`, so
+copying `libstoolap.so` next to the plugin works as an alternative.
+
+### macOS
+
+```sh
+PLUGIN_DIR="$(mariadb_config --plugindir)"
+sudo install -m 0755 build/ha_stoolap.so "$PLUGIN_DIR/"
+sudo install -m 0755 ../stoolap/target/release/libstoolap.dylib "$PLUGIN_DIR/"
+
+# stoolap's release dylib carries an absolute build-path install_name.
+# Rewrite to @rpath so dyld falls through to the plugin's @loader_path.
+sudo install_name_tool -id @rpath/libstoolap.dylib "$PLUGIN_DIR/libstoolap.dylib"
+sudo codesign --remove-signature "$PLUGIN_DIR/libstoolap.dylib" || true
+sudo codesign --sign - "$PLUGIN_DIR/libstoolap.dylib"
+```
+
+The `install_name_tool` step is critical: dyld checks the dylib's
+embedded `LC_ID_DYLIB` *before* the plugin's `@rpath`, and stoolap's
+release build leaves it at the absolute build-time path
+(`/Users/.../stoolap/target/release/libstoolap.dylib`), which fails
+to resolve on any other host. If you skip the rewrite and keep the
+build tree around, dyld will still find the dylib via its absolute
+install_name on your local box; new hosts (including containers and
+CI runners) will fail with `Library not loaded`.
+
+`codesign --sign -` (ad-hoc) is required after `install_name_tool`
+because it invalidates the existing codesign blob and macOS 14+
+refuses unsigned dylibs at `dlopen`.
+
+### Plugin directory paths
 
 `mariadb_config --plugindir` resolves to `/opt/homebrew/opt/mariadb@11.4/lib/plugin`
 on macOS (Brew), `/usr/lib/mysql/plugin` on Debian/Ubuntu, `/usr/lib64/mysql/plugin`
