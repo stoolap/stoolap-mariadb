@@ -56,17 +56,33 @@ extern stoolap_mariadb::Engine g_engine;
 // miss the session's snapshot.
 extern int register_trx(THD* thd);
 
-// Defined in ha_stoolap.cc. Maps a stoolap error string to the right
+// Defined in ha_stoolap.cc. Bundles a typed STOOLAP_ERR_* code with
+// the populated StoolapErrorDetails captured from one
+// stoolap_*_errdetails call. Pointers in `details` remain valid only
+// until the next FFI call on the originating handle.
+struct StoolapErrorView {
+    int32_t code;
+    StoolapErrorDetails details;
+};
+
+// Defined in ha_stoolap.cc. Capture the live error from a tx / db /
+// stmt / rows handle into a view that report_stoolap_error and
+// errkey_from_view can consume.
+extern StoolapErrorView fetch_db_error(StoolapDB* db);
+extern StoolapErrorView fetch_tx_error(StoolapTx* tx);
+
+// Defined in ha_stoolap.cc. Maps a stoolap error view to the right
 // HA_ERR_* code and, for generic-class codes, surfaces the original
 // text via my_printf_error so the user sees the real cause instead of
 // "Got error 168". Direct DML used to skip this and always returned
 // HA_ERR_GENERIC, hiding constraint failures behind error 1296.
-extern int report_stoolap_error(const char* msg);
+extern int report_stoolap_error(const StoolapErrorView& v);
 
-// Defined in ha_stoolap.cc. From a stoolap "unique constraint failed
-// ... on column X" message, returns the matching MariaDB key index so
-// the handler can publish errkey for ON DUPLICATE KEY / REPLACE.
-extern unsigned guess_errkey(const char* msg, TABLE_SHARE* share);
+// Defined in ha_stoolap.cc. From a stoolap typed UNIQUE / PRIMARY KEY
+// error (with details.constraint / details.column populated), returns
+// the matching MariaDB key index so the handler can publish errkey
+// for ON DUPLICATE KEY / REPLACE.
+extern unsigned errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share);
 
 // Brewed mariadbd doesn't ship the my_print_error_service struct that
 // `mysql/plugin.h` rewires my_error / my_printf_error through, so we undef
@@ -643,9 +659,10 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
                  : stoolap_exec_params(db, sql.c_str(), pv, pn, &rows_aff);
     }
     if (rc != STOOLAP_OK) {
+        StoolapErrorView verr =
+            ctx->has_tx() ? fetch_tx_error(ctx->tx()) : fetch_db_error(db);
         const char* msg =
-            ctx->has_tx() ? stoolap_tx_errmsg(ctx->tx()) : stoolap_errmsg(db);
-        if (!msg || !*msg) msg = "unknown error";
+            *verr.details.message ? verr.details.message : "unknown error";
         sql_print_error("stoolap: direct DML failed: %s", msg);
         // Map to the right HA_ERR_* (used to be a blanket
         // HA_ERR_GENERIC, which hid UNIQUE / FK / lock errors as a
@@ -660,11 +677,11 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
         // my_printf_error so the user sees a real reason. The
         // structured HA_ERR_* still drives SQLSTATE classification
         // and any handler-level retry logic.
-        const int mapped = report_stoolap_error(msg);
+        const int mapped = report_stoolap_error(verr);
         if (mapped == HA_ERR_FOUND_DUPP_KEY && errkey_out) {
             TABLE_LIST* tl = thd->lex->query_tables;
             TABLE_SHARE* share = (tl && tl->table) ? tl->table->s : nullptr;
-            *errkey_out = guess_errkey(msg, share);
+            *errkey_out = errkey_from_view(verr, share);
         }
         // MariaDB's direct-DML hooks don't always call print_error
         // after the engine returns, so the user would otherwise see a

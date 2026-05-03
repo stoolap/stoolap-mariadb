@@ -58,6 +58,13 @@ DEFAULT_COUNTER_DELTA_ALLOWLIST = {
     "Stoolap_records_live_counts",
     "Stoolap_buffered_scans",
     "Stoolap_buffered_rows",
+    # Stoolap-side typed-error gap signal: stoolap returned
+    # STOOLAP_ERR_GENERIC for an error class our prose pattern still
+    # classifies. The plugin behaviour stays correct (right HA_ERR_*,
+    # right SQLSTATE), so this is not a plugin regression -- it's an
+    # upstream signal to file. Read the counter via SHOW STATUS LIKE
+    # 'Stoolap_typed_fallback_hits' to spot which run produced it.
+    "Stoolap_typed_fallback_hits",
 }
 
 
@@ -155,18 +162,19 @@ class ServerCtx:
             return
 
         # Install the plugin into MariaDB's plugin dir. Skip if the
-        # destination already exists with the same byte content as our
-        # build artifact -- that's the CI flow, where the workflow has
-        # already done a `sudo install` before invoking the runner and
-        # the runner itself doesn't have sudo. Plain "exists" isn't
-        # enough because a stale plugin from a prior run would silently
-        # mask edits; comparing sizes catches "you forgot to re-copy
-        # after rebuilding" without needing a content hash.
+        # destination is at least as new as our build artifact -- that's
+        # the CI flow, where the workflow has already done a `sudo
+        # install` before invoking the runner and the runner itself
+        # doesn't have sudo. Comparing mtimes catches "you forgot to
+        # re-copy after rebuilding" without needing a content hash;
+        # byte-size used to be the gate but two different builds can
+        # produce identically-sized .so files (different inline expansion,
+        # same total bytes), silently masking edits.
         dst = f"{self.plugin_dir}/ha_stoolap.so"
         try:
             if (os.path.exists(dst) and
-                    os.path.getsize(dst) == os.path.getsize(self.plugin)):
-                pass  # already installed identically; CI flow
+                    os.path.getmtime(dst) >= os.path.getmtime(self.plugin)):
+                pass  # destination is up-to-date; CI flow
             else:
                 shutil.copyfile(self.plugin, dst)
         except (PermissionError, OSError) as e:

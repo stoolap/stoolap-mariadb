@@ -235,14 +235,87 @@ int query_params_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
                                 out_rows);
 }
 
-const char* errmsg_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback) {
-    if (ctx && ctx->has_tx()) return stoolap_tx_errmsg(ctx->tx());
-    return stoolap_errmsg(warm_db(ctx, fallback));
-}
-
 }  // namespace (close the anonymous namespace so the helpers below
 // have external linkage and ha_stoolap_select.cc can call them
 // for direct UPDATE / DELETE error mapping)
+
+/**
+ * Bundle of (typed code, populated details) captured from one
+ * stoolap_*_errdetails call. The pointer fields inside `details`
+ * remain valid until the next FFI call on the originating handle, so
+ * always consume the view inline (log it, hand it to
+ * report_stoolap_error / errkey_from_view) before issuing any further
+ * FFI on that handle. `details.message` is normalised to "" if the FFI
+ * left it NULL so callers don't need to NULL-check.
+ */
+struct StoolapErrorView {
+    int32_t code;
+    StoolapErrorDetails details;
+};
+
+namespace {
+
+/**
+ * Common tail: normalise message to "" and lift code from details.
+ *
+ * Defensive promotion: every caller fetches a view AFTER seeing a
+ * non-OK rc from the FFI, so a code that comes back STOOLAP_ERR_OK
+ * (NULL handle, the FFI returned no live error, the wrong handle was
+ * inspected) means our error fetching is broken -- not that the
+ * operation succeeded. Promote OK -> GENERIC so map_stoolap_errcode
+ * can never silently turn an FFI failure into a 0 return that
+ * MariaDB would treat as success. Mirror the promotion into
+ * details.code so any consumer reading from the struct sees the same
+ * code as the view's top-level field.
+ */
+StoolapErrorView finish_view(StoolapErrorView v) {
+    if (!v.details.message) v.details.message = "";
+    v.code = v.details.code;
+    if (v.code == STOOLAP_ERR_OK) {
+        v.code = STOOLAP_ERR_GENERIC;
+        v.details.code = STOOLAP_ERR_GENERIC;
+    }
+    return v;
+}
+
+}  // namespace
+
+StoolapErrorView fetch_db_error(StoolapDB* db) {
+    StoolapErrorView v{};
+    if (db) (void)stoolap_errdetails(db, &v.details);
+    return finish_view(v);
+}
+
+StoolapErrorView fetch_tx_error(StoolapTx* tx) {
+    StoolapErrorView v{};
+    if (tx) (void)stoolap_tx_errdetails(tx, &v.details);
+    return finish_view(v);
+}
+
+StoolapErrorView fetch_stmt_error(StoolapStmt* stmt) {
+    StoolapErrorView v{};
+    if (stmt) (void)stoolap_stmt_errdetails(stmt, &v.details);
+    return finish_view(v);
+}
+
+StoolapErrorView fetch_rows_error(StoolapRows* rows) {
+    StoolapErrorView v{};
+    if (rows) (void)stoolap_rows_errdetails(rows, &v.details);
+    return finish_view(v);
+}
+
+/**
+ * Mirror of errmsg_via: pick the handle that actually holds the live
+ * error. Inside an open tx, the tx handle owns the last operation's
+ * error; outside, the warm db handle does. Same fallback chain so a
+ * typed read sees the same error string the legacy errmsg_via did.
+ */
+StoolapErrorView fetch_error_via(stoolap_mariadb::ThdContext* ctx,
+                                 StoolapDB* fallback) {
+    if (ctx && ctx->has_tx()) return fetch_tx_error(ctx->tx());
+    StoolapDB* d = (ctx && ctx->db()) ? ctx->db() : fallback;
+    return fetch_db_error(d);
+}
 
 /**
  * Find the index whose first key part is the named column. Returns MAX_KEY
@@ -292,25 +365,59 @@ std::string_view extract_token(std::string_view msg, size_t pos) {
     return msg.substr(pos, end - pos);
 }
 
+/** Find a key by its declared name (case-insensitive). MAX_KEY if no
+ *  match. Used when stoolap hands us the index name through
+ *  StoolapErrorDetails.constraint, which is the most precise routing
+ *  for a UNIQUE collision: no message parsing, no leading-column guess. */
+uint find_key_by_name(TABLE_SHARE* share, std::string_view name) {
+    if (!share || name.empty()) return MAX_KEY;
+    for (uint i = 0; i < share->keys; ++i) {
+        const KEY& k = share->key_info[i];
+        if (k.name.length == name.size() &&
+            ::strncasecmp(k.name.str, name.data(), name.size()) == 0) {
+            return i;
+        }
+    }
+    return MAX_KEY;
+}
+
 /**
- * Inspect a stoolap constraint error and figure out which MariaDB key
- * index was violated, so the handler can set `errkey`. Stoolap's UNIQUE
- * error format (from ../stoolap/src/core/error.rs):
- *   "unique constraint failed for index NAME on column COL with value V"
- * Stoolap's PK error format:
- *   "primary key constraint failed with ROWID already exists in this table"
- * Falls back to `primary_key` (or 0) when the message can't be parsed.
+ * Resolve the violated MariaDB key index for an errkey publish.
+ *
+ * Preferred path (typed FFI): StoolapErrorDetails.constraint carries
+ * the offending index name -- match it directly, no message parsing.
+ * Stoolap names PK indexes after the table+column though, so for
+ * STOOLAP_ERR_PRIMARY_KEY we just return share->primary_key.
+ *
+ * Legacy fallback (prose grep): for transitions where stoolap returns
+ * STOOLAP_ERR_GENERIC with a recognisable message ("unique constraint
+ * failed ... on column X"), reuse the original column-extraction logic
+ * so the errkey routing keeps working until the typed surface fully
+ * lands.
  */
-uint guess_errkey(const char* msg, TABLE_SHARE* share) {
-    auto starts_with = [](std::string_view s, std::string_view prefix) {
-        return s.size() >= prefix.size() &&
-               s.compare(0, prefix.size(), prefix) == 0;
-    };
-    if (msg && share) {
-        std::string_view m(msg);
-        if (starts_with(m, "primary key constraint failed")) {
+uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
+    if (!share) return 0;
+    if (v.code == STOOLAP_ERR_PRIMARY_KEY) {
+        if (share->primary_key < share->keys) return share->primary_key;
+    } else if (v.code == STOOLAP_ERR_UNIQUE) {
+        if (v.details.constraint && *v.details.constraint) {
+            uint k = find_key_by_name(share, v.details.constraint);
+            if (k != MAX_KEY) return k;
+        }
+        if (v.details.column && *v.details.column) {
+            uint k = find_key_for_column(share, v.details.column);
+            if (k != MAX_KEY) return k;
+        }
+    }
+    // Prose fallback (stoolap returned GENERIC for what looks like a dup).
+    if (v.details.message && *v.details.message) {
+        std::string_view m(v.details.message);
+        auto starts_with = [&](std::string_view p) {
+            return m.size() >= p.size() && m.compare(0, p.size(), p) == 0;
+        };
+        if (starts_with("primary key constraint failed")) {
             if (share->primary_key < share->keys) return share->primary_key;
-        } else if (starts_with(m, "unique constraint failed")) {
+        } else if (starts_with("unique constraint failed")) {
             const auto col = m.find("on column ");
             if (col != std::string_view::npos) {
                 std::string_view name =
@@ -322,22 +429,114 @@ uint guess_errkey(const char* msg, TABLE_SHARE* share) {
             }
         }
     }
-    if (share && share->primary_key < share->keys) return share->primary_key;
+    if (share->primary_key < share->keys) return share->primary_key;
     return 0;
 }
 
 /**
- * Map a stoolap error message to a MariaDB handler error code.
+ * Mapping result for a typed STOOLAP_ERR_* code.
+ *
+ * `ha_err` is the MariaDB HA_ERR_* the plugin should return.
+ *
+ * `known` is true iff the code matched an explicit case in the switch
+ * below. False means the value fell through `default` -- a future
+ * stoolap added a code we haven't taught the plugin about yet. The
+ * distinction matters for report_stoolap_error: the prose-grep
+ * fallback is only safe to run for unknown codes (or for codes
+ * stoolap explicitly flagged as "no info": GENERIC, INTERNAL).
+ * Codes the plugin DELIBERATELY maps to HA_ERR_GENERIC because no
+ * specific MariaDB code exists (NOT_NULL, CHECK, TYPE_MISMATCH, ...)
+ * are `known=true`, so prose-grep doesn't get a chance to remap them
+ * incorrectly.
+ */
+struct ErrcodeMap {
+    int ha_err;
+    bool known;
+};
+
+/**
+ * Map a typed stoolap error code (STOOLAP_ERR_*) to a MariaDB
+ * HA_ERR_*. Source of truth for the codes: stoolap.h.
+ *
+ * Unknown / future STOOLAP_ERR_* values fall through to HA_ERR_GENERIC
+ * with `known=false`, so a stoolap that adds a new code without a
+ * plugin recompile still produces a usable error (the user sees the
+ * message via report_stoolap_error). The legacy prose-grep map is
+ * kept as a safety net for that case -- when the typed code is
+ * unknown / GENERIC / INTERNAL but the prose still recognises the
+ * wording, we record a Stoolap_typed_fallback_hits bump so the gap
+ * is visible.
+ */
+ErrcodeMap map_stoolap_errcode(int32_t code) {
+    switch (code) {
+        case STOOLAP_ERR_OK:
+            return {0, true};
+        case STOOLAP_ERR_PRIMARY_KEY:
+        case STOOLAP_ERR_UNIQUE:
+            return {HA_ERR_FOUND_DUPP_KEY, true};
+        case STOOLAP_ERR_FOREIGN_KEY:
+            return {HA_ERR_NO_REFERENCED_ROW, true};
+        case STOOLAP_ERR_TABLE_NOT_FOUND:
+        case STOOLAP_ERR_VIEW_NOT_FOUND:
+            return {HA_ERR_NO_SUCH_TABLE, true};
+        case STOOLAP_ERR_TABLE_EXISTS:
+        case STOOLAP_ERR_VIEW_EXISTS:
+        case STOOLAP_ERR_INDEX_EXISTS:
+            return {HA_ERR_TABLE_EXIST, true};
+        case STOOLAP_ERR_TX_ABORTED:
+        case STOOLAP_ERR_DB_LOCKED:
+            // Stoolap doesn't yet split deadlock vs lock-wait; both
+            // surface as 40001 via HA_ERR_LOCK_DEADLOCK so clients
+            // know to retry the tx.
+            return {HA_ERR_LOCK_DEADLOCK, true};
+        case STOOLAP_ERR_NOT_SUPPORTED:
+            return {HA_ERR_UNSUPPORTED, true};
+        case STOOLAP_ERR_READ_ONLY:
+            return {HA_ERR_TABLE_READONLY, true};
+        case STOOLAP_ERR_NOT_NULL:
+        case STOOLAP_ERR_CHECK:
+        case STOOLAP_ERR_TYPE_MISMATCH:
+        case STOOLAP_ERR_VALUE_TOO_LONG:
+        case STOOLAP_ERR_INVALID_ARGUMENT:
+        case STOOLAP_ERR_PARSE:
+        case STOOLAP_ERR_DIVISION_BY_ZERO:
+        case STOOLAP_ERR_COLUMN_NOT_FOUND:
+        case STOOLAP_ERR_INDEX_NOT_FOUND:
+        case STOOLAP_ERR_TX_CLOSED:
+        case STOOLAP_ERR_IO:
+        case STOOLAP_ERR_QUERY_CANCELLED:
+        case STOOLAP_ERR_REOPEN_REQUIRED:
+            // No specific HA_ERR_* in MariaDB for these; surface as
+            // ER_GET_ERRMSG (1296) with the stoolap text via
+            // report_stoolap_error. `known=true` so prose-grep does
+            // NOT get a chance to remap them.
+            return {HA_ERR_GENERIC, true};
+        case STOOLAP_ERR_GENERIC:
+        case STOOLAP_ERR_INTERNAL:
+            // Stoolap explicitly said "I have no specific
+            // classification for this." Fall through to prose-grep
+            // (rc=GENERIC, known=true) so the legacy patterns can
+            // still pin lock-class / table-class messages until the
+            // typed surface fully covers them.
+            return {HA_ERR_GENERIC, true};
+        default:
+            // Unknown future code. `known=false` lets the prose
+            // fallback try, and lets unmapped_errors bump if even
+            // prose can't classify.
+            return {HA_ERR_GENERIC, false};
+    }
+}
+
+/**
+ * Legacy prose-grep map. Kept as a fallback path when stoolap returns
+ * a generic typed code (STOOLAP_ERR_GENERIC) for an error whose
+ * wording we can still classify -- see report_stoolap_error. Once the
+ * typed surface fully covers every observed error (typed_fallback_hits
+ * stays 0 across a real run) this can retire.
  *
  * Source of truth: stoolap's `Error` enum in
  * ../stoolap/src/core/error.rs. Each pattern below is anchored at the
- * known position in the canonical format string. Wording drift on
- * stoolap's side surfaces as a bumped `Stoolap_unmapped_errors` status
- * counter (see report_stoolap_error) and a degraded ER_GET_ERRMSG
- * (1296) to the user — the message text still reaches the client, only
- * the error number is generic. Tests in case_18_error_mapping.py pin
- * the round-trip from stoolap text to MariaDB errno; run them against
- * a stoolap upgrade to detect drift.
+ * known position in the canonical format string.
  */
 int map_stoolap_error(const char* msg) {
     if (!msg) return HA_ERR_GENERIC;
@@ -428,33 +627,72 @@ extern "C" void my_printf_error(unsigned int nr, const char* fmt,
                                 unsigned long MyFlags, ...);
 
 /**
- * Map+publish: classify a stoolap error message into a HA_ERR_* code and,
- * for the generic-class codes that MariaDB would otherwise print as
- * "Got error 168 \"Unknown (generic) error from engine\"", stash the real
- * stoolap text via my_printf_error so the client sees the underlying
- * cause. Specific HA_ERR_* codes (HA_ERR_FOUND_DUPP_KEY,
- * HA_ERR_NO_REFERENCED_ROW, HA_ERR_TABLE_EXIST, etc.) get descriptive
- * server-side messages from MariaDB itself, so we don't override those.
+ * Map+publish: take an error view (typed code + populated details from
+ * one stoolap_*_errdetails call) and convert it to a HA_ERR_* while
+ * making sure the user sees the cause.
+ *
+ * Resolution order:
+ *   1. Typed errcode -> HA_ERR_*. Fast and unambiguous when stoolap
+ *      returned a specific STOOLAP_ERR_* code.
+ *   2. If typed says GENERIC, fall back to prose-grep on the message.
+ *      Bump Stoolap_typed_fallback_hits when the prose finds something
+ *      specific -- that signals a stoolap-side typed-error gap.
+ *   3. If both come back generic, bump Stoolap_unmapped_errors -- the
+ *      pattern table has drifted and we don't know what this error is.
+ *
+ * For HA_ERR_GENERIC / HA_ERR_UNSUPPORTED (which MariaDB would
+ * otherwise print as "Got error 168"), we stash the real stoolap text
+ * via my_printf_error so the client sees the underlying cause.
+ * Specific HA_ERR_* codes (HA_ERR_FOUND_DUPP_KEY, ...) get descriptive
+ * server-side messages from MariaDB itself.
  */
-int report_stoolap_error(const char* msg) {
-    int rc = map_stoolap_error(msg);
-    const bool needs_text = (rc == HA_ERR_GENERIC || rc == HA_ERR_UNSUPPORTED);
-    if (needs_text && msg && *msg) {
-        my_printf_error(ER_GET_ERRMSG, "stoolap: %s", MYF(0), msg);
+int report_stoolap_error(const StoolapErrorView& v) {
+    const char* msg = v.details.message;  // never NULL (see fetch helpers)
+    const bool have_text = (msg && *msg);
+
+    const ErrcodeMap m = map_stoolap_errcode(v.code);
+    int rc = m.ha_err;
+
+    // Prose fallback gating. Only run prose-grep when the typed
+    // surface didn't have a specific opinion -- either it's an
+    // unknown future code (m.known=false) or stoolap explicitly said
+    // "no info" (GENERIC / INTERNAL). Codes we deliberately mapped
+    // to HA_ERR_GENERIC because no specific MariaDB code exists
+    // (NOT_NULL, CHECK, TYPE_MISMATCH, ...) are KNOWN and we trust
+    // the typed surface for them -- prose-grep would only get a
+    // chance to misclassify.
+    const bool typed_unhelpful = !m.known || v.code == STOOLAP_ERR_GENERIC ||
+                                 v.code == STOOLAP_ERR_INTERNAL;
+    if (rc == HA_ERR_GENERIC && have_text && typed_unhelpful) {
+        const int prose_rc = map_stoolap_error(msg);
+        if (prose_rc != HA_ERR_GENERIC) {
+            // Typed surface lost an error class the prose can still
+            // classify -- record the gap and use the prose result so
+            // the user gets the right SQLSTATE. Log the (code, msg)
+            // pair so an operator can file an upstream typed-error
+            // request -- this is the signal that turns the counter
+            // from "something is off" into "here is the wording".
+            stoolap_mariadb::g_stats.typed_fallback_hits.fetch_add(
+                1, std::memory_order_relaxed);
+            sql_print_information(
+                "stoolap typed-error gap: code=%d msg='%s' "
+                "(prose mapped to ha_err=%d) -- file upstream so the "
+                "STOOLAP_ERR_* layer covers it directly",
+                v.code, msg, prose_rc);
+            rc = prose_rc;
+        } else {
+            // Both typed AND prose gave up on a non-empty error.
+            // Either stoolap added a code we don't recognise (m.known
+            // is false) OR an explicit GENERIC/INTERNAL came with a
+            // message wording our patterns no longer match.
+            stoolap_mariadb::g_stats.unmapped_errors.fetch_add(
+                1, std::memory_order_relaxed);
+        }
     }
-    // Telemetry: when map_stoolap_error degrades a non-empty stoolap
-    // message to HA_ERR_GENERIC, the pattern table has fallen behind
-    // stoolap's wording. Surfaced via SHOW STATUS LIKE
-    // 'Stoolap_unmapped_errors'; the case_18 smoke test asserts this
-    // counter stays at 0 across all known error classes, so a stoolap
-    // upgrade that reworded one of them fails the test.
-    //
-    // HA_ERR_UNSUPPORTED maps cleanly via the "not supported" /
-    // "unsupported" patterns, so it's NOT counted as unmapped even
-    // though it shares the my_printf_error path.
-    if (rc == HA_ERR_GENERIC && msg && *msg) {
-        stoolap_mariadb::g_stats.unmapped_errors.fetch_add(
-            1, std::memory_order_relaxed);
+
+    const bool needs_text = (rc == HA_ERR_GENERIC || rc == HA_ERR_UNSUPPORTED);
+    if (needs_text && have_text) {
+        my_printf_error(ER_GET_ERRMSG, "stoolap: %s", MYF(0), msg);
     }
     return rc;
 }
@@ -1205,10 +1443,10 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
                                            /*if_not_exists=*/true);
         if (sql.empty()) return HA_ERR_UNSUPPORTED;
         if (stoolap_exec(d, sql.c_str(), nullptr) != STOOLAP_OK) {
-            const char* msg = stoolap_errmsg(d);
+            auto verr = fetch_db_error(d);
             sql_print_error("stoolap: schema reconcile failed for '%s': %s",
-                            stoolap_table_.c_str(), msg);
-            return report_stoolap_error(msg);
+                            stoolap_table_.c_str(), verr.details.message);
+            return report_stoolap_error(verr);
         }
         // Re-emit non-unique secondary indexes too. CREATE TABLE IF NOT
         // EXISTS only re-creates the table; without the matching CREATE
@@ -1306,9 +1544,10 @@ int ha_stoolap::create(const char* name, TABLE* form,
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
     if (stoolap_exec(db, sql.c_str(), nullptr) != STOOLAP_OK) {
-        const char* msg = stoolap_errmsg(db);
-        sql_print_error("stoolap: CREATE TABLE failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_db_error(db);
+        sql_print_error("stoolap: CREATE TABLE failed: %s",
+                        verr.details.message);
+        return report_stoolap_error(verr);
     }
     g_engine.mark_reconciled(tbl);
     create_secondary_indexes(db, tbl, form);
@@ -1323,9 +1562,9 @@ int ha_stoolap::delete_table(const char* name) {
     if (!db) return HA_ERR_OUT_OF_MEM;
     int rc = stoolap_exec(db, sql.c_str(), nullptr);
     if (rc != STOOLAP_OK) {
-        const char* msg = stoolap_errmsg(db);
-        sql_print_error("stoolap: DROP TABLE failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_db_error(db);
+        sql_print_error("stoolap: DROP TABLE failed: %s", verr.details.message);
+        return report_stoolap_error(verr);
     }
     g_engine.drop_reconciled(flat);
     g_engine.records_drop(flat);
@@ -1347,9 +1586,10 @@ int ha_stoolap::rename_table(const char* from, const char* to) {
     if (!db) return HA_ERR_OUT_OF_MEM;
     int rc = stoolap_exec(db, sql.c_str(), nullptr);
     if (rc != STOOLAP_OK) {
-        const char* msg = stoolap_errmsg(db);
-        sql_print_error("stoolap: RENAME TABLE failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_db_error(db);
+        sql_print_error("stoolap: RENAME TABLE failed: %s",
+                        verr.details.message);
+        return report_stoolap_error(verr);
     }
     // Old name is gone; new name is now reconciled (we just verified it
     // exists by renaming to it).
@@ -1649,12 +1889,13 @@ int ha_stoolap::flush_bulk_buffer() {
         StoolapStmt* fresh = nullptr;
         if (stoolap_prepare(db_for_prepare, insert_sql_.c_str(), &fresh) !=
             STOOLAP_OK) {
-            const char* msg = stoolap_errmsg(db_for_prepare);
-            sql_print_error("stoolap: prepare bulk INSERT failed: %s",
-                            msg ? msg : "(no detail)");
+            auto verr = fetch_db_error(db_for_prepare);
+            sql_print_error(
+                "stoolap: prepare bulk INSERT failed: %s",
+                *verr.details.message ? verr.details.message : "(no detail)");
             bulk_params_.clear();
             bulk_text_holders_.clear();
-            return report_stoolap_error(msg);
+            return report_stoolap_error(verr);
         }
         stmt_raw = fresh;
         if (ctx) {
@@ -1693,16 +1934,19 @@ int ha_stoolap::flush_bulk_buffer() {
     bulk_params_.clear();
     bulk_text_holders_.clear();
     if (rc != STOOLAP_OK) {
-        const char* msg = (ctx && ctx->has_tx())
-                              ? stoolap_tx_errmsg(ctx->tx())
-                              : stoolap_stmt_errmsg(stmt_raw);
-        if (!msg || !*msg) msg = stoolap_errmsg(db_for_prepare);
-        sql_print_error("stoolap: batch INSERT failed: %s",
-                        msg ? msg : "(no detail)");
+        StoolapErrorView verr = (ctx && ctx->has_tx())
+                                    ? fetch_tx_error(ctx->tx())
+                                    : fetch_stmt_error(stmt_raw);
+        if (verr.code == STOOLAP_ERR_OK || !*verr.details.message) {
+            verr = fetch_db_error(db_for_prepare);
+        }
+        sql_print_error(
+            "stoolap: batch INSERT failed: %s",
+            *verr.details.message ? verr.details.message : "(no detail)");
         invalidate_records_cache();
-        int err = report_stoolap_error(msg);
+        int err = report_stoolap_error(verr);
         if (err == HA_ERR_FOUND_DUPP_KEY) {
-            last_dup_key_ = guess_errkey(msg, table->s);
+            last_dup_key_ = errkey_from_view(verr, table->s);
             errkey = last_dup_key_;
         }
         return err;
@@ -1873,11 +2117,12 @@ int ha_stoolap::write_row(const uchar* buf) {
             int rc = exec_via(ctx, db_raw(), insert_sql_.c_str(), params.data(),
                               static_cast<int32_t>(params.size()), &affected);
             if (rc != STOOLAP_OK) {
-                const char* msg = errmsg_via(ctx, db_raw());
-                sql_print_error("stoolap: INSERT failed: %s", msg);
-                err = report_stoolap_error(msg);
+                auto verr = fetch_error_via(ctx, db_raw());
+                sql_print_error("stoolap: INSERT failed: %s",
+                                verr.details.message);
+                err = report_stoolap_error(verr);
                 if (err == HA_ERR_FOUND_DUPP_KEY) {
-                    last_dup_key_ = guess_errkey(msg, table_share);
+                    last_dup_key_ = errkey_from_view(verr, table_share);
                     errkey = last_dup_key_;
                 }
             } else {
@@ -1988,9 +2233,9 @@ int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
         int rc = exec_via(ctx, db_raw(), sql.c_str(), params.data(),
                           static_cast<int32_t>(params.size()), &affected);
         if (rc != STOOLAP_OK) {
-            const char* msg = errmsg_via(ctx, db_raw());
-            sql_print_error("stoolap: UPDATE failed: %s", msg);
-            err = report_stoolap_error(msg);
+            auto verr = fetch_error_via(ctx, db_raw());
+            sql_print_error("stoolap: UPDATE failed: %s", verr.details.message);
+            err = report_stoolap_error(verr);
         } else if (affected == 0) {
             err =
                 HA_ERR_RECORD_DELETED;  // row vanished between scan and update
@@ -2029,9 +2274,9 @@ int ha_stoolap::delete_row(const uchar* buf) {
         int rc = exec_via(ctx, db_raw(), sql.c_str(), params.data(),
                           static_cast<int32_t>(params.size()), &affected);
         if (rc != STOOLAP_OK) {
-            const char* msg = errmsg_via(ctx, db_raw());
-            sql_print_error("stoolap: DELETE failed: %s", msg);
-            err = report_stoolap_error(msg);
+            auto verr = fetch_error_via(ctx, db_raw());
+            sql_print_error("stoolap: DELETE failed: %s", verr.details.message);
+            err = report_stoolap_error(verr);
         } else if (affected == 0) {
             err = HA_ERR_RECORD_DELETED;
         } else {
@@ -2049,9 +2294,9 @@ int ha_stoolap::analyze(THD* /*thd*/, HA_CHECK_OPT* /*opt*/) {
     std::string sql = "ANALYZE TABLE ";
     sql += quote_ident(stoolap_table_);
     if (stoolap_exec(db_ensure(), sql.c_str(), nullptr) != STOOLAP_OK) {
-        const char* msg = stoolap_errmsg(db_raw());
-        sql_print_error("stoolap: ANALYZE failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_db_error(db_raw());
+        sql_print_error("stoolap: ANALYZE failed: %s", verr.details.message);
+        return report_stoolap_error(verr);
     }
     return 0;
 }
@@ -2219,9 +2464,9 @@ int ha_stoolap::delete_all_rows() {
     sql += quote_ident(stoolap_table_);
 
     if (stoolap_exec(db_ensure(), sql.c_str(), nullptr) != STOOLAP_OK) {
-        const char* msg = stoolap_errmsg(db_raw());
-        sql_print_error("stoolap: TRUNCATE failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_db_error(db_raw());
+        sql_print_error("stoolap: TRUNCATE failed: %s", verr.details.message);
+        return report_stoolap_error(verr);
     }
     set_count_exact(0);
     // AUTO_INCREMENT reservations are now stale: stoolap's MAX for this
@@ -2296,9 +2541,9 @@ int ha_stoolap::rnd_init(bool /*scan*/) {
     StoolapRows* rows = nullptr;
     int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
     if (rc != STOOLAP_OK) {
-        const char* msg = errmsg_via(ctx, db_raw());
-        sql_print_error("stoolap: SELECT failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_error_via(ctx, db_raw());
+        sql_print_error("stoolap: SELECT failed: %s", verr.details.message);
+        return report_stoolap_error(verr);
     }
 
     // Pick between Tier 3 buffered scan and the original streaming path.
@@ -2811,9 +3056,10 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     int rc = query_params_via(ctx, db_raw(), sql.c_str(), params.data(),
                               static_cast<int32_t>(params.size()), &rows);
     if (rc != STOOLAP_OK) {
-        const char* msg = errmsg_via(ctx, db_raw());
-        sql_print_error("stoolap: index_read SELECT failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_error_via(ctx, db_raw());
+        sql_print_error("stoolap: index_read SELECT failed: %s",
+                        verr.details.message);
+        return report_stoolap_error(verr);
     }
     scan_.reset(rows);
 
@@ -2891,9 +3137,10 @@ int ha_stoolap::index_first(uchar* buf) {
     StoolapRows* rows = nullptr;
     int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
     if (rc != STOOLAP_OK) {
-        const char* msg = errmsg_via(ctx, db_raw());
-        sql_print_error("stoolap: index_first SELECT failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_error_via(ctx, db_raw());
+        sql_print_error("stoolap: index_first SELECT failed: %s",
+                        verr.details.message);
+        return report_stoolap_error(verr);
     }
     scan_.reset(rows);
     int next_rc = rnd_next(buf);
@@ -2921,9 +3168,10 @@ int ha_stoolap::index_last(uchar* buf) {
     StoolapRows* rows = nullptr;
     int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
     if (rc != STOOLAP_OK) {
-        const char* msg = errmsg_via(ctx, db_raw());
-        sql_print_error("stoolap: index_last SELECT failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_error_via(ctx, db_raw());
+        sql_print_error("stoolap: index_last SELECT failed: %s",
+                        verr.details.message);
+        return report_stoolap_error(verr);
     }
     scan_.reset(rows);
     int next_rc = rnd_next(buf);
@@ -3233,9 +3481,10 @@ int ha_stoolap::read_range_first(const key_range* start_key,
     int rc = query_params_via(ctx, db_raw(), sql.c_str(), params.data(),
                               static_cast<int32_t>(params.size()), &rows);
     if (rc != STOOLAP_OK) {
-        const char* msg = errmsg_via(ctx, db_raw());
-        sql_print_error("stoolap: read_range query failed: %s", msg);
-        return report_stoolap_error(msg);
+        auto verr = fetch_error_via(ctx, db_raw());
+        sql_print_error("stoolap: read_range query failed: %s",
+                        verr.details.message);
+        return report_stoolap_error(verr);
     }
     scan_.reset(rows);
     int next_rc = rnd_next(table->record[0]);
@@ -3812,14 +4061,23 @@ static struct st_mysql_show_var stoolap_status_vars[] = {
      SHOW_LONGLONG},
     {"Stoolap_buffered_scans", _SS_PTR(buffered_scans), SHOW_LONGLONG},
     {"Stoolap_buffered_rows", _SS_PTR(buffered_rows), SHOW_LONGLONG},
-    // Drift detector for the error mapping table. Bumped every time
-    // map_stoolap_error degrades a non-empty stoolap message to
-    // HA_ERR_GENERIC -- which means stoolap reworded an error and our
-    // pattern table missed it. The user still gets the raw stoolap
-    // text via ER_GET_ERRMSG (1296), but the SQLSTATE class is wrong.
-    // case_18_error_mapping.py asserts this stays at 0 across every
-    // known error class.
+    // Drift detectors for the error mapping table.
+    //
+    // Stoolap_unmapped_errors: BOTH the typed errcode AND the prose
+    // pattern table came back generic for a non-empty stoolap message.
+    // Either stoolap added a STOOLAP_ERR_* we don't recognise OR
+    // reworded the message away from every known anchor. case_18
+    // pins this at 0 across every known error class.
+    //
+    // Stoolap_typed_fallback_hits: typed errcode said GENERIC but the
+    // prose pattern still classified the message into a specific
+    // HA_ERR_*. Means stoolap returned a generic typed code for an
+    // error we know how to pin down by text -- a stoolap-side typed-
+    // error gap. Once both stay 0 across a real run the prose fallback
+    // can retire.
     {"Stoolap_unmapped_errors", _SS_PTR(unmapped_errors), SHOW_LONGLONG},
+    {"Stoolap_typed_fallback_hits", _SS_PTR(typed_fallback_hits),
+     SHOW_LONGLONG},
     // PERF DEBUG: aggregate nanoseconds per phase across all pushed
     // SELECTs. Divide by Stoolap_perf_query_count (or _next_row_count
     // for next_row_ns) to read off per-query / per-row averages. Always

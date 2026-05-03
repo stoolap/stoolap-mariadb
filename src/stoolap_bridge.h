@@ -222,10 +222,17 @@ struct PushdownStats {
     std::atomic<uint64_t> records_live_counts{
         0};  // cached_records() had to issue live COUNT(*)
     std::atomic<uint64_t> unmapped_errors{
-        0};  // stoolap returned an error string we couldn't classify
-             // -- degraded to ER_GET_ERRMSG (1296) with the raw stoolap
-             // text. Non-zero means map_stoolap_error has fallen behind
-             // stoolap's wording; see ../stoolap/src/core/error.rs.
+        0};  // BOTH the typed errcode AND the prose pattern table came back
+             // generic. Either stoolap added a STOOLAP_ERR_* code we don't
+             // recognise OR it returned a brand-new message wording. Either
+             // way the user sees ER_GET_ERRMSG (1296) with the raw text.
+    std::atomic<uint64_t> typed_fallback_hits{
+        0};  // typed errcode was STOOLAP_ERR_GENERIC but the prose pattern
+             // still classified the message into a specific HA_ERR_*. Means
+             // stoolap returned a generic code for an error we know how to
+             // pin down by text -- a stoolap-side typed-error gap. When this
+             // and unmapped_errors both stay 0 across a real run, the prose
+             // fallback can be retired.
 
     // Per-phase timing buckets for pushdown latency profiling. Gated by
     // perf_trace_enabled below (default OFF) because the per-row clocks
