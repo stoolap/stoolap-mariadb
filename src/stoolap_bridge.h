@@ -220,7 +220,13 @@ struct PushdownStats {
     std::atomic<uint64_t> direct_modify_hits{
         0};  // direct_update_rows / direct_delete_rows took it
     std::atomic<uint64_t> records_live_counts{
-        0};  // cached_records() had to issue live COUNT(*)
+        0};  // cached_records() cache miss that had to fetch a fresh
+             // count from stoolap. After PR-B this is an O(1) atomic
+             // load via stoolap_(tx_)table_count rather than a real
+             // SELECT COUNT(*); the counter still measures cache
+             // effectiveness (high values mean handler/tx/global
+             // caches are not being reused) but the cost per miss
+             // is now negligible.
     std::atomic<uint64_t> unmapped_errors{
         0};  // BOTH the typed errcode AND the prose pattern table came back
              // generic. Either stoolap added a STOOLAP_ERR_* code we don't

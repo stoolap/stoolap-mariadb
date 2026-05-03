@@ -235,6 +235,24 @@ int query_params_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
                                 out_rows);
 }
 
+/**
+ * MVCC-safe table count via the typed FFI (Bucket A). Inside an open
+ * tx, stoolap_tx_table_count returns the snapshot-correct count
+ * including the session's uncommitted INSERT/DELETE; otherwise
+ * Database::table_count returns the autocommit-visible count via
+ * the SegmentedTable fast path (O(1) atomic loads). Replaces the old
+ * SELECT COUNT(*) ... WHERE 1=1 trick that existed solely to defeat
+ * stoolap's pre-typed bare-COUNT(*) metadata fast path, which used
+ * to leak rows from in-flight/rolled-back transactions.
+ */
+int count_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
+              const char* table, uint64_t* out_count) {
+    if (ctx && ctx->has_tx()) {
+        return stoolap_tx_table_count(ctx->tx(), table, out_count);
+    }
+    return stoolap_table_count(warm_db(ctx, fallback), table, out_count);
+}
+
 }  // namespace (close the anonymous namespace so the helpers below
 // have external linkage and ha_stoolap_select.cc can call them
 // for direct UPDATE / DELETE error mapping)
@@ -3683,36 +3701,36 @@ ha_rows ha_stoolap::cached_records() {
         }
     }
 
-    // Include a tautological WHERE to force Stoolap through the MVCC-visible
-    // scan/aggregate path. Bare COUNT(*) can use Stoolap's table-count
-    // metadata, which is not safe around in-flight/rolled-back transactions:
-    // it can report rows that ordinary row reads cannot see.
-    std::string sql =
-        "SELECT COUNT(*) FROM " + quote_ident(stoolap_table_) + " WHERE 1 = 1";
-    StoolapRows* rows = nullptr;
+    // MVCC-safe count via the typed FFI. Inside an open tx,
+    // stoolap_tx_table_count returns the snapshot-correct count
+    // (sees this session's uncommitted INSERT/DELETE, hides other
+    // sessions' post-snapshot writes); outside, stoolap_table_count
+    // returns the autocommit-visible count via the SegmentedTable
+    // fast path -- O(1) atomic loads, safe on the hot loop. The old
+    // SELECT COUNT(*) ... WHERE 1=1 trick existed solely to defeat
+    // stoolap's pre-typed bare-COUNT(*) metadata fast path, which
+    // could leak rows from in-flight transactions; the new entry
+    // points are MVCC-aware so that workaround is unnecessary.
     stoolap_mariadb::g_stats.records_live_counts.fetch_add(
         1, std::memory_order_relaxed);
-    int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
-    if (rc != STOOLAP_OK || !rows) return stats.records;
+    uint64_t count = 0;
+    int rc = count_via(ctx, db_raw(), stoolap_table_.c_str(), &count);
+    if (rc != STOOLAP_OK) return stats.records;
 
-    stoolap_mariadb::RowsPtr scoped(rows);
-    if (stoolap_rows_next(rows) == STOOLAP_ROW) {
-        cached_records_ =
-            static_cast<ha_rows>(stoolap_rows_column_int64(rows, 0));
-        cached_records_valid_ = true;
-        stats.records = cached_records_;
-        if (in_tx) {
-            ctx->records_set(stoolap_table_,
-                             static_cast<uint64_t>(cached_records_));
-        }
-        // Do not publish live COUNT(*) results into the process-wide cache.
-        // Some optimizer/stat callers can run before MariaDB has called
-        // external_lock/register_trx for the statement, so detecting an
-        // active transaction here is not reliable enough to prevent a
-        // transaction-visible count from leaking to other sessions. Keep
-        // this as a handler-local cache only; explicit DDL paths such as
-        // TRUNCATE may still seed exact global values themselves.
+    cached_records_ = static_cast<ha_rows>(count);
+    cached_records_valid_ = true;
+    stats.records = cached_records_;
+    if (in_tx) {
+        ctx->records_set(stoolap_table_, count);
     }
+    // Do not publish tx-visible counts into the process-wide cache.
+    // Some optimizer/stat callers can run before MariaDB has called
+    // external_lock/register_trx for the statement, so detecting an
+    // active transaction here is not reliable enough to prevent a
+    // transaction-visible count from leaking to other sessions. Keep
+    // this as a handler-local + tx-local cache only; explicit DDL
+    // paths such as TRUNCATE may still seed exact global values
+    // themselves.
     return stats.records;
 }
 
