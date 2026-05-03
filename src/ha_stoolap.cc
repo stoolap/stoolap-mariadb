@@ -102,6 +102,33 @@ int register_trx(THD* thd) {
     return 0;
 }
 
+/**
+ * Bundle of (typed code, populated details) captured from one
+ * stoolap_*_errdetails call. The pointer fields inside `details`
+ * remain valid until the next FFI call on the originating handle, so
+ * always consume the view inline (log it, hand it to
+ * report_stoolap_error / errkey_from_view) before issuing any further
+ * FFI on that handle. `details.message` is normalised to "" if the FFI
+ * left it NULL so callers don't need to NULL-check.
+ *
+ * Definition lives at file-top (before the anon namespace) so the
+ * handlerton callbacks inside the anon namespace can take it by
+ * value. fetch_*_error / report_stoolap_error themselves are defined
+ * after the namespace closes (they have external linkage so
+ * ha_stoolap_select.cc can call them); the forward declarations
+ * below let the anon-namespace callers reach the file-scope symbols.
+ */
+struct StoolapErrorView {
+    int32_t code;
+    StoolapErrorDetails details;
+};
+
+StoolapErrorView fetch_db_error(StoolapDB* db);
+StoolapErrorView fetch_tx_error(StoolapTx* tx);
+StoolapErrorView fetch_stmt_error(StoolapStmt* stmt);
+StoolapErrorView fetch_rows_error(StoolapRows* rows);
+int report_stoolap_error(const StoolapErrorView& v);
+
 namespace {
 
 /** System variable: DSN passed to stoolap_open() at plugin init. */
@@ -187,6 +214,99 @@ int stoolap_start_consistent_snapshot_cb(handlerton* /*hton*/, THD* thd) {
     return 0;
 }
 
+/**
+ * Engine-private chunk MariaDB allocates per SAVEPOINT (sized via
+ * hton->savepoint_offset). MariaDB does not pass the user's
+ * SAVEPOINT name into our callback, so we synthesise a byte-stable
+ * "sp<id>" name from a per-connection monotonic counter and stash
+ * both the id and the formatted name+length here. uint64 in decimal
+ * tops out at 20 chars, plus the "sp" prefix = 22; round name[] to
+ * 24 for a clean alignment.
+ */
+struct StoolapSavepointSlot {
+    uint64_t id;
+    uint8_t name_len;
+    char name[24];
+};
+
+/** Format the savepoint name into the slot. Must match the byte
+ *  sequence stoolap will see across set / release / rollback so
+ *  the lookup stays consistent within a tx. */
+void format_savepoint_slot(StoolapSavepointSlot* slot, uint64_t id) {
+    slot->id = id;
+    int n = std::snprintf(slot->name, sizeof(slot->name), "sp%llu",
+                          static_cast<unsigned long long>(id));
+    if (n < 0) n = 0;
+    if (n >= static_cast<int>(sizeof(slot->name))) {
+        n = static_cast<int>(sizeof(slot->name)) - 1;
+    }
+    slot->name_len = static_cast<uint8_t>(n);
+}
+
+int stoolap_savepoint_set_cb(handlerton* /*hton*/, THD* thd, void* sv) {
+    auto* ctx = get_thd_ctx(thd);
+    if (!ctx || !ctx->has_tx()) {
+        // MariaDB only routes SAVEPOINT to engines whose tx it
+        // registered; reaching here without an active tx is a
+        // contract violation worth flagging rather than ignoring.
+        sql_print_error("stoolap: SAVEPOINT without an active tx");
+        return HA_ERR_GENERIC;
+    }
+    auto* slot = static_cast<StoolapSavepointSlot*>(sv);
+    format_savepoint_slot(slot, ctx->next_savepoint_id());
+    int rc = stoolap_tx_savepoint(ctx->tx(), slot->name,
+                                  static_cast<int32_t>(slot->name_len));
+    if (rc != STOOLAP_OK) {
+        auto verr = fetch_tx_error(ctx->tx());
+        sql_print_error("stoolap: SAVEPOINT failed: %s", verr.details.message);
+        return report_stoolap_error(verr);
+    }
+    return 0;
+}
+
+int stoolap_savepoint_release_cb(handlerton* /*hton*/, THD* thd, void* sv) {
+    auto* ctx = get_thd_ctx(thd);
+    if (!ctx || !ctx->has_tx()) {
+        // Tx already gone (commit/rollback ran first) -- the
+        // savepoint dissolved with it, so RELEASE is a no-op.
+        return 0;
+    }
+    auto* slot = static_cast<StoolapSavepointSlot*>(sv);
+    int rc = stoolap_tx_release_savepoint(ctx->tx(), slot->name,
+                                          static_cast<int32_t>(slot->name_len));
+    if (rc != STOOLAP_OK) {
+        auto verr = fetch_tx_error(ctx->tx());
+        sql_print_error("stoolap: RELEASE SAVEPOINT failed: %s",
+                        verr.details.message);
+        return report_stoolap_error(verr);
+    }
+    return 0;
+}
+
+int stoolap_savepoint_rollback_cb(handlerton* /*hton*/, THD* thd, void* sv) {
+    auto* ctx = get_thd_ctx(thd);
+    if (!ctx || !ctx->has_tx()) {
+        // Same reasoning as release: the savepoint is gone with the
+        // tx, ROLLBACK TO has nothing to undo.
+        return 0;
+    }
+    auto* slot = static_cast<StoolapSavepointSlot*>(sv);
+    int rc = stoolap_tx_rollback_to_savepoint(
+        ctx->tx(), slot->name, static_cast<int32_t>(slot->name_len));
+    if (rc != STOOLAP_OK) {
+        auto verr = fetch_tx_error(ctx->tx());
+        sql_print_error("stoolap: ROLLBACK TO SAVEPOINT failed: %s",
+                        verr.details.message);
+        return report_stoolap_error(verr);
+    }
+    // ROLLBACK TO undoes any record-count deltas applied since the
+    // savepoint. We do not track them at savepoint granularity, so
+    // invalidate the tx-local count cache and let it re-fetch on
+    // demand instead of holding a now-wrong adjusted value.
+    ctx->invalidate_dirty_records();
+    return 0;
+}
+
 /* ---------- Tx-aware execution helpers ---------- */
 
 // Pick the StoolapDB the auto-commit path should use. The per-handler db_
@@ -255,21 +375,9 @@ int count_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
 
 }  // namespace (close the anonymous namespace so the helpers below
 // have external linkage and ha_stoolap_select.cc can call them
-// for direct UPDATE / DELETE error mapping)
-
-/**
- * Bundle of (typed code, populated details) captured from one
- * stoolap_*_errdetails call. The pointer fields inside `details`
- * remain valid until the next FFI call on the originating handle, so
- * always consume the view inline (log it, hand it to
- * report_stoolap_error / errkey_from_view) before issuing any further
- * FFI on that handle. `details.message` is normalised to "" if the FFI
- * left it NULL so callers don't need to NULL-check.
- */
-struct StoolapErrorView {
-    int32_t code;
-    StoolapErrorDetails details;
-};
+// for direct UPDATE / DELETE error mapping. StoolapErrorView itself
+// is forward-declared at file-top so the handlerton callbacks above
+// can take it by value.)
 
 namespace {
 
@@ -1260,11 +1368,17 @@ int stoolap_init_func(void* p) {
     // up any fully-stoolap derived inside.
     stoolap_hton->create_derived =
         stoolap_pushdown::create_stoolap_derived_handler;
-    // Savepoints are deliberately not registered: stoolap's `tx_exec` C ABI
-    // currently rejects non-DML statements inside a transaction, so we
-    // cannot route `SAVEPOINT name` through it. The Rust-side
-    // `Transaction::create_savepoint` exists but isn't exposed through the
-    // FFI. Wiring it up is a stoolap-side change.
+    // Savepoints route SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO via
+    // stoolap_tx_savepoint / stoolap_tx_release_savepoint /
+    // stoolap_tx_rollback_to_savepoint (Bucket A FFI). MariaDB does not
+    // pass the user's SAVEPOINT name to the engine; we generate
+    // "sp<id>" from a per-connection counter and stash id+name in the
+    // engine-private chunk MariaDB allocates per SAVEPOINT (sized via
+    // savepoint_offset, addressed via the `sv` arg to each callback).
+    stoolap_hton->savepoint_offset = sizeof(StoolapSavepointSlot);
+    stoolap_hton->savepoint_set = stoolap_savepoint_set_cb;
+    stoolap_hton->savepoint_release = stoolap_savepoint_release_cb;
+    stoolap_hton->savepoint_rollback = stoolap_savepoint_rollback_cb;
 
     const char* dsn =
         (stoolap_dsn_var && *stoolap_dsn_var) ? stoolap_dsn_var : "memory://";

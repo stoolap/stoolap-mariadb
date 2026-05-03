@@ -86,6 +86,17 @@ public:
     StoolapStmt* bulk_stmt_get(const std::string& sql);
     void bulk_stmt_put(std::string sql, StmtPtr stmt);
 
+    /** Allocate the next monotonic savepoint id for this connection.
+     *  MariaDB does not pass the user's SAVEPOINT name into the
+     *  hton->savepoint_set callback, so we generate our own
+     *  byte-stable name ("sp<id>") and stash the id in the engine-
+     *  private chunk MariaDB allocates for us. The id space is
+     *  per-connection and resets on disconnect (when the ThdContext
+     *  is destroyed); stoolap-side savepoint state is tx-scoped and
+     *  vanishes with commit/rollback so re-using ids across
+     *  transactions is safe. */
+    uint64_t next_savepoint_id() { return ++next_savepoint_id_; }
+
 private:
     Engine* engine_;
     DbPtr db_;
@@ -94,6 +105,7 @@ private:
     std::unordered_map<std::string, StmtPtr> bulk_stmt_cache_;
     std::unordered_set<std::string> dirty_record_tables_;
     std::unordered_map<std::string, uint64_t> record_counts_;
+    uint64_t next_savepoint_id_ = 0;
 };
 
 }  // namespace stoolap_mariadb
