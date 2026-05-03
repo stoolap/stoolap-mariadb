@@ -52,17 +52,24 @@ jobs:
       # row would fail to build. Run only `main` for now; restore the
       # `pinned` row by adding back a v0.4.1+ entry once upstream ships
       # one. Tracked in docs/upstream/stoolap_ffi_issue.md.
+      #
+      # The bucket-A FFI work that PRs A/B/C consume (typed errors,
+      # stoolap_table_count, savepoints) currently lives on stoolap's
+      # `read-only-trait-split` branch, not yet merged to main. Track
+      # that branch until it lands; once stoolap merges, flip back to
+      # `main` here. version_label stays "main" so the artifact name /
+      # cache key shape don't churn for downstream jobs.
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             lib: libstoolap.so
-            stoolap_version: main
+            stoolap_version: read-only-trait-split
             version_label: main
           - os: macos-latest
             target: aarch64-apple-darwin
             lib: libstoolap.dylib
-            stoolap_version: main
+            stoolap_version: read-only-trait-split
             version_label: main
     runs-on: ${{ matrix.os }}
     steps:
