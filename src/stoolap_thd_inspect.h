@@ -12,15 +12,13 @@
 
 class THD;
 
-// THD inspection helpers that need MariaDB's sql_class.h live in
-// stoolap_thd_inspect.cc so most translation units do not pull in the
-// heavy sql_class/wsrep include chain.
+// sql_class.h-dependent helpers: live in stoolap_thd_inspect.cc to keep
+// the heavy sql_class/wsrep include chain out of most TUs.
 extern "C" int stoolap_thd_has_explicit_limit(THD* thd);
 extern "C" int stoolap_thd_is_update_or_delete(THD* thd);
 extern "C" int stoolap_thd_needs_per_row_dup_handling(THD* thd);
 
-// These THDVAR-backed helpers deliberately stay near the sysvar
-// definitions in ha_stoolap.cc; THDVAR(thd, varname) resolves against
-// the generated sysvar symbols in that translation unit.
+// THDVAR-backed; live in ha_stoolap.cc because THDVAR resolves against
+// the sysvar symbols generated there.
 extern "C" int stoolap_thd_trust_binary_strings(THD* thd);
 extern "C" int stoolap_thd_explain_pushdown(THD* thd);

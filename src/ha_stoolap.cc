@@ -35,25 +35,16 @@
 #include <string_view>
 #include <vector>
 
-// MariaDB exposes the original SQL text via this server-side function.
-// We declare it locally to avoid pulling in sql_class.h (which would drag
+// Declared locally to avoid pulling in sql_class.h (transitively requires
 // wsrep headers brew doesn't ship).
 extern "C" LEX_STRING* thd_query_string(MYSQL_THD thd);
 
-// Externally visible so the direct DML helper in ha_stoolap_select.cc can
-// gate its eligibility check on `tl->table->file->ht == stoolap_hton`.
 handlerton* stoolap_hton = nullptr;
-
-// Process-wide engine handle. ha_stoolap_select.cc reaches in here so the
-// direct UPDATE/DELETE path can clone a thread-local handle on demand.
 stoolap_mariadb::Engine g_engine;
 
-/* ---------- Per-THD context ---------- */
-
-// External linkage on purpose: ha_stoolap_select.cc's pushdown factories
-// call register_trx() defensively before the eager query, since
-// create_select can fire before any handler's external_lock when we're
-// installed as the whole-statement executor.
+// External linkage: ha_stoolap_select.cc's pushdown factories call
+// register_trx() defensively before the eager query, since create_select
+// can fire before any handler's external_lock.
 stoolap_mariadb::ThdContext* get_thd_ctx(THD* thd) {
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
         thd_get_ha_data(thd, stoolap_hton));
@@ -64,17 +55,9 @@ stoolap_mariadb::ThdContext* get_thd_ctx(THD* thd) {
     return ctx;
 }
 
-/**
- * Register the engine in the current statement's transaction list and start
- * a stoolap Tx if the THD is inside an explicit BEGIN block. Auto-commit
- * statements skip the Tx so each DML stays as a stoolap auto-commit exec.
- *
- * Picks the stoolap isolation level off the THD's @@tx_isolation:
- *   REPEATABLE-READ / SERIALIZABLE  -> STOOLAP_ISOLATION_SNAPSHOT
- *   READ-COMMITTED  / READ-UNCOMMITTED -> STOOLAP_ISOLATION_READ_COMMITTED
- * Without this, MariaDB's default REPEATABLE-READ tx silently ran as
- * read-committed and saw post-BEGIN commits from other sessions.
- */
+// REPEATABLE-READ / SERIALIZABLE map to STOOLAP_ISOLATION_SNAPSHOT;
+// without this, MariaDB's default RR ran as read-committed inside stoolap
+// and saw post-BEGIN commits from other sessions.
 int register_trx(THD* thd) {
     auto* ctx = get_thd_ctx(thd);
 
@@ -102,22 +85,9 @@ int register_trx(THD* thd) {
     return 0;
 }
 
-/**
- * Bundle of (typed code, populated details) captured from one
- * stoolap_*_errdetails call. The pointer fields inside `details`
- * remain valid until the next FFI call on the originating handle, so
- * always consume the view inline (log it, hand it to
- * report_stoolap_error / errkey_from_view) before issuing any further
- * FFI on that handle. `details.message` is normalised to "" if the FFI
- * left it NULL so callers don't need to NULL-check.
- *
- * Definition lives at file-top (before the anon namespace) so the
- * handlerton callbacks inside the anon namespace can take it by
- * value. fetch_*_error / report_stoolap_error themselves are defined
- * after the namespace closes (they have external linkage so
- * ha_stoolap_select.cc can call them); the forward declarations
- * below let the anon-namespace callers reach the file-scope symbols.
- */
+// Pointers inside `details` remain valid only until the next FFI call on
+// the originating handle, so consume the view inline before issuing any
+// further FFI on that handle. `details.message` is normalised to "".
 struct StoolapErrorView {
     int32_t code;
     StoolapErrorDetails details;
@@ -154,10 +124,9 @@ int stoolap_commit_cb(handlerton* /*hton*/, THD* thd, bool all) {
 
     int rc = ctx->commit();
     if (rc != STOOLAP_OK) {
-        // stoolap_tx_commit consumes the tx handle, so we can't query the
-        // error message after it returns. The dominant cause of a
-        // commit-time failure is concurrent-write rollback, so map to
-        // ER_LOCK_DEADLOCK (40001) — the SQLSTATE class apps know to retry.
+        // stoolap_tx_commit consumes the tx handle; querying its error
+        // message after the call is impossible. Dominant failure mode
+        // is write conflict, so map to LOCK_DEADLOCK / 40001 for retry.
         const char* msg = stoolap_errmsg(ctx->db());
         sql_print_error(
             "stoolap: COMMIT failed: %s",
@@ -195,11 +164,9 @@ int stoolap_close_connection_cb(handlerton* /*hton*/, THD* thd) {
     return 0;
 }
 
-// START TRANSACTION WITH CONSISTENT SNAPSHOT runs this hook for every
-// engine. Without it the tx wouldn't open until the first statement's
-// external_lock fires, so a concurrent commit between BEGIN and the
-// first SELECT would slide into our snapshot. Open the stoolap tx now
-// so the snapshot is anchored at BEGIN time, the way InnoDB does.
+// Anchor the snapshot at BEGIN time. Without this, the tx wouldn't
+// open until the first statement's external_lock fires and a concurrent
+// commit between BEGIN and the first SELECT would slide into the snapshot.
 int stoolap_start_consistent_snapshot_cb(handlerton* /*hton*/, THD* thd) {
     auto* ctx = get_thd_ctx(thd);
     if (ctx->has_tx()) return 0;  // already open
@@ -214,24 +181,15 @@ int stoolap_start_consistent_snapshot_cb(handlerton* /*hton*/, THD* thd) {
     return 0;
 }
 
-/**
- * Engine-private chunk MariaDB allocates per SAVEPOINT (sized via
- * hton->savepoint_offset). MariaDB does not pass the user's
- * SAVEPOINT name into our callback, so we synthesise a byte-stable
- * "sp<id>" name from a per-connection monotonic counter and stash
- * both the id and the formatted name+length here. uint64 in decimal
- * tops out at 20 chars, plus the "sp" prefix = 22; round name[] to
- * 24 for a clean alignment.
- */
+// Engine-private chunk MariaDB allocates per SAVEPOINT (sized via
+// hton->savepoint_offset). MariaDB doesn't pass the user's name into
+// our callback, so we synthesise "sp<id>" from a per-connection counter.
 struct StoolapSavepointSlot {
     uint64_t id;
     uint8_t name_len;
-    char name[24];
+    char name[24];  // "sp" + 20-digit uint64 max
 };
 
-/** Format the savepoint name into the slot. Must match the byte
- *  sequence stoolap will see across set / release / rollback so
- *  the lookup stays consistent within a tx. */
 void format_savepoint_slot(StoolapSavepointSlot* slot, uint64_t id) {
     slot->id = id;
     int n = std::snprintf(slot->name, sizeof(slot->name), "sp%llu",
@@ -246,9 +204,6 @@ void format_savepoint_slot(StoolapSavepointSlot* slot, uint64_t id) {
 int stoolap_savepoint_set_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     auto* ctx = get_thd_ctx(thd);
     if (!ctx || !ctx->has_tx()) {
-        // MariaDB only routes SAVEPOINT to engines whose tx it
-        // registered; reaching here without an active tx is a
-        // contract violation worth flagging rather than ignoring.
         sql_print_error("stoolap: SAVEPOINT without an active tx");
         return HA_ERR_GENERIC;
     }
@@ -266,11 +221,8 @@ int stoolap_savepoint_set_cb(handlerton* /*hton*/, THD* thd, void* sv) {
 
 int stoolap_savepoint_release_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     auto* ctx = get_thd_ctx(thd);
-    if (!ctx || !ctx->has_tx()) {
-        // Tx already gone (commit/rollback ran first) -- the
-        // savepoint dissolved with it, so RELEASE is a no-op.
-        return 0;
-    }
+    // Tx already gone (commit/rollback ran first): savepoint dissolved with it.
+    if (!ctx || !ctx->has_tx()) return 0;
     auto* slot = static_cast<StoolapSavepointSlot*>(sv);
     int rc = stoolap_tx_release_savepoint(ctx->tx(), slot->name,
                                           static_cast<int32_t>(slot->name_len));
@@ -285,11 +237,7 @@ int stoolap_savepoint_release_cb(handlerton* /*hton*/, THD* thd, void* sv) {
 
 int stoolap_savepoint_rollback_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     auto* ctx = get_thd_ctx(thd);
-    if (!ctx || !ctx->has_tx()) {
-        // Same reasoning as release: the savepoint is gone with the
-        // tx, ROLLBACK TO has nothing to undo.
-        return 0;
-    }
+    if (!ctx || !ctx->has_tx()) return 0;
     auto* slot = static_cast<StoolapSavepointSlot*>(sv);
     int rc = stoolap_tx_rollback_to_savepoint(
         ctx->tx(), slot->name, static_cast<int32_t>(slot->name_len));
@@ -299,24 +247,16 @@ int stoolap_savepoint_rollback_cb(handlerton* /*hton*/, THD* thd, void* sv) {
                         verr.details.message);
         return report_stoolap_error(verr);
     }
-    // ROLLBACK TO undoes any record-count deltas applied since the
-    // savepoint. We do not track them at savepoint granularity, so
-    // invalidate the tx-local count cache and let it re-fetch on
-    // demand instead of holding a now-wrong adjusted value.
+    // We track count deltas at tx granularity, not per-savepoint, so any
+    // adjusted count is now wrong; re-fetch on next read.
     ctx->invalidate_dirty_records();
     return 0;
 }
 
 /* ---------- Tx-aware execution helpers ---------- */
 
-// Pick the StoolapDB the auto-commit path should use. The per-handler db_
-// is reset every time MariaDB closes the handler instance (which can be
-// once per statement in tight benchmark loops); each clone has its own
-// executor and parsed-query cache, so routing through it leaves stoolap's
-// semantic cache cold across statements. The THD context's db() is
-// cloned once per connection and lives for the connection's lifetime, so
-// repeated INSERT/SELECT/UPDATE templates from the same session keep
-// hitting a warm parse cache.
+// THD-context db() is cloned per-connection so its parse cache stays
+// warm across statements; ha_stoolap::db_ is reset per-handler-close.
 static StoolapDB* warm_db(stoolap_mariadb::ThdContext* ctx,
                           StoolapDB* fallback) {
     if (ctx) {
@@ -355,13 +295,8 @@ int query_params_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
                                 out_rows);
 }
 
-/**
- * MVCC-safe table count. Inside an open tx, stoolap_tx_table_count
- * returns the snapshot-correct count including the session's
- * uncommitted INSERT/DELETE; otherwise Database::table_count returns
- * the autocommit-visible count via the SegmentedTable fast path
- * (O(1) atomic loads), safe on the hot loop.
- */
+// O(1) MVCC-safe table count. tx-side sees this session's uncommitted
+// INSERT/DELETE; db-side returns the autocommit-visible count.
 int count_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
               const char* table, uint64_t* out_count) {
     if (ctx && ctx->has_tx()) {
@@ -370,27 +305,14 @@ int count_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
     return stoolap_table_count(warm_db(ctx, fallback), table, out_count);
 }
 
-}  // namespace (close the anonymous namespace so the helpers below
-// have external linkage and ha_stoolap_select.cc can call them
-// for direct UPDATE / DELETE error mapping. StoolapErrorView itself
-// is forward-declared at file-top so the handlerton callbacks above
-// can take it by value.)
+}  // namespace (helpers below have external linkage so
+// ha_stoolap_select.cc can call them.)
 
 namespace {
 
-/**
- * Common tail: normalise message to "" and lift code from details.
- *
- * Defensive promotion: every caller fetches a view AFTER seeing a
- * non-OK rc from the FFI, so a code that comes back STOOLAP_ERR_OK
- * (NULL handle, the FFI returned no live error, the wrong handle was
- * inspected) means our error fetching is broken -- not that the
- * operation succeeded. Promote OK -> GENERIC so map_stoolap_errcode
- * can never silently turn an FFI failure into a 0 return that
- * MariaDB would treat as success. Mirror the promotion into
- * details.code so any consumer reading from the struct sees the same
- * code as the view's top-level field.
- */
+// Defensive: callers fetch only AFTER a non-OK FFI rc, so STOOLAP_ERR_OK
+// here means the error fetch itself is broken (NULL handle, wrong handle).
+// Promote to GENERIC so map_stoolap_errcode can't silently return 0.
 StoolapErrorView finish_view(StoolapErrorView v) {
     if (!v.details.message) v.details.message = "";
     v.code = v.details.code;
@@ -427,12 +349,7 @@ StoolapErrorView fetch_rows_error(StoolapRows* rows) {
     return finish_view(v);
 }
 
-/**
- * Mirror of errmsg_via: pick the handle that actually holds the live
- * error. Inside an open tx, the tx handle owns the last operation's
- * error; outside, the warm db handle does. Same fallback chain so a
- * typed read sees the same error string the legacy errmsg_via did.
- */
+// Pick the handle that owns the live error: tx if open, else warm db.
 StoolapErrorView fetch_error_via(stoolap_mariadb::ThdContext* ctx,
                                  StoolapDB* fallback) {
     if (ctx && ctx->has_tx()) return fetch_tx_error(ctx->tx());
@@ -440,17 +357,8 @@ StoolapErrorView fetch_error_via(stoolap_mariadb::ThdContext* ctx,
     return fetch_db_error(d);
 }
 
-/**
- * Find the index whose first key part is the named column. Returns MAX_KEY
- * if no match. Used to translate stoolap "unique constraint failed ... on
- * column X" errors into a MariaDB key index for `errkey`, which ON
- * DUPLICATE KEY UPDATE and REPLACE need to look up the conflicting row.
- *
- * Composite UNIQUE is refused at CREATE (see build_create_sql), so every
- * KEY here has exactly one user-defined part; matching against
- * `key_part[0].field` is sufficient. If composite UNIQUE ever lands,
- * this loop should walk every key part.
- */
+// Composite UNIQUE is refused at CREATE so every KEY has exactly one
+// user-defined part; if composite UNIQUE ever lands, walk every key part.
 uint find_key_for_column(TABLE_SHARE* share, std::string_view col) {
     if (!share) return MAX_KEY;
     for (uint i = 0; i < share->keys; ++i) {
@@ -465,13 +373,8 @@ uint find_key_for_column(TABLE_SHARE* share, std::string_view col) {
     return MAX_KEY;
 }
 
-/**
- * Extract a quoted or unquoted token from `msg` starting at `pos`. The
- * stoolap error strings use single-quotes around column names ("column
- * 'pid' in table 'cfk'") and unquoted bareword tokens for other places
- * ("on column u with value", "for index unique_t_0"). Returns the bare
- * token (no surrounding quotes), advancing nothing of the caller's state.
- */
+// Stoolap errors mix single-quoted ("column 'pid'") and bareword
+// ("on column u with value") tokens. Strip surrounding quotes if present.
 std::string_view extract_token(std::string_view msg, size_t pos) {
     if (pos >= msg.size()) return {};
     if (msg[pos] == '\'') {
@@ -488,10 +391,6 @@ std::string_view extract_token(std::string_view msg, size_t pos) {
     return msg.substr(pos, end - pos);
 }
 
-/** Find a key by its declared name (case-insensitive). MAX_KEY if no
- *  match. Used when stoolap hands us the index name through
- *  StoolapErrorDetails.constraint, which is the most precise routing
- *  for a UNIQUE collision: no message parsing, no leading-column guess. */
 uint find_key_by_name(TABLE_SHARE* share, std::string_view name) {
     if (!share || name.empty()) return MAX_KEY;
     for (uint i = 0; i < share->keys; ++i) {
@@ -504,20 +403,8 @@ uint find_key_by_name(TABLE_SHARE* share, std::string_view name) {
     return MAX_KEY;
 }
 
-/**
- * Resolve the violated MariaDB key index for an errkey publish.
- *
- * Preferred path (typed FFI): StoolapErrorDetails.constraint carries
- * the offending index name -- match it directly, no message parsing.
- * Stoolap names PK indexes after the table+column though, so for
- * STOOLAP_ERR_PRIMARY_KEY we just return share->primary_key.
- *
- * Legacy fallback (prose grep): for transitions where stoolap returns
- * STOOLAP_ERR_GENERIC with a recognisable message ("unique constraint
- * failed ... on column X"), reuse the original column-extraction logic
- * so the errkey routing keeps working until the typed surface fully
- * lands.
- */
+// Prefer details.constraint (typed index name); fall back to column lookup,
+// then to message-grep for stoolap codes that still come back GENERIC.
 uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
     if (!share) return 0;
     if (v.code == STOOLAP_ERR_PRIMARY_KEY) {
@@ -556,40 +443,16 @@ uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
     return 0;
 }
 
-/**
- * Mapping result for a typed STOOLAP_ERR_* code.
- *
- * `ha_err` is the MariaDB HA_ERR_* the plugin should return.
- *
- * `known` is true iff the code matched an explicit case in the switch
- * below. False means the value fell through `default` -- a future
- * stoolap added a code we haven't taught the plugin about yet. The
- * distinction matters for report_stoolap_error: the prose-grep
- * fallback is only safe to run for unknown codes (or for codes
- * stoolap explicitly flagged as "no info": GENERIC, INTERNAL).
- * Codes the plugin DELIBERATELY maps to HA_ERR_GENERIC because no
- * specific MariaDB code exists (NOT_NULL, CHECK, TYPE_MISMATCH, ...)
- * are `known=true`, so prose-grep doesn't get a chance to remap them
- * incorrectly.
- */
+// `known` is true iff the code matched an explicit case below. False
+// means the value fell through `default` (future stoolap code we don't
+// know about yet). Used by report_stoolap_error to gate the prose-grep
+// fallback to GENERIC/INTERNAL/unknown only -- codes deliberately mapped
+// to HA_ERR_GENERIC (NOT_NULL, CHECK, ...) stay typed-only.
 struct ErrcodeMap {
     int ha_err;
     bool known;
 };
 
-/**
- * Map a typed stoolap error code (STOOLAP_ERR_*) to a MariaDB
- * HA_ERR_*. Source of truth for the codes: stoolap.h.
- *
- * Unknown / future STOOLAP_ERR_* values fall through to HA_ERR_GENERIC
- * with `known=false`, so a stoolap that adds a new code without a
- * plugin recompile still produces a usable error (the user sees the
- * message via report_stoolap_error). The legacy prose-grep map is
- * kept as a safety net for that case -- when the typed code is
- * unknown / GENERIC / INTERNAL but the prose still recognises the
- * wording, we record a Stoolap_typed_fallback_hits bump so the gap
- * is visible.
- */
 ErrcodeMap map_stoolap_errcode(int32_t code) {
     switch (code) {
         case STOOLAP_ERR_OK:
@@ -608,9 +471,8 @@ ErrcodeMap map_stoolap_errcode(int32_t code) {
             return {HA_ERR_TABLE_EXIST, true};
         case STOOLAP_ERR_TX_ABORTED:
         case STOOLAP_ERR_DB_LOCKED:
-            // Stoolap doesn't yet split deadlock vs lock-wait; both
-            // surface as 40001 via HA_ERR_LOCK_DEADLOCK so clients
-            // know to retry the tx.
+            // No deadlock vs lock-wait distinction in stoolap; both
+            // become 40001 so clients retry.
             return {HA_ERR_LOCK_DEADLOCK, true};
         case STOOLAP_ERR_NOT_SUPPORTED:
             return {HA_ERR_UNSUPPORTED, true};
@@ -629,47 +491,27 @@ ErrcodeMap map_stoolap_errcode(int32_t code) {
         case STOOLAP_ERR_IO:
         case STOOLAP_ERR_QUERY_CANCELLED:
         case STOOLAP_ERR_REOPEN_REQUIRED:
-            // No specific HA_ERR_* in MariaDB for these; surface as
-            // ER_GET_ERRMSG (1296) with the stoolap text via
-            // report_stoolap_error. `known=true` so prose-grep does
-            // NOT get a chance to remap them.
+            // No specific MariaDB code; surface as 1296 with stoolap text.
             return {HA_ERR_GENERIC, true};
         case STOOLAP_ERR_GENERIC:
         case STOOLAP_ERR_INTERNAL:
-            // Stoolap explicitly said "I have no specific
-            // classification for this." Fall through to prose-grep
-            // (rc=GENERIC, known=true) so the legacy patterns can
-            // still pin lock-class / table-class messages until the
-            // typed surface fully covers them.
+            // Stoolap explicitly said "no classification"; let prose try.
             return {HA_ERR_GENERIC, true};
         default:
-            // Unknown future code. `known=false` lets the prose
-            // fallback try, and lets unmapped_errors bump if even
-            // prose can't classify.
+            // Unknown future code; let prose try and bump unmapped_errors.
             return {HA_ERR_GENERIC, false};
     }
 }
 
-/**
- * Legacy prose-grep map. Kept as a fallback path when stoolap returns
- * a generic typed code (STOOLAP_ERR_GENERIC) for an error whose
- * wording we can still classify -- see report_stoolap_error. Once the
- * typed surface fully covers every observed error (typed_fallback_hits
- * stays 0 across a real run) this can retire.
- *
- * Source of truth: stoolap's `Error` enum in
- * ../stoolap/src/core/error.rs. Each pattern below is anchored at the
- * known position in the canonical format string.
- */
+// Legacy prose-grep fallback for typed codes that come back GENERIC.
+// Source of truth for the strings: ../stoolap/src/core/error.rs.
 int map_stoolap_error(const char* msg) {
     if (!msg) return HA_ERR_GENERIC;
     std::string_view m(msg);
 
-    // Anchor enum: PREFIX matches at position 0, CONTAINS finds the
-    // needle anywhere. Most stoolap errors are prefix-anchored on the
-    // class name; CONTAINS is reserved for tail-message markers that
-    // can't be anchored (e.g. the truncate-blocked variant of
-    // "uncommitted changes" appears as the second clause).
+    // PREFIX anchors at pos 0; CONTAINS finds the needle anywhere
+    // (used for tail markers like the truncate-blocked variant of
+    // "uncommitted changes" that appears as the second clause).
     enum Anchor : uint8_t { PREFIX, CONTAINS };
     struct Pattern {
         std::string_view needle;
@@ -684,50 +526,22 @@ int map_stoolap_error(const char* msg) {
         return m.find(p.needle) != std::string_view::npos;
     };
 
-    // Order: most-specific first. The constraint violations and the
-    // FK violation are anchored prefixes (no risk of cross-matching
-    // each other's tail messages -- the FK message contains the words
-    // "does not exist" which would otherwise route to NO_SUCH_TABLE).
+    // Order: most-specific first. PK/UNIQUE/FK use anchored prefixes
+    // since the FK message contains "does not exist" which would
+    // otherwise route to NO_SUCH_TABLE.
     static constexpr Pattern kTable[] = {
-        // ---- Constraint violations (DUP_KEY) ---------------------------
         {"primary key constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
         {"unique constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
-
-        // ---- Foreign key violation -------------------------------------
         {"foreign key constraint violation", HA_ERR_NO_REFERENCED_ROW, PREFIX},
-
-        // ---- NOT NULL / CHECK (no specific HA_ERR; surface as 1296
-        //      with the stoolap text via report_stoolap_error). Keep
-        //      anchored so future similar messages don't match by accident.
+        // Anchored so future similar wordings don't match by accident.
         {"not null constraint failed", HA_ERR_GENERIC, PREFIX},
         {"CHECK constraint failed", HA_ERR_GENERIC, PREFIX},
-
-        // ---- Table / view lifecycle ------------------------------------
-        // "table 'X' already exists" / "view 'X' already exists" /
-        // "index 'X' already exists" all map to the same MariaDB error.
         {"' already exists", HA_ERR_TABLE_EXIST, CONTAINS},
-        // "table 'X' not found" / "view 'X' not found" /
-        // "table or view 'X' not found"; "doesn't exist" doesn't appear
-        // in stoolap's error.rs but is plumbed in via MariaDB's frame.
         {"' not found", HA_ERR_NO_SUCH_TABLE, CONTAINS},
-
-        // ---- Concurrency / locking -------------------------------------
-        // "row N has uncommitted changes from transaction M" (write
-        // conflict against an in-flight tx) and the truncate-blocked
-        // variant "cannot truncate table: active transactions have
-        // uncommitted changes". Both map to deadlock-class for client retry.
+        // "row N has uncommitted changes ..." + truncate-blocked variant.
         {"uncommitted changes", HA_ERR_LOCK_DEADLOCK, CONTAINS},
         {"write conflict", HA_ERR_LOCK_DEADLOCK, CONTAINS},
-        // "failed to acquire lock: ..." -- lock-wait timeout class. (We
-        // don't currently distinguish DEADLOCK vs LOCK_WAIT_TIMEOUT
-        // because stoolap doesn't expose the wait/abort distinction over
-        // the FFI yet; both surface as 40001 SQLSTATE.)
         {"failed to acquire lock", HA_ERR_LOCK_DEADLOCK, PREFIX},
-
-        // ---- Capability errors (stoolap declines a request that
-        //      MariaDB asked for, e.g. "only DML supported in tx").
-        //      Surface as ER_ILLEGAL_HA so apps can distinguish from
-        //      runtime failures.
         {"not supported", HA_ERR_UNSUPPORTED, CONTAINS},
         {"unsupported", HA_ERR_UNSUPPORTED, CONTAINS},
     };
@@ -738,52 +552,23 @@ int map_stoolap_error(const char* msg) {
 }
 
 // Brewed mariadbd exports my_error / my_printf_error directly, but the
-// plugin's `mysql/plugin.h` rewrites them to a service-pointer dispatch
-// (`my_print_error_service->...`) that isn't shipped in this build. Undef
-// the macros and declare the underlying symbols so we can hand a real
-// stoolap message to the user instead of MariaDB's generic "Got error 168"
-// fallback.
+// plugin's mysql/plugin.h rewrites them through a service-pointer struct
+// that isn't shipped. Undef + extern declarations bind to the real symbols.
 #undef my_error
 #undef my_printf_error
 extern "C" void my_error(unsigned int nr, unsigned long MyFlags, ...);
 extern "C" void my_printf_error(unsigned int nr, const char* fmt,
                                 unsigned long MyFlags, ...);
 
-/**
- * Map+publish: take an error view (typed code + populated details from
- * one stoolap_*_errdetails call) and convert it to a HA_ERR_* while
- * making sure the user sees the cause.
- *
- * Resolution order:
- *   1. Typed errcode -> HA_ERR_*. Fast and unambiguous when stoolap
- *      returned a specific STOOLAP_ERR_* code.
- *   2. If typed says GENERIC, fall back to prose-grep on the message.
- *      Bump Stoolap_typed_fallback_hits when the prose finds something
- *      specific -- that signals a stoolap-side typed-error gap.
- *   3. If both come back generic, bump Stoolap_unmapped_errors -- the
- *      pattern table has drifted and we don't know what this error is.
- *
- * For HA_ERR_GENERIC / HA_ERR_UNSUPPORTED (which MariaDB would
- * otherwise print as "Got error 168"), we stash the real stoolap text
- * via my_printf_error so the client sees the underlying cause.
- * Specific HA_ERR_* codes (HA_ERR_FOUND_DUPP_KEY, ...) get descriptive
- * server-side messages from MariaDB itself.
- */
 int report_stoolap_error(const StoolapErrorView& v) {
-    const char* msg = v.details.message;  // never NULL (see fetch helpers)
+    const char* msg = v.details.message;
     const bool have_text = (msg && *msg);
 
     const ErrcodeMap m = map_stoolap_errcode(v.code);
     int rc = m.ha_err;
 
-    // Prose fallback gating. Only run prose-grep when the typed
-    // surface didn't have a specific opinion -- either it's an
-    // unknown future code (m.known=false) or stoolap explicitly said
-    // "no info" (GENERIC / INTERNAL). Codes we deliberately mapped
-    // to HA_ERR_GENERIC because no specific MariaDB code exists
-    // (NOT_NULL, CHECK, TYPE_MISMATCH, ...) are KNOWN and we trust
-    // the typed surface for them -- prose-grep would only get a
-    // chance to misclassify.
+    // Run prose-grep only when the typed surface had no specific opinion:
+    // unknown future code OR stoolap explicitly said GENERIC/INTERNAL.
     const bool typed_unhelpful = !m.known || v.code == STOOLAP_ERR_GENERIC ||
                                  v.code == STOOLAP_ERR_INTERNAL;
     if (rc == HA_ERR_GENERIC && have_text && typed_unhelpful) {
@@ -804,10 +589,7 @@ int report_stoolap_error(const StoolapErrorView& v) {
                 v.code, msg, prose_rc);
             rc = prose_rc;
         } else {
-            // Both typed AND prose gave up on a non-empty error.
-            // Either stoolap added a code we don't recognise (m.known
-            // is false) OR an explicit GENERIC/INTERNAL came with a
-            // message wording our patterns no longer match.
+            // Unrecognised typed code AND wording; signal drift.
             stoolap_mariadb::g_stats.unmapped_errors.fetch_add(
                 1, std::memory_order_relaxed);
         }
@@ -822,18 +604,9 @@ int report_stoolap_error(const StoolapErrorView& v) {
 
 namespace {
 
-/**
- * Derive a stoolap-side table identifier from MariaDB's per-table path.
- * MariaDB passes paths like "./test/t1" -- we strip the "./" and need
- * an injective encoding of (db, tbl) since database and table names
- * can each contain '_' and '/'. Naive `/` -> `__` collides:
- *   db `p`,  tbl `q__r`     -> `p__q__r`
- *   db `p__q`, tbl `r`      -> `p__q__r`     (same flat name!)
- * Escape `_` as `_0` and `/` as `_1`. Decoding is unambiguous because
- * `_` only ever appears followed by `0` or `1`. Other path chars pass
- * through untouched. Stoolap CREATE on a colliding pair now produces
- * distinct backing names.
- */
+// MariaDB hands us "./db/tbl"; both db and tbl can contain '_' and '/'.
+// Inject `_0` for `_` and `_1` for `/` so distinct (db, tbl) pairs never
+// collide (naive `/` -> `__` collides on db=`p`,tbl=`q__r` vs db=`p__q`,tbl=`r`).
 std::string stoolap_table_from_path(const char* mariadb_path) {
     if (!mariadb_path) return std::string();
     std::string_view s(mariadb_path);
@@ -887,7 +660,6 @@ std::string quote_ident(std::string_view s) {
     return out;
 }
 
-/** Map a MariaDB Field to a stoolap column type, or nullptr if unsupported. */
 const char* stoolap_type_for(const Field* f) {
     switch (f->real_type()) {
         case MYSQL_TYPE_TINY:
@@ -926,15 +698,13 @@ const char* stoolap_type_for(const Field* f) {
     }
 }
 
-/** Skip whitespace, return new position. */
 size_t fk_skip_ws(std::string_view s, size_t p) {
     while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
         ++p;
     return p;
 }
 
-/** Match keyword case-insensitively at position p with word boundaries.
- *  Returns position past the word, or npos. */
+// Case-insensitive keyword match at p with word boundaries.
 size_t fk_match_kw(std::string_view s, size_t p, std::string_view word) {
     if (p + word.size() > s.size()) return std::string_view::npos;
     for (size_t i = 0; i < word.size(); ++i) {
@@ -953,8 +723,6 @@ size_t fk_match_kw(std::string_view s, size_t p, std::string_view word) {
     return p + word.size();
 }
 
-/** Read an SQL identifier (bare word or `backticked`). Returns position
- *  past the identifier and stores the unescaped name in `out`. */
 size_t fk_read_ident(std::string_view s, size_t p, std::string& out) {
     out.clear();
     if (p >= s.size()) return std::string_view::npos;
@@ -973,8 +741,6 @@ size_t fk_read_ident(std::string_view s, size_t p, std::string& out) {
     return out.empty() ? std::string_view::npos : p;
 }
 
-/** Read "(col[, col...])" at position p. Stores the column list (without
- *  parens) verbatim in `out`. Returns position past the closing paren. */
 size_t fk_read_paren_list(std::string_view s, size_t p, std::string& out) {
     if (p >= s.size() || s[p] != '(') return std::string_view::npos;
     int depth = 0;
@@ -992,8 +758,6 @@ size_t fk_read_paren_list(std::string_view s, size_t p, std::string& out) {
     return std::string_view::npos;
 }
 
-/** Count comma separators in `s`, treating identifier whitespace as ignorable.
- *  Used to detect multi-column FK (stoolap supports single-column only). */
 size_t count_commas(std::string_view s) {
     size_t n = 0;
     for (char c : s)
@@ -1001,18 +765,9 @@ size_t count_commas(std::string_view s) {
     return n;
 }
 
-/**
- * Parse one FOREIGN KEY clause starting at `fk_pos` and append a stoolap-
- * compatible rewrite to `out`. The rewrite renames the parent table from
- * `tbl` (or `db.tbl`) to `db__tbl` so it matches our table-naming convention.
- *
- * Returns position past the consumed clause, or npos on parse failure.
- *
- * Skips (returns past-clause without appending) when the clause references
- * the current table (self-referencing FK — stoolap can't resolve the
- * parent until the table is fully created) or has multiple key parts
- * (stoolap's parser is single-column only).
- */
+// Rewrites the parent table from `tbl` (or `db.tbl`) to `db__tbl`.
+// Skips self-referencing FK (parent not yet registered) and multi-column
+// FK (stoolap parser is single-column only); npos on parse failure.
 size_t copy_one_fk_clause(std::string_view sql, size_t fk_pos,
                           const std::string& current_db,
                           const std::string& current_tbl, std::string& out,
@@ -1133,15 +888,9 @@ size_t copy_one_fk_clause(std::string_view sql, size_t fk_pos,
     return p;
 }
 
-/** Scan the THD's current SQL for FOREIGN KEY clauses and append them to
- *  `extra` (each prefixed with ", ", suitable for splicing into the body of
- *  a CREATE TABLE statement). Parent table names are rewritten to our
- *  `<db>__<tbl>` convention.
- *
- *  Returns true on success. Returns false when the user's CREATE contains
- *  a FOREIGN KEY shape stoolap can't enforce (multi-column or self-ref);
- *  in that case my_printf_error has already been raised so the caller can
- *  bail with an empty SQL string. */
+// Append every FOREIGN KEY clause from the THD's CREATE SQL to `extra`,
+// prefixed with ", " for splicing into the table body. False when the user's
+// CREATE has an FK shape stoolap can't enforce (my_printf_error already raised).
 bool collect_foreign_keys(THD* thd, const std::string& current_db,
                           const std::string& current_tbl, std::string& extra) {
     if (!thd) return true;
@@ -1177,24 +926,12 @@ bool collect_foreign_keys(THD* thd, const std::string& current_db,
     return true;
 }
 
-/**
- * Build a stoolap CREATE TABLE statement for `form`'s schema.
- *
- * - Single-column PRIMARY KEY is emitted inline on the column (`id INT
- *   NOT NULL PRIMARY KEY`). Stoolap only creates its PkIndex from the
- *   column-level form; table-level `PRIMARY KEY (col)` is parsed but
- *   ignored, so it would not enforce uniqueness.
- * - UNIQUE keys are emitted as table-level constraints (stoolap honors
- *   these and rejects duplicates).
- * - Multi-column PKs and non-unique indexes are skipped for now.
- *
- * Returns empty string and logs if a column type is unsupported.
- */
-// Inspect every PK / UNIQUE key part for a non-binary string column.
-// Stoolap's TEXT equality is byte-wise, so a UNIQUE on a ci VARCHAR
-// would accept 'a' and 'A' as distinct rows -- the engine's enforcement
-// would silently diverge from MariaDB's ci semantics. Returns the
-// offending field name (caller emits the error). Empty string means OK.
+// Single-column PK is emitted inline (stoolap only builds PkIndex from
+// the column-level form). UNIQUE goes table-level. Multi-column PK/UNIQUE
+// and ci-collated PK/UNIQUE are refused before we get here.
+
+// Returns the offending field name when any PK/UNIQUE part is a ci string
+// (stoolap's TEXT equality is byte-wise; ci_general would accept 'a'/'A').
 std::string ci_string_unique_part(TABLE* form) {
     auto is_ci_string = [](Field* f) -> bool {
         if (!f || !f->has_charset()) return false;
@@ -1230,13 +967,8 @@ std::string ci_string_unique_part(TABLE* form) {
 
 std::string build_create_sql(const std::string& table_name, TABLE* form,
                              bool if_not_exists) {
-    // Refuse PK / UNIQUE on ci-collated string columns. Stoolap's
-    // bytewise equality would accept 'a' and 'A' as distinct, silently
-    // weakening the constraint vs. what MariaDB users expect on the
-    // default `_general_ci` collations. The user has two clean fixes:
-    // change the column collation to `_bin` (e.g. `utf8mb4_bin`), or
-    // drop the UNIQUE / PRIMARY KEY. Failing CREATE up front is
-    // preferable to silently accepting case-different duplicates.
+    // Refuse ci PK/UNIQUE up front: silent acceptance of case-different
+    // duplicates is worse than failing at CREATE.
     if (std::string bad = ci_string_unique_part(form); !bad.empty()) {
         my_printf_error(ER_GET_ERRMSG,
                         "stoolap: PRIMARY KEY / UNIQUE on column '%s' uses "
@@ -1248,11 +980,9 @@ std::string build_create_sql(const std::string& table_name, TABLE* form,
         return std::string();
     }
 
-    // Identify which column (if any) carries a single-column PK so we can
-    // emit it inline. Reject multi-column PRIMARY KEY here: stoolap only
-    // builds its uniqueness index from the column-level PRIMARY KEY form,
-    // so a table-level PRIMARY KEY (a, b) parses but isn't enforced --
-    // duplicates of (a, b) would silently be accepted.
+    // Single-column PK gets emitted inline. Multi-column PK is refused
+    // because stoolap only enforces the column-level PRIMARY KEY form;
+    // table-level (a, b) parses but doesn't enforce uniqueness.
     int pk_col = -1;
     if (form->s->primary_key < form->s->keys) {
         KEY& pk = form->key_info[form->s->primary_key];
@@ -1268,9 +998,8 @@ std::string build_create_sql(const std::string& table_name, TABLE* form,
             return std::string();
         }
     }
-    // Same story for table-level UNIQUE: only single-column UNIQUE is
-    // enforced by stoolap. A multi-column UNIQUE (a, b) would be parsed
-    // and ignored, accepting duplicate (a, b) rows.
+    // Same story for table-level UNIQUE: composite UNIQUE parses but isn't
+    // enforced by stoolap.
     for (uint i = 0; i < form->s->keys; ++i) {
         if (static_cast<uint>(i) == form->s->primary_key) continue;
         KEY& k = form->key_info[i];
@@ -1341,37 +1070,22 @@ int stoolap_init_func(void* p) {
     stoolap_hton = static_cast<handlerton*>(p);
     stoolap_hton->db_type = DB_TYPE_AUTOASSIGN;
     stoolap_hton->create = stoolap_create_handler;
-    // HTON_CAN_RECREATE would tell MariaDB to implement TRUNCATE as
-    // DROP+CREATE, which collides with the .frm and stoolap-side state.
-    // We expose a real `delete_all_rows()` that runs stoolap's native
-    // TRUNCATE, so we let MariaDB take that path instead.
+    // HTON_CAN_RECREATE would route TRUNCATE through DROP+CREATE; we expose
+    // a real delete_all_rows that runs stoolap's native TRUNCATE instead.
     stoolap_hton->flags = 0;
     stoolap_hton->commit = stoolap_commit_cb;
     stoolap_hton->rollback = stoolap_rollback_cb;
     stoolap_hton->close_connection = stoolap_close_connection_cb;
     stoolap_hton->start_consistent_snapshot =
         stoolap_start_consistent_snapshot_cb;
-    // Whole-SELECT pushdown. The factories return NULL when the query
-    // isn't pushdown-eligible (cross-engine join, SP context, prepare
-    // phase, side effects, etc.), in which case MariaDB falls through to
-    // the row-pump path. That's the documented contract of create_select
-    // and create_unit, not an error. See ha_stoolap_select.cc for the
-    // eligibility predicate and SQL emission.
+    // Pushdown factories return NULL for ineligible plans (cross-engine
+    // join, SP context, prepare phase, ...) and MariaDB falls through to
+    // row-pump. See ha_stoolap_select.cc.
     stoolap_hton->create_select =
         stoolap_pushdown::create_stoolap_select_handler;
     stoolap_hton->create_unit = stoolap_pushdown::create_stoolap_unit_handler;
-    // Partial pushdown for hybrid stoolap+InnoDB queries: when the outer
-    // SELECT mixes engines, select_handler bails. derived_handler picks
-    // up any fully-stoolap derived inside.
     stoolap_hton->create_derived =
         stoolap_pushdown::create_stoolap_derived_handler;
-    // Savepoints route SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO via
-    // stoolap_tx_savepoint / stoolap_tx_release_savepoint /
-    // stoolap_tx_rollback_to_savepoint. MariaDB does not
-    // pass the user's SAVEPOINT name to the engine; we generate
-    // "sp<id>" from a per-connection counter and stash id+name in the
-    // engine-private chunk MariaDB allocates per SAVEPOINT (sized via
-    // savepoint_offset, addressed via the `sv` arg to each callback).
     stoolap_hton->savepoint_offset = sizeof(StoolapSavepointSlot);
     stoolap_hton->savepoint_set = stoolap_savepoint_set_cb;
     stoolap_hton->savepoint_release = stoolap_savepoint_release_cb;
@@ -1404,61 +1118,36 @@ int stoolap_done_func(void*) {
 
 ha_stoolap::ha_stoolap(handlerton* hton, TABLE_SHARE* table_arg)
     : handler(hton, table_arg) {
-    // MariaDB constructs schema-only handler instances with a NULL share
-    // (e.g. mysql_create_frm_image), so guard the deref.
+    // Schema-only instances (mysql_create_frm_image) have a NULL share.
+    // No native rowid: position()/rnd_pos() memcpy the full record via `ref`.
     if (table_arg) {
-        // We have no native row id; use the full record bytes as our position
-        // cookie. position()/rnd_pos() memcpy through `ref`.
         ref_length = table_arg->reclength;
     }
 }
 
 ulonglong ha_stoolap::table_flags() const {
-    // We do support transactions (commit/rollback callbacks are wired). Not
-    // declaring HA_NO_TRANSACTIONS lets MariaDB use transactional recovery
-    // paths like ON DUPLICATE KEY UPDATE and REPLACE INTO.
-    //
-    // Deliberately no HA_HAS_RECORDS: MariaDB's optimized-away COUNT(*) path
-    // turns records() into a user-visible result, and Stoolap's bare
-    // table-count metadata is not MVCC-safe enough for that contract.
-    // records() remains available for optimizer stats.
-    return HA_REC_NOT_IN_SEQ | HA_NULL_IN_KEY |
-           HA_BINLOG_ROW_CAPABLE
-           // Tell MariaDB our update_row / delete_row need the PK columns
-           // populated -- our SQL builder uses the PK to identify the row.
-           // Without these flags, the optimizer may strip PK columns from
-           // read_set when only filter columns are obviously used, which
-           // would leave the PK as zero in the row buffer and cause
-           // UPDATE/DELETE to silently target the wrong (or no) row.
-           | HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
-           HA_PRIMARY_KEY_REQUIRED_FOR_POSITION
-           // Hand whole UPDATE / DELETE statements to stoolap in one call
-           // instead of having MariaDB scan matching rows and call back per
-           // row. See direct_update_rows / direct_delete_rows.
-           | HA_CAN_DIRECT_UPDATE_AND_DELETE;
+    // No HA_HAS_RECORDS on purpose: MariaDB's optimized-away COUNT(*) would
+    // turn records() into a user-visible result, and Stoolap's bare
+    // table-count metadata isn't MVCC-safe enough for that contract.
+    // HA_PRIMARY_KEY_REQUIRED_FOR_{DELETE,POSITION}: our SQL builder
+    // identifies rows by PK; without these flags the optimizer may strip
+    // PK columns from read_set and UPDATE/DELETE would target the wrong row.
+    return HA_REC_NOT_IN_SEQ | HA_NULL_IN_KEY | HA_BINLOG_ROW_CAPABLE |
+           HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
+           HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
+           HA_CAN_DIRECT_UPDATE_AND_DELETE;
 }
 
 ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
-    // For numeric / timestamp / boolean key parts we can take the full
-    // range-scan plan (>, >=, <, <=) and ordered iteration -- stoolap
-    // sorts those types deterministically and our binary comparison
-    // matches MariaDB's expectations.
-    //
-    // String / binary / decimal columns need conservative flags. MariaDB
-    // by default uses a case-insensitive collation (e.g. utf8mb3_general_ci)
-    // for VARCHAR columns and rewrites LIKE / BETWEEN into encoded key
-    // ranges that assume that collation. Stoolap compares strings byte-wise,
-    // so forwarding those ranges silently drops case-folded matches. Drop
-    // HA_READ_RANGE / HA_READ_ORDER for string parts so the optimizer
-    // skips index-range plans on them and falls back to a full scan with
-    // a per-row WHERE check (which MariaDB evaluates with its own
-    // collation, getting correct results).
-    // HA_KEY_SCAN_NOT_ROR tells the optimizer our index scans are NOT
-    // in rowid order. That disables index_merge_intersect plans, which
-    // assume ROR and would produce wrong results otherwise: our handler
-    // returns rows in stoolap's own order (typically index order, but
-    // we have no rowid concept anyway), not in the rowid order MariaDB's
-    // intersect logic expects.
+    // Numeric/timestamp/boolean parts: full range-scan + ordered iter; their
+    // byte-compare matches MariaDB's expected order.
+    // ci string parts: drop everything (return 0) so the optimizer falls
+    // back to a full scan where MariaDB applies its own collation per row.
+    // _bin string parts: full flags (byte compare agrees).
+    // DECIMAL/ENUM/SET: drop everything; ref access would build numeric-vs-
+    // text predicates against stoolap's TEXT storage.
+    // HA_KEY_SCAN_NOT_ROR disables index_merge_intersect (our scans aren't
+    // in rowid order; we have no rowid concept).
     if (inx < table_share->keys &&
         part < table_share->key_info[inx].user_defined_key_parts) {
         Field* f = table_share->key_info[inx].key_part[part].field;
@@ -1471,22 +1160,6 @@ ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
                 case MYSQL_TYPE_BLOB:
                 case MYSQL_TYPE_MEDIUM_BLOB:
                 case MYSQL_TYPE_LONG_BLOB: {
-                    // The default ci collation (utf8mb3_general_ci etc.)
-                    // case-folds; stoolap compares strings byte-wise.
-                    // We keep range support ONLY when the column is
-                    // binary-collated (BINARY, VARBINARY, or *_bin /
-                    // _binary collation), where MariaDB and stoolap
-                    // agree on byte-wise compare.
-                    //
-                    // For ci collations we return 0 -- not even
-                    // HA_READ_NEXT. Without HA_READ_NEXT MariaDB won't
-                    // pick the index for ref / range / iter, so a
-                    // ci-string predicate forces a full scan with the
-                    // server applying its own collation per row. With
-                    // HA_READ_NEXT (no HA_READ_RANGE) MariaDB still
-                    // picks ref access for `name = 'bob'` and our
-                    // bytewise index_read_map predicate would silently
-                    // miss case-folded matches like 'Bob' / 'BOb'.
                     CHARSET_INFO* cs = f->charset();
                     if (cs && (cs->state & MY_CS_BINSORT)) {
                         return HA_READ_NEXT | HA_READ_RANGE | HA_READ_ORDER |
@@ -1497,10 +1170,6 @@ ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
                 case MYSQL_TYPE_NEWDECIMAL:
                 case MYSQL_TYPE_ENUM:
                 case MYSQL_TYPE_SET:
-                    // Stoolap stores these as TEXT. ref access on the
-                    // index would build a numeric-vs-text predicate
-                    // (e.g. `dec_v = 1.50` against text '1.50') which
-                    // silently misses. Drop all index access methods.
                     return 0;
                 default:
                     break;
@@ -1544,26 +1213,11 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
         }
     }
 
-    // Reconcile schema: if MariaDB has a .frm but the stoolap side is missing
-    // the table (fresh datadir, manual wipe, DSN switch, etc.), recreate it
-    // from the TABLE_SHARE schema. CREATE TABLE IF NOT EXISTS is a no-op when
-    // the table already exists.
-    //
-    // Cache the verified-exists state on the process-wide engine so the
-    // second+ open of the same table short-circuits. MariaDB calls open()
-    // for every fresh handler instance (per statement in tight benchmark
-    // loops); re-running a CREATE TABLE IF NOT EXISTS that's a no-op
-    // ~99% of the time still pays SQL construction + stoolap parse +
-    // catalog lookup. The cache invalidates on DROP / TRUNCATE / RENAME.
-    //
-    // Note we no longer eagerly clone db_ here. The handler routes
-    // through the THD-context clone in normal operation (see warm_db);
-    // db_ is allocated lazily on first call to ha_stoolap::db() if some
-    // path can't reach a THD ctx, so a tight statement loop never pays
-    // the per-statement clone cost.
+    // Reconcile: MariaDB may have a .frm while stoolap is missing the table
+    // (fresh datadir, wipe, DSN switch). CREATE TABLE IF NOT EXISTS no-ops
+    // when present. The reconciled-set cache short-circuits the next open()
+    // (called per-statement in tight loops); invalidates on DROP/TRUNCATE/RENAME.
     if (!g_engine.is_reconciled(stoolap_table_)) {
-        // Schema reconcile DOES need a stoolap handle now. Prefer the
-        // THD ctx (warm) and fall back to the lazy per-handler clone.
         auto* ctx = ha_thd() ? get_thd_ctx(ha_thd()) : nullptr;
         StoolapDB* d = (ctx && ctx->db()) ? ctx->db() : db_ensure();
         if (!d) return HA_ERR_OUT_OF_MEM;
@@ -1577,14 +1231,8 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
                             stoolap_table_.c_str(), verr.details.message);
             return report_stoolap_error(verr);
         }
-        // Re-emit non-unique secondary indexes too. CREATE TABLE IF NOT
-        // EXISTS only re-creates the table; without the matching CREATE
-        // INDEX calls, a stoolap-side table that was wiped (fresh
-        // datadir, manual cleanup, DSN swap) would come back without
-        // its KEY indexes, leaving queries that MariaDB believes are
-        // index-served permanently degraded to full scans. CREATE
-        // INDEX IF NOT EXISTS makes the call idempotent for the
-        // already-reconciled-elsewhere case.
+        // Re-emit secondary indexes too: a wiped stoolap-side table comes
+        // back without them, leaving "index-served" queries on a full scan.
         create_secondary_indexes(d, stoolap_table_, table);
         g_engine.mark_reconciled(stoolap_table_);
     }
@@ -1592,9 +1240,8 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
 }
 
 int ha_stoolap::close() {
-    // Release both streaming and packed scan state immediately on handler
-    // close. A large fetch_all buffer can otherwise live until the handler
-    // object itself is destroyed, which is too long for memory-heavy scans.
+    // Release scan state now -- a large fetch_all buffer would otherwise
+    // live until the handler is destroyed.
     reset_scan_state();
     bulk_insert_stmt_.reset();
     insert_sql_.clear();
@@ -1603,20 +1250,9 @@ int ha_stoolap::close() {
     return 0;
 }
 
-// Issue CREATE INDEX IF NOT EXISTS for every non-unique secondary KEY
-// MariaDB declared on `form`. Called from create() (after a fresh
-// CREATE TABLE) AND from open()'s reconcile path (after a CREATE
-// TABLE IF NOT EXISTS that may have actually re-created a missing
-// stoolap-side table). Using IF NOT EXISTS makes the call idempotent
-// so the no-op-table path doesn't error per index.
-//
-// Stoolap's CREATE INDEX is single-column only; for composite KEY
-// (a, b) we still create an index on the LEADING column. That's a
-// usable prefix index: equality on a -- with or without a trailing
-// condition on b -- gets a real index lookup (b filters per row).
-// Without this, MariaDB would advertise a composite index that has
-// no physical storage backing, and any WHERE on the leading column
-// would degrade to a full scan inside stoolap.
+// Stoolap's CREATE INDEX is single-column only; composite KEY (a, b) gets
+// an index on the leading column (b filters per row). Without it, MariaDB
+// advertises an index with no physical backing and degrades to full scan.
 void create_secondary_indexes(StoolapDB* db, const std::string& tbl,
                               TABLE* form) {
     for (uint i = 0; i < form->s->keys; ++i) {
@@ -1650,14 +1286,9 @@ void create_secondary_indexes(StoolapDB* db, const std::string& tbl,
     }
 }
 
-// Resolve a per-thread StoolapDB* for DDL calls. The Stoolap C ABI
-// requires that a single StoolapDB handle not be used concurrently;
-// concurrent DDL from different THDs through `g_engine.raw()` would
-// race both the executor and the per-handle error buffer, so attached
-// error messages could leak across threads. Prefer the THD-context
-// clone (warm, already used for DML on this connection); fall back to
-// the lazy per-handler clone for code paths that arrive without a
-// THD (none today, but defensive).
+// A single StoolapDB* is unsafe for concurrent use: concurrent DDL
+// through g_engine.raw() would race both the executor and the per-handle
+// error buffer, leaking error messages across threads. Use the THD clone.
 StoolapDB* ha_stoolap::ddl_db() {
     auto* ctx = ha_thd() ? get_thd_ctx(ha_thd()) : nullptr;
     StoolapDB* d = (ctx && ctx->db()) ? ctx->db() : db_ensure();
@@ -1697,9 +1328,8 @@ int ha_stoolap::delete_table(const char* name) {
     }
     g_engine.drop_reconciled(flat);
     g_engine.records_drop(flat);
-    // Drop process-wide AUTO_INCREMENT reservations. A subsequent CREATE
-    // TABLE with the same name must start fresh, not from the dropped
-    // table's leftover counter.
+    // Re-CREATE TABLE of the same name must start AI fresh, not from the
+    // dropped table's leftover counter.
     g_engine.ai_invalidate();
     return 0;
 }
@@ -1720,40 +1350,29 @@ int ha_stoolap::rename_table(const char* from, const char* to) {
                         verr.details.message);
         return report_stoolap_error(verr);
     }
-    // Old name is gone; new name is now reconciled (we just verified it
-    // exists by renaming to it).
     g_engine.drop_reconciled(flat_from);
     g_engine.mark_reconciled(flat_to);
-    // Move the records cache entry too, if present, so the renamed
-    // table doesn't pay a fresh COUNT just because its key changed.
+    // Move records-cache entry so the renamed table doesn't pay a fresh COUNT.
     uint64_t cnt = 0;
     if (g_engine.records_lookup(flat_from, &cnt)) {
         g_engine.records_set(flat_to, cnt);
     }
     g_engine.records_drop(flat_from);
-    // Clear AUTO_INCREMENT reservations: the old name is gone, and the new
-    // name may have stale reservations from an earlier create/drop cycle.
     g_engine.ai_invalidate();
     return 0;
 }
 
 namespace {
 
-/** Shift every Field's read pointer by `d` bytes. Used to point Fields at a
- *  caller-supplied row buffer that isn't `table->record[0]`. */
+// Point Fields at a row buffer that isn't table->record[0].
 void move_fields(TABLE* t, my_ptrdiff_t d) {
     if (!d) return;
     for (uint i = 0; i < t->s->fields; ++i)
         t->field[i]->move_field_offset(d);
 }
 
-/**
- * Extract a Field's current value into a StoolapValue. For TEXT columns the
- * caller must own a std::string (`text_holder`) for the duration of the API
- * call to keep the StoolapValue.text.ptr valid.
- *
- * Returns true on success, false if the column type is unsupported.
- */
+// For TEXT columns the caller owns a std::string (`text_holder`) that
+// keeps StoolapValue.text.ptr valid for the duration of the FFI call.
 bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
     if (f->is_null()) {
         v.value_type = STOOLAP_TYPE_NULL;
@@ -1768,16 +1387,10 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
         case MYSQL_TYPE_YEAR:
         case MYSQL_TYPE_BIT: {
             const longlong raw = f->val_int();
-            // Stoolap's INTEGER is i64. All unsigned types narrower than
-            // BIGINT UNSIGNED fit (their max <= UINT32_MAX < INT64_MAX),
-            // so the bit pattern from val_int() round-trips faithfully
-            // and the read path preserves UNSIGNED_FLAG through
-            // Field::store. BIGINT UNSIGNED values > INT64_MAX are the
-            // only case that *can't* be represented: val_int() hands us
-            // the bit pattern as a negative longlong, which would land
-            // in stoolap as a negative i64 and compare wrong on every
-            // range / order operation. Reject those rather than silently
-            // corrupting the data.
+            // BIGINT UNSIGNED > INT64_MAX is the only narrower-than-i64
+            // case we can't represent: val_int() hands us a negative
+            // longlong that would land as negative i64 in stoolap and
+            // compare wrong on range/order. Reject rather than corrupt.
             if (f->real_type() == MYSQL_TYPE_LONGLONG && f->is_unsigned() &&
                 raw < 0) {
                 return false;
@@ -1902,19 +1515,10 @@ bool append_where_for_row(std::string& sql, TABLE* table,
         }
     }
 
-    // No usable single-column PK: refuse the row-pump path. Identifying
-    // a row by every column value is ambiguous when byte-identical
-    // duplicates exist -- the WHERE we'd build matches every duplicate,
-    // so MariaDB's filesort+LIMIT path (e.g. UPDATE/DELETE ... ORDER BY
-    // ... LIMIT N) calls update_row/delete_row N times but each call
-    // affects every duplicate in stoolap, silently mutating more rows
-    // than the user asked for. Stoolap doesn't expose a row-id we can
-    // use as a tiebreaker, and its UPDATE/DELETE grammar has no LIMIT,
-    // so there's no byte-side fix. Refuse with a clear error pointing
-    // users at the workarounds: add a single-column PRIMARY KEY (the
-    // recommended path) or write the statement so the direct-DML hook
-    // (cond_push -> stoolap UPDATE/DELETE WHERE) handles it as one
-    // engine-side query.
+    // No PK + byte-identical duplicates + filesort+LIMIT path: each per-row
+    // UPDATE/DELETE callback would over-mutate every dup. Stoolap has no
+    // rowid for tiebreaking and its UPDATE/DELETE grammar has no LIMIT,
+    // so no byte-side fix exists. Direct DML (cond_push) still works.
     my_printf_error(
         ER_GET_ERRMSG,
         "stoolap: row-pump UPDATE/DELETE on a table without a "
@@ -1930,15 +1534,9 @@ bool append_where_for_row(std::string& sql, TABLE* table,
 
 }  // namespace
 
-// Threshold (in rows) at which write_row eagerly flushes the bulk
-// buffer instead of growing it further. Bounds memory for very large
-// INSERT ... VALUES, INSERT ... SELECT, and LOAD DATA without losing
-// the per-batch prepare amortisation (the prepared StoolapStmt lives
-// on the THD context and survives across flushes). Also keeps every
-// chunk well below the int32_t row_count cast that the stoolap batch
-// FFI accepts. 50K rows is small enough to bound memory at ~5MB for
-// a typical 8-column INSERT but large enough that the per-flush
-// fixed cost stays a small fraction of overall throughput.
+// Bounds memory on huge INSERT...VALUES / SELECT / LOAD DATA (~5MB at
+// 8 columns) while keeping per-flush fixed cost a small fraction of
+// throughput. Stays well under int32_t row_count for the batch FFI.
 static constexpr size_t kBulkFlushRows = 50000;
 
 void ha_stoolap::start_bulk_insert(ha_rows rows, uint /*flags*/) {
@@ -1947,43 +1545,22 @@ void ha_stoolap::start_bulk_insert(ha_rows rows, uint /*flags*/) {
     bulk_params_.clear();
     bulk_text_holders_.clear();
 
-    // Two batch flavours below:
-    //   - Auto-commit: stoolap_stmt_exec_batch runs N rows in one
-    //     stoolap-side transaction. Best path; only one fsync on file://.
-    //   - Explicit user tx: stoolap_stmt_exec_batch can't compose with an
-    //     outer BEGIN (it begins its own tx), but we can still avoid the
-    //     per-row parse cost by preparing the INSERT once at batch start
-    //     and looping stoolap_tx_stmt_exec at flush time.
-    // Either way we activate the bulk path; end_bulk_insert dispatches
-    // based on ctx->has_tx().
+    // Auto-commit path uses stoolap_stmt_exec_batch (one tx, one fsync).
+    // Inside an explicit user tx, we still skip per-row parse by preparing
+    // once and looping tx_stmt_exec at flush. end_bulk_insert dispatches.
 
-    // INSERT IGNORE / REPLACE / INSERT ... ON DUPLICATE KEY UPDATE rely
-    // on MariaDB seeing a per-row HA_ERR_FOUND_DUPP_KEY callback so it
-    // can run the right recovery (skip the dup, delete-then-reinsert,
-    // or update the existing row). Stoolap's stmt_exec_batch is
-    // all-or-nothing: a single dup aborts the whole batch and rolls
-    // every other row back. Buffering would silently drop every
-    // non-conflicting row in a multi-row INSERT IGNORE / REPLACE /
-    // ODKU. Stay on the per-row write path for these shapes.
+    // INSERT IGNORE / REPLACE / ODKU need per-row HA_ERR_FOUND_DUPP_KEY
+    // callbacks for recovery. stmt_exec_batch is all-or-nothing -- one dup
+    // would silently drop every non-conflicting row.
     if (stoolap_thd_needs_per_row_dup_handling(ha_thd())) {
         return;
     }
 
-    // AUTO_INCREMENT tables are handled per-row at write_row time: we let
-    // update_auto_increment() stamp the field, then buffer the now-fully-
-    // populated row into the bulk vector like any other. get_auto_increment()
-    // reserves ids from a process-wide counter, so unflushed bulk rows and
-    // concurrent sessions cannot reuse the same values.
     bulk_active_ = true;
 
-    // Pre-size bulk_params_ for the upcoming chunk only -- never beyond
-    // the chunked-flush threshold. Without this cap a multi-million-row
-    // INSERT ... VALUES would allocate StoolapValues for the whole
-    // statement before write_row gets a chance to flush. INSERT...SELECT
-    // usually passes 0 (source row count not known up front), so we
-    // seed kBulkFlushRows as a sensible default that matches the chunk
-    // size used by write_row. bulk_text_holders_ is a std::deque -- it
-    // doesn't reallocate, so reserve() isn't needed.
+    // Cap the up-front reserve at the flush threshold so multi-million-row
+    // INSERT...VALUES doesn't allocate the whole batch before flushing.
+    // INSERT...SELECT often passes 0 (unknown source size); use the cap.
     const ha_rows raw_hint =
         (rows && rows != HA_POS_ERROR) ? rows : ha_rows{kBulkFlushRows};
     const ha_rows hint =
@@ -2100,17 +1677,9 @@ int ha_stoolap::write_row(const uchar* buf) {
         if (err) return err;
     }
 
-    // Keep the process-wide AI allocator in sync with explicit-id INSERTs
-    // and generated values that successfully reached write_row. This is
-    // cross-connection state: a later session must not keep issuing low
-    // ids after another session inserted id=100 explicitly.
-    //
-    // Skip non-positive explicit values: AUTO_INCREMENT only assigns
-    // positive ids, so a negative or zero user-supplied value cannot
-    // collide with future generated ids and must not advance the
-    // cache. Without the guard, val_int() returning -2 on a signed
-    // column casts to ULLONG_MAX-1 and the next generated insert
-    // fails ER_AUTOINC_READ_FAILED (ER 1467).
+    // Keep AI allocator in sync with explicit-id INSERTs (cross-connection).
+    // Skip non-positive: signed -2 casts to ULLONG_MAX-1 and the next
+    // generated insert fails ER_AUTOINC_READ_FAILED.
     if (table->found_next_number_field) {
         Field* aifield = table->found_next_number_field;
         const longlong sv = aifield->val_int();
@@ -2121,10 +1690,8 @@ int ha_stoolap::write_row(const uchar* buf) {
         }
     }
 
-    // Build the INSERT SQL template lazily and stash it on the handler.
-    // Stoolap has its own semantic-cache that hashes the SQL string and
-    // reuses parsed plans across calls, so we just hand it the raw text
-    // each time -- no plugin-side StoolapStmt cache needed.
+    // Stoolap's semantic-cache reuses parsed plans by SQL string hash;
+    // no plugin-side StoolapStmt cache needed.
     if (insert_sql_.empty()) {
         insert_sql_ = "INSERT INTO ";
         insert_sql_ += quote_ident(stoolap_table_);
@@ -2143,9 +1710,7 @@ int ha_stoolap::write_row(const uchar* buf) {
 
     int err = 0;
 
-    // Bulk path: append this row's params to the per-handler buffer instead
-    // of executing now. end_bulk_insert flushes them via
-    // stoolap_stmt_exec_batch in a single transaction.
+    // Buffer for end_bulk_insert / kBulkFlushRows-triggered flush.
     if (bulk_active_) {
         const size_t holders_base = bulk_text_holders_.size();
         const size_t params_base = bulk_params_.size();
@@ -2155,15 +1720,9 @@ int ha_stoolap::write_row(const uchar* buf) {
             StoolapValue v{};
             if (!extract_field(f, v, bulk_text_holders_.back())) {
                 err = HA_ERR_UNSUPPORTED;
-                // Roll back BOTH this row's holders AND its already-
-                // pushed StoolapValues. Without the params rollback,
-                // the cols 0..k-1 entries that succeeded for this row
-                // would stay in bulk_params_, misaligning every
-                // subsequent row's column indices in the batch and
-                // (for INSERT IGNORE / continue-on-error paths)
-                // producing a silently-corrupted INSERT. deque::pop_back
-                // is O(1) and doesn't move earlier elements, so
-                // previously-recorded text.ptr values stay valid.
+                // Roll back this row's partial entries: leaving cols
+                // 0..k-1 in bulk_params_ would misalign every following
+                // row's column indices in the batch.
                 while (bulk_text_holders_.size() > holders_base) {
                     bulk_text_holders_.pop_back();
                 }
@@ -2174,20 +1733,9 @@ int ha_stoolap::write_row(const uchar* buf) {
             }
             bulk_params_.push_back(v);
         }
-        // Eager flush when the buffered batch crosses the row threshold.
-        // Bounds memory for large INSERT ... VALUES / SELECT / LOAD DATA
-        // without losing the per-batch prepare amortisation: the
-        // prepared StoolapStmt lives on the THD context and survives
-        // across flushes so each chunk reuses the same parsed plan.
-        //
-        // Atomicity: stoolap_stmt_exec_batch opens its own internal
-        // transaction per call, which would let earlier chunks commit
-        // while a later chunk fails. Force the flush onto a single
-        // outer stoolap tx so the whole bulk statement is atomic. We
-        // only need to do this in autocommit mode (`!ctx->has_tx()`);
-        // an explicit user BEGIN already provides the outer tx, and
-        // flush_bulk_buffer's tx_stmt_exec path naturally feeds rows
-        // through it.
+        // Eager flush when over threshold. In autocommit mode, wrap the
+        // chunked flushes in one outer tx so the whole bulk statement is
+        // atomic (stmt_exec_batch otherwise commits per-chunk).
         if (bulk_params_.size() >= kBulkFlushRows * table->s->fields) {
             auto* ctx = get_thd_ctx(ha_thd());
             if (ctx && !ctx->has_tx()) {
@@ -2199,20 +1747,14 @@ int ha_stoolap::write_row(const uchar* buf) {
                     goto done;
                 }
                 bulk_owns_tx_ = true;
-                // Make sure the handlerton commit / rollback callbacks
-                // fire at statement end so the tx we just opened is
-                // properly closed even if the engine's own register
-                // path didn't already fire (some bulk INSERT paths
-                // skip external_lock).
+                // Some bulk INSERT paths skip external_lock; register here
+                // so commit/rollback callbacks fire at statement end.
                 trans_register_ha(ha_thd(), /*all=*/false, stoolap_hton,
                                   /*flags=*/0);
             }
             int frc = flush_bulk_buffer();
             if (frc) {
                 if (bulk_owns_tx_ && ctx && ctx->has_tx()) {
-                    // Rollback our tx so earlier chunks don't persist.
-                    // The handlerton rollback callback will see no tx
-                    // and short-circuit, which is fine.
                     ctx->rollback();
                     bulk_owns_tx_ = false;
                 }
@@ -2268,31 +1810,23 @@ done:
 int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
 
-    // Build "UPDATE t SET col1=$1, col2=$2, ... WHERE old1=$N AND ... LIMIT 1".
-    // The SET values come from `new_data`, the WHERE bindings from `old_data`.
+    // SET from new_data, WHERE from old_data: UPDATE t SET ... WHERE ... LIMIT 1.
     std::string sql = "UPDATE ";
     sql += quote_ident(stoolap_table_);
     sql += " SET ";
 
     std::vector<StoolapValue> params;
     std::vector<std::string> text_holders;
-    // Worst-case: every column is text on both sides + each column is a text
-    // SET binding and a text WHERE binding.
     params.reserve(table->s->fields * 2);
     text_holders.reserve(table->s->fields * 2);
 
     int err = 0;
     int next_param = 1;
 
-    // SET clause from new_data. Two filters:
-    //   1) `bitmap_is_set(write_set, i)` — MariaDB's hint about which
-    //      columns the statement intends to modify.
-    //   2) bytewise compare old vs new — skip columns whose value is
-    //      unchanged. This matters for ON DUPLICATE KEY UPDATE / REPLACE,
-    //      where MariaDB hands us a merged new_data that re-supplies
-    //      every column of the existing row, including the PRIMARY KEY.
-    //      Stoolap rejects re-assigning a PK column even when the value
-    //      doesn't change ("cannot UPDATE primary key column").
+    // SET filters: write_set hint AND bytewise old-vs-new compare. The
+    // compare matters for ODKU/REPLACE which re-supply every column of
+    // the existing row including the PK; stoolap rejects re-assigning a
+    // PK column even with the same value.
     {
         const my_ptrdiff_t d =
             static_cast<my_ptrdiff_t>(new_data - table->record[0]);
@@ -2435,20 +1969,10 @@ const COND* ha_stoolap::cond_push(const COND* cond) {
     THD* thd = ha_thd();
     if (!thd) return cond;
 
-    // We accept (return null) iff the engine will actually filter the
-    // rows. The only path where that holds today is direct DML:
-    // try_direct_modify forwards thd->query() (with the WHERE intact)
-    // to stoolap, which re-evaluates the predicate itself. For any
-    // shape MariaDB might fall back from direct to per-row -- ORDER BY,
-    // LIMIT, multi-table, prepared phase, SP context, no-stoolap-leaves
-    // -- can_direct_modify already says no, and we must NOT lie to the
-    // optimizer here. Returning null on a shape that ends up per-row
-    // means MariaDB might trust us to filter while we hand back every
-    // row, silently mass-updating/deleting the table.
-    //
-    // Single source of truth: same predicate as try_direct_modify uses.
-    // If can_direct_modify(thd) accepts, AND the comparison is safe
-    // byte-wise (or the user opted into byte semantics), we accept.
+    // Accept (return null) only when the engine will actually filter:
+    // the direct-DML path forwards thd->query() with WHERE intact and
+    // stoolap re-evaluates. Returning null on a shape that ends up
+    // per-row would silently mass-mutate the table.
     if (stoolap_pushdown::can_direct_modify(thd)) {
         Item* it = const_cast<Item*>(static_cast<const Item*>(cond));
         const bool trust_bin = stoolap_thd_trust_binary_strings(thd);
@@ -2461,17 +1985,13 @@ const COND* ha_stoolap::cond_push(const COND* cond) {
 }
 
 int ha_stoolap::direct_update_rows_init(List<Item>* /*update_fields*/) {
-    // Eligibility check fires here (before MariaDB locks tables) so we can
-    // bail without committing to the direct path. If we return non-zero,
-    // MariaDB falls back to the per-row update_row() loop instead of
-    // failing -- exactly what we want for unsupported corner cases.
+    // Non-zero falls back to per-row update_row(); never error here.
     return stoolap_pushdown::can_direct_modify(ha_thd()) ? 0
                                                          : HA_ERR_WRONG_COMMAND;
 }
 
 int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
-    // pre_direct_update_rows may have already executed and stashed the
-    // affected count -- drain it here without re-running.
+    // pre_direct_update_rows may have run already and stashed the count.
     if (direct_modify_in_pre_) {
         direct_modify_in_pre_ = false;
         if (update_rows) *update_rows = direct_modify_affected_pre_;
@@ -2489,9 +2009,7 @@ int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
         return rc;
     }
     if (update_rows) *update_rows = affected;
-    // stoolap reports affected rows; we don't track found-but-unchanged
-    // separately, so report found == affected. MariaDB only uses found_rows
-    // for the "Rows matched: N Changed: M" diagnostic.
+    // No found-but-unchanged tracking; report found == affected.
     if (found_rows) *found_rows = affected;
     return 0;
 }
@@ -2526,13 +2044,10 @@ int ha_stoolap::direct_delete_rows(ha_rows* delete_rows) {
     return 0;
 }
 
-// pre_direct_* hooks: MariaDB 11.4 gates the direct DML path on these
-// returning success. Default base implementation returns
-// HA_ERR_WRONG_COMMAND, which is why direct DML wasn't firing despite
-// direct_*_init / direct_*_rows being overridden. Eligibility delegates
-// to the existing direct_*_init helpers; the actual modify runs in
-// pre_direct_*_rows (some 11.4 paths use that as the work site, others
-// also call direct_*_rows after, which our short-circuit handles).
+// MariaDB 11.4 gates direct DML on these; the base impl returns
+// HA_ERR_WRONG_COMMAND. The actual modify runs in pre_direct_*_rows
+// (some paths use it as the work site; the short-circuit handles
+// follow-up direct_*_rows calls).
 int ha_stoolap::pre_direct_update_rows_init(List<Item>* fields) {
     return direct_update_rows_init(fields);
 }
@@ -2580,15 +2095,9 @@ int ha_stoolap::pre_direct_delete_rows() {
 
 int ha_stoolap::delete_all_rows() {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
-    // stoolap supports `TRUNCATE TABLE` natively (faster than DELETE FROM).
-    // Note: stoolap also blocks TRUNCATE inside an explicit transaction, so
-    // we route this through the auto-commit `db` handle, not the active Tx.
-    //
-    // Cache invalidations come AFTER stoolap confirms success. Stoolap
-    // can reject TRUNCATE (e.g. when FK children still reference the
-    // parent); a pre-emptive `records_set(0)` would leave the
-    // optimizer's HA_HAS_RECORDS shortcut returning 0 while rows are
-    // still there.
+    // Route via autocommit db (stoolap blocks TRUNCATE inside a tx).
+    // Cache invalidate AFTER success: a pre-emptive set(0) would leave
+    // the optimizer seeing 0 while a rejected TRUNCATE keeps the rows.
     std::string sql = "TRUNCATE TABLE ";
     sql += quote_ident(stoolap_table_);
 
@@ -2598,38 +2107,20 @@ int ha_stoolap::delete_all_rows() {
         return report_stoolap_error(verr);
     }
     set_count_exact(0);
-    // AUTO_INCREMENT reservations are now stale: stoolap's MAX for this
-    // table dropped to 0 (NULL), but the process-wide allocator may still
-    // reflect the pre-truncate counter.
+    // Process-wide allocator may still reflect pre-truncate counter.
     g_engine.ai_invalidate();
     return 0;
 }
 
-// Shared packed-buffer parser lives in stoolap_packet.h and is also used
-// by the SELECT pushdown handlers in ha_stoolap_select.cc. Bring it into
-// scope here for the row-pump full-scan path.
 using stoolap_mariadb::pkt_le32;
 using stoolap_mariadb::pkt_parse_header;
 using stoolap_mariadb::pkt_skip_value;
 using stoolap_mariadb::pkt_store_value;
 
 std::string ha_stoolap::build_scan_columns() {
-    // Adaptive projection. Earlier we always emitted SELECT *, which kept
-    // the row-pump fallback paths simple but materialised every column
-    // per row. For queries that fall through to the row pump because of
-    // ci-string predicates / cross-engine joins / SP context (the audit
-    // case: `LIKE 'User_1%'` over a wide users table) the wasted FFI
-    // bandwidth was a measurable cost.
-    //
-    // The earlier narrowing attempt projected only `read_set` and broke
-    // ORDER BY paths because MariaDB's filesort consults sort-key
-    // columns from the row buffer rnd_next populates. Today we project
-    // `read_set | write_set` instead -- write_set covers the UPDATE
-    // path that compares old/new buffers, and ORDER BY columns are
-    // already added to read_set by MariaDB's optimizer (they have to
-    // be, otherwise the filesort would read garbage). If neither bitmap
-    // is set we fall back to `*` -- safe default for paths we haven't
-    // traced.
+    // Project read_set | write_set: write_set covers UPDATE's old/new
+    // compare; ORDER BY columns are already in read_set (filesort would
+    // read garbage otherwise). Only-read_set broke ORDER BY paths.
     scan_proj_.assign(table->s->fields, -1);
     if (!table->read_set || !table->write_set) {
         for (uint i = 0; i < table->s->fields; ++i)
@@ -2650,8 +2141,7 @@ std::string ha_stoolap::build_scan_columns() {
             std::string_view(f->field_name.str, f->field_name.length)));
     }
     if (cols.empty()) {
-        // No bits set -- belt-and-suspenders fallback so we still produce
-        // one row per stoolap row (used by COUNT(*)-shape paths).
+        // No bits set -- COUNT(*)-shape needs one row per stoolap row.
         for (uint i = 0; i < table->s->fields; ++i)
             scan_proj_[i] = i;
         return "*";
@@ -2675,15 +2165,8 @@ int ha_stoolap::rnd_init(bool /*scan*/) {
         return report_stoolap_error(verr);
     }
 
-    // Pick between Tier 3 buffered scan and the original streaming path.
-    //
-    // Buffered (fetch_all) wins when MariaDB will consume every row:
-    // ~5x reduction in FFI traffic on large GROUP BYs and similar full-
-    // scan aggregations. It loses badly when MariaDB stops early -- a
-    // SELECT ... LIMIT 100 over a 10K-row table would still materialise
-    // all 10K rows up front. So if the outermost SELECT has an explicit
-    // LIMIT, stay on the streaming path; rnd_next stops at HA_ERR_END_OF_FILE
-    // when MariaDB has read its limit.
+    // Buffered (fetch_all) wins on full scans (~5x less FFI traffic) but
+    // loses on early-exit plans. Stay streaming when LIMIT is explicit.
     if (stoolap_thd_has_explicit_limit(ha_thd())) {
         scan_.reset(rows);
         return 0;
@@ -2698,9 +2181,7 @@ int ha_stoolap::rnd_init(bool /*scan*/) {
         sql_print_error("stoolap: rows_fetch_all failed");
         return HA_ERR_GENERIC;
     }
-    // Direct ownership of stoolap's allocation -- skip the memcpy that
-    // a std::vector::assign(buf, buf+len) would do. StoolapBuffer's
-    // destructor calls stoolap_buffer_free on whatever it holds.
+    // Take ownership of stoolap's allocation; std::vector::assign would memcpy.
     scan_buf_.take(buf, blen);
 
     if (!pkt_parse_header(scan_buf_.data(), scan_buf_.size(), &scan_buf_pos_,
@@ -2715,11 +2196,8 @@ int ha_stoolap::rnd_init(bool /*scan*/) {
     }
     scan_buf_rows_left_ = pkt_le32(scan_buf_.data() + scan_buf_pos_);
     scan_buf_pos_ += 4;
-    // Build the cell->field inverse of scan_proj_ once. With adaptive
-    // projection scan_proj_[i] is the result-cell index for field i, or
-    // -1 when the field wasn't projected. Per-row rnd_next consumes
-    // cells in order (the packed format is sequential), so the inverse
-    // lets it look up the destination field in one indexed access.
+    // Inverse of scan_proj_: cell index -> field index, for O(1) lookup
+    // per cell in rnd_next.
     scan_buf_cell_to_field_.assign(scan_buf_cols_, -1);
     for (size_t i = 0; i < scan_proj_.size(); ++i) {
         const int c = scan_proj_[i];
@@ -2735,17 +2213,12 @@ int ha_stoolap::rnd_init(bool /*scan*/) {
 }
 
 int ha_stoolap::rnd_end() {
-    // StoolapBuffer's reset() calls stoolap_buffer_free; the stoolap-
-    // side allocator (Rust) reuses freed regions itself, so we don't
-    // need to keep the buffer around between scans. Direct ownership
-    // also means there's no std::vector capacity to manage.
     reset_scan_state();
     return 0;
 }
 
 int ha_stoolap::rnd_next(uchar* buf) {
-    // Buffered (Tier 3) path: parse the next row out of the packed
-    // fetch_all buffer with no FFI calls.
+    // Buffered path: parse next row from the packed fetch_all buffer.
     if (!scan_buf_.empty()) {
         if (scan_buf_rows_left_ == 0) return HA_ERR_END_OF_FILE;
 
@@ -2759,11 +2232,6 @@ int ha_stoolap::rnd_next(uchar* buf) {
         const uint8_t* p = scan_buf_.data();
         const size_t len = scan_buf_.size();
         int err = 0;
-        // For each cell c the buffer carries (in the SELECT-list order
-        // we issued), look up the destination MariaDB field via the
-        // pre-built inverse map. Cells the table doesn't claim get
-        // skipped without storing -- that case shouldn't happen unless
-        // the schemas drift mid-flight, but skip cleanly if it does.
         for (uint32_t c = 0; c < scan_buf_cols_ && !err; ++c) {
             const int field_i = (c < scan_buf_cell_to_field_.size())
                                     ? scan_buf_cell_to_field_[c]
@@ -2776,10 +2244,8 @@ int ha_stoolap::rnd_next(uchar* buf) {
                                       table->field[field_i]);
             }
         }
-        // Always advance the row counter, even on a parse error -- the
-        // buffer offset is now effectively unrecoverable, so we want
-        // subsequent rnd_next calls to return EOF rather than parse
-        // garbage. Clamping rows_left to zero on error does that cleanly.
+        // On parse error, clamp rows_left to 0 so subsequent rnd_next
+        // returns EOF (the buffer offset is unrecoverable).
         if (err)
             scan_buf_rows_left_ = 0;
         else
@@ -2812,33 +2278,17 @@ int ha_stoolap::rnd_next(uchar* buf) {
     }
 
     int err = 0;
-    // The optimizer marks the columns it actually needs in `read_set`. For
-    // queries like `SELECT COUNT(*) FROM t` or `SELECT id FROM t WHERE x=?`
-    // we'd otherwise pay one FFI call per column we don't read; honoring
-    // the bitmap is the difference between O(rows*cols) and O(rows*needed)
-    // FFI calls per scan -- the dominant cost on full-scan-style aggregates.
-    //
-    // We also have to read every column in `write_set`, even when it's not
-    // in read_set: update_row() does a byte-compare of old vs new buffers
-    // to skip unchanged columns and avoid stoolap's "cannot UPDATE primary
-    // key" rejection. If the old buffer were left zeroed, an UPDATE SET
-    // x = 0 against a row with x = 100 would compare 0 == 0 and silently
-    // skip the SET, turning the whole UPDATE into a no-op.
-    // Read every column. We tried gating on read_set/write_set but
-    // MariaDB's filesort / temp-table / GROUP BY paths sometimes consult
-    // columns we'd otherwise skip (the read_set bitmap doesn't always
-    // tell the full story for sort keys produced from index plans),
-    // which produced empty result sets on `ORDER BY col LIMIT N`-shape
-    // queries. Populating every column is the only correct choice
-    // without diving into MariaDB's optimizer hooks.
+    // We tried bitmap-gated projection (read_set | write_set) but MariaDB's
+    // filesort / temp-table / GROUP BY paths sometimes consult columns
+    // outside the bitmap for sort keys, producing empty results on
+    // ORDER BY ... LIMIT N. Populating every projected column is the only
+    // correct choice without diving into the optimizer hooks.
     for (uint i = 0; i < table->s->fields; ++i) {
         const int col = (i < scan_proj_.size()) ? scan_proj_[i] : -1;
         if (col < 0) continue;
         Field* f = table->field[i];
-        // Skip the column_is_null FFI probe entirely for NOT NULL columns
-        // (the schema guarantees no NULLs there); for nullable columns,
-        // set_notnull() needs to fire when the value is present so the
-        // row buffer's null bitmap doesn't carry a stale 1.
+        // Skip column_is_null FFI for NOT NULL columns (schema guarantees);
+        // for nullable, set_notnull() clears stale 1s in the null bitmap.
         if (f->maybe_null()) {
             if (stoolap_rows_column_is_null(scan_.get(),
                                             static_cast<int32_t>(col))) {
@@ -2855,14 +2305,10 @@ int ha_stoolap::rnd_next(uchar* buf) {
             case MYSQL_TYPE_INT24:
             case MYSQL_TYPE_YEAR:
             case MYSQL_TYPE_BIT:
-                // Preserve UNSIGNED_FLAG: matches the packed-buffer path
-                // in stoolap_packet.h. Without this, the streaming row
-                // pump and index/range scans store INT UNSIGNED above
-                // INT32_MAX as a negative i64 and BIGINT UNSIGNED above
-                // INT64_MAX silently corrupts. The write side already
-                // refuses BIGINT UNSIGNED > INT64_MAX up front, so the
-                // round-trip via Field::store(..., unsigned=true) is
-                // faithful for every value the engine accepts.
+                // Preserve UNSIGNED_FLAG: without it, INT UNSIGNED > INT32_MAX
+                // stores as negative i64 and BIGINT UNSIGNED > INT64_MAX
+                // silently corrupts. write_row already refuses BIGINT
+                // UNSIGNED > INT64_MAX, so the round-trip is faithful.
                 f->store(stoolap_rows_column_int64(scan_.get(),
                                                    static_cast<int32_t>(col)),
                          /*unsigned=*/f->is_unsigned());
@@ -2932,17 +2378,10 @@ done:
 }
 
 int ha_stoolap::rnd_pos(uchar* buf, uchar* pos) {
-    // ref_length == table_share->reclength, so this restores the row content
-    // captured by position(). Used by UPDATE/DELETE plans that re-read by
-    // recorded position rather than by re-scanning.
-    //
-    // BLOB/TEXT hazard: a BLOB Field stores its in-record bytes as a
-    // (length, ptr) trio; ptr references memory owned by the prior
-    // rnd_next's stoolap value-store, which the next rnd_next overwrites.
-    // Restoring ref bytes verbatim resurrects a freed pointer and the
-    // server then reads garbage / crashes. Until rnd_pos is rebuilt to
-    // re-fetch the row from stoolap by primary key, refuse the call so
-    // affected statements fail loudly instead of corrupting data.
+    // BLOB hazard: a BLOB Field's in-record bytes are (length, ptr) where
+    // ptr is owned by the prior rnd_next's value-store and overwritten by
+    // the next rnd_next. Restoring ref bytes verbatim resurrects a freed
+    // pointer; refuse until rnd_pos is rebuilt to re-fetch by PK.
     if (has_blob_field_) {
         my_printf_error(ER_GET_ERRMSG,
                         "stoolap: rnd_pos / re-read by position is not "
@@ -2965,9 +2404,8 @@ int ha_stoolap::index_init(uint keynr, bool sorted) {
     ci_collation_filter_active_ = false;
     ci_collation_key_info_ = nullptr;
     ci_collation_nparts_ = 0;
-    // Drop scan_buf_ alongside scan_: rnd_next prefers the buffer over
-    // the streaming cursor, so a non-empty scan_buf_ left over from a
-    // prior rnd_init would shadow the index stream we're about to open.
+    // rnd_next prefers scan_buf_ over scan_; clear so a leftover buffer
+    // from a prior rnd_init doesn't shadow this index stream.
     reset_scan_state();
     return 0;
 }
@@ -2986,9 +2424,6 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
                                enum ha_rkey_function find_flag) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     if (active_index >= table->s->keys) return HA_ERR_INTERNAL_ERROR;
-    // Defensive: index_init clears scan_buf_, but a fresh index_read_map
-    // call following a prior one within the same index session must also
-    // ensure scan_buf_ from any earlier rnd_init can't be sitting around.
     reset_scan_state();
 
     // Pick the comparison operator for the LAST bound key part and the
@@ -3047,30 +2482,12 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     params.reserve(nparts);
     text_holders.reserve(nparts);
 
-    // ci-string ref access: stoolap compares bytes; MariaDB's default
-    // ci collations (utf8mb4_general_ci, ...) case-fold AND accent-fold
-    // ('é' = 'e', 'ß' = 'ss'). A byte-wise LOWER() rewrite handles
-    // ASCII case but not accent equivalents, and we can't pass-through
-    // and rely on "Using where" because join ref access drops the
-    // residual filter and IN-list ref re-applies the full IN clause
-    // per value (multiplying matches).
-    //
-    // The correct path is to drop the engine-side WHERE for ci ref,
-    // pull all rows from stoolap in index order, and ci-filter each
-    // row in our overridden index_next using the field's actual
-    // CHARSET_INFO comparator (Field::cmp). That gives MariaDB-correct
-    // semantics for both single-table and join refs, IN lists (each
-    // value's ref returns only its own ci-equivalent rows, no
-    // duplication), and accented data ('é' = 'e' is detected via the
-    // server's collation library, not approximated). Cost: O(N) per
-    // ref, same as a full scan -- acceptable since the optimizer's
-    // alternative for ci columns is also full scan.
-    //
-    // Skipped when stoolap_trust_binary_strings is on (caller has
-    // explicitly accepted byte-exact semantics). Also only triggers on
-    // the leading key part being ci string for an exact lookup --
-    // range/prefix bounds on ci columns are gated to _bin collations
-    // by index_flags().
+    // ci-string ref: MariaDB's ci collations case+accent fold; stoolap
+    // compares bytes. Drop the engine-side WHERE, pull all rows in index
+    // order, and ci-filter each row in index_next via Field::cmp (the
+    // real CHARSET_INFO comparator). Join ref drops the residual filter
+    // and IN-list ref re-applies the IN per value, so we can't rely on
+    // "Using where". stoolap_trust_binary_strings opts out.
     auto field_needs_ci_fold = [](Field* f) -> bool {
         if (!f) return false;
         switch (f->real_type()) {
@@ -3089,13 +2506,9 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         }
     };
     const bool trust_bin = stoolap_thd_trust_binary_strings(ha_thd());
-    // Trigger the ci fallback whenever ANY bound key part is a ci
-    // string column, not just the leading one. KEY(n, s) (INT, ci
-    // VARCHAR) is a ref where the leading part is byte-safe but the
-    // trailing part still needs ci collation; the bytewise predicate
-    // on `s` would miss accent-equivalent rows. index_next already
-    // ci-compares every bound key part via Field::cmp, so the filter
-    // covers leading-ci AND trailing-ci shapes uniformly.
+    // Trigger ci fallback for ANY bound ci part: KEY(n, s) on (INT, ci
+    // VARCHAR) ref-binds both, and the bytewise predicate on `s` would
+    // miss accent-equivalent rows. index_next ci-compares every bound part.
     bool any_ci_part = false;
     if (!trust_bin && find_flag == HA_READ_KEY_EXACT) {
         for (uint i = 0; i < nparts; ++i) {
@@ -3109,9 +2522,7 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     int rc_err = 0;
     int next_param = 1;
     if (ci_collation_lookup) {
-        // No engine-side predicate: index_next will Field::cmp every
-        // bound key part against record[1]. Strip the trailing " WHERE "
-        // we appended above.
+        // index_next does the work; strip the trailing " WHERE ".
         if (sql.size() >= 7 && sql.compare(sql.size() - 7, 7, " WHERE ") == 0) {
             sql.resize(sql.size() - 7);
         }
@@ -3125,8 +2536,7 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
             sql += quote_ident(
                 std::string_view(f->field_name.str, f->field_name.length));
             if (f->is_null()) {
-                // NULL with a range comparison is always false in SQL — no rows.
-                // For equality we use IS NULL.
+                // NULL with range op = no rows; equality uses IS NULL.
                 if (op[0] == '=' && op[1] == '\0') {
                     sql += " IS NULL";
                     continue;
@@ -3150,24 +2560,13 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     move_fields(table, -d);
     if (rc_err) return rc_err;
 
-    // Index-order iteration: order by every column of the index. DESC when
-    // the caller asked for backward iteration; index_next still walks forward
-    // through the result set.
-    //
-    // Skip the ORDER BY for an exact lookup that's bounded by a unique key
-    // (PRIMARY or UNIQUE) covering all bound parts -- there's at most one
-    // row, so sorting it is pure overhead in stoolap's planner.
+    // Skip ORDER BY when an exact lookup is bound by a unique key (one
+    // row max). For unsorted forward scans we also drop it; backward
+    // scans still need ORDER BY DESC so index_next can forward-iterate.
     const bool exact_unique_lookup =
         find_flag == HA_READ_KEY_EXACT &&
         nparts == key_info.user_defined_key_parts &&
         (key_info.flags & HA_NOSAME);
-    // Drop ORDER BY when:
-    //   - the lookup is on a unique key with all parts equality-bound (one
-    //     row max, sorting is pointless), OR
-    //   - index_init was called with sorted=false AND we're walking
-    //     forward (`!desc`). For backward scans we still need ORDER BY
-    //     DESC; stoolap returns rows in some natural order but we need
-    //     them reversed so subsequent index_next forward-iterates them.
     const bool need_order = !exact_unique_lookup && (index_sorted_ || desc);
     if (need_order) {
         sql += " ORDER BY ";
@@ -3193,14 +2592,8 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     scan_.reset(rows);
 
     if (ci_collation_lookup) {
-        // Engage the per-row ci-collation filter. The bound key parts'
-        // bytes are already in table->record[1] from key_restore above.
-        // index_next will compare EVERY bound key part of each fetched
-        // row against the search key bytes via each Field's CHARSET_INFO
-        // comparator and emit only rows where every part ci-matches.
-        // Comparing only the leading part would let composite-key joins
-        // like KEY(s, n) ON st.s=so.s AND st.n=so.n through with the
-        // wrong `n` value.
+        // Search-key bytes are in table->record[1] from key_restore.
+        // index_next will Field::cmp every bound part per row.
         ci_collation_filter_active_ = true;
         ci_collation_key_info_ = &key_info;
         ci_collation_nparts_ = nparts;
@@ -3257,10 +2650,8 @@ int ha_stoolap::index_first(uchar* buf) {
         sql += quote_ident(
             std::string_view(f->field_name.str, f->field_name.length));
     }
-    // index_first / index_last are one-row probes (MIN/MAX shortcut,
-    // existence check, ordered-fallback first row). Without LIMIT 1
-    // stoolap would produce an unbounded ordered stream that we'd
-    // discard after the first row, paying for the entire sort.
+    // One-row probe (MIN/MAX, existence). Without LIMIT 1 we'd pay for
+    // sorting the whole stream and discard everything after the first row.
     sql += " LIMIT 1";
     auto* ctx = get_thd_ctx(ha_thd());
     StoolapRows* rows = nullptr;
@@ -3316,20 +2707,10 @@ int ha_stoolap::read_range_first(const key_range* start_key,
 
     KEY& key_info = table->key_info[active_index];
 
-    // Punt collation-sensitive key parts to MariaDB's default range loop.
-    // MariaDB rewrites LIKE / BETWEEN over VARCHAR into bounded ranges
-    // assuming its own collation rules (case-insensitive `_general_ci`
-    // by default), but stoolap compares strings byte-wise. Forwarding
-    // those end bounds verbatim would silently drop rows that case-fold
-    // into the range. handler::read_range_first does index_read_map(start)
-    // + per-row compare_key(end) using MariaDB's collation, so it stays
-    // correct -- we just lose the engine-side end-bound shortcut.
-    //
-    // Binary-collated string columns (`_bin`, VARBINARY, BLOB) compare
-    // bytewise on both sides, so the bound IS safe to push for those:
-    // we keep them on the engine path. Non-string types (NEWDECIMAL,
-    // ENUM, SET) still punt because their bound encoding has surprises
-    // that haven't been re-validated.
+    // Punt ci string ranges to handler::read_range_first (it does
+    // index_read_map(start) + per-row compare_key(end) using MariaDB's
+    // collation). _bin / BINARY / BLOB are byte-safe; NEWDECIMAL/ENUM/SET
+    // still punt (encoded bound semantics not re-validated).
     auto contains_unsafe_part = [&](const key_range* range) {
         if (!range) return false;
         for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
@@ -3343,8 +2724,6 @@ int ha_stoolap::read_range_first(const key_range* start_key,
                 case MYSQL_TYPE_BLOB:
                 case MYSQL_TYPE_MEDIUM_BLOB:
                 case MYSQL_TYPE_LONG_BLOB: {
-                    // Binary collation -> bytewise -> safe to push the
-                    // bound. ci collations -> punt.
                     CHARSET_INFO* cs = f->charset();
                     if (cs && (cs->state & MY_CS_BINSORT)) break;
                     return true;
@@ -3363,23 +2742,11 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         return handler::read_range_first(start_key, end_key, eq_range, sorted);
     }
 
-    // Composite key bounds need lexicographic-tuple semantics:
-    // (a, b) >= (1, 5) AND (a, b) <= (2, 3) is *not* the same as
-    // a >= 1 AND b >= 5 AND a <= 2 AND b <= 3 -- the latter is empty
-    // (`a = 1 AND a = 2`), the former matches (1,5),(1,6),(1,10),
-    // (2,2),(2,3). Stoolap's CREATE INDEX is single-column only, so
-    // the inner key parts buy nothing as a physical index anyway.
-    // For any composite range we expand to an OR-chain of
-    // equality-prefixed predicates on the last key part:
-    //
-    //   (a, b) >= (1, 5)
-    //     becomes (a > 1) OR (a = 1 AND b >= 5)
-    //   (a, b) <= (2, 3)
-    //     becomes (a < 2) OR (a = 2 AND b <= 3)
-    //
-    // That's literal lex semantics, evaluated correctly by any SQL
-    // engine that does column compares -- including stoolap's
-    // expression VM.
+    // Lexicographic-tuple semantics: (a,b) >= (1,5) is NOT a >= 1 AND b >= 5
+    // (which would be empty when paired with the upper bound). Expand to
+    //   (a > 1) OR (a = 1 AND b >= 5)   -- lower bound
+    //   (a < 2) OR (a = 2 AND b <= 3)   -- upper bound
+    // evaluated correctly by stoolap's expression VM.
     auto count_bound_parts = [&](const key_range* range) -> uint {
         if (!range) return 0;
         uint n = 0;
@@ -3393,8 +2760,7 @@ int ha_stoolap::read_range_first(const key_range* start_key,
     const uint end_parts = count_bound_parts(end_key);
     const bool composite_range = (start_parts > 1 || end_parts > 1);
 
-    // Helper: translate a key_range::flag into the SQL operator we need on
-    // the LAST bound key part. Earlier parts are always equality.
+    // SQL op for the last bound part; earlier parts are always equality.
     auto op_for_start = [](ha_rkey_function f) -> const char* {
         switch (f) {
             case HA_READ_KEY_EXACT:
@@ -3414,9 +2780,8 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         }
     };
     auto op_for_end = [](ha_rkey_function f) -> const char* {
-        // MariaDB convention for the upper bound: HA_READ_AFTER_KEY means
-        // "up to and including the key" (col <= K), HA_READ_BEFORE_KEY
-        // means "up to but not including" (col < K).
+        // Upper bound convention: HA_READ_AFTER_KEY = "<= K" (inclusive),
+        // HA_READ_BEFORE_KEY = "< K" (exclusive).
         switch (f) {
             case HA_READ_AFTER_KEY:
                 return "<=";
@@ -3441,21 +2806,15 @@ int ha_stoolap::read_range_first(const key_range* start_key,
     sql += quote_ident(stoolap_table_);
 
     std::vector<StoolapValue> params;
-    // std::deque (not vector) so push_back never moves earlier strings:
-    // append_bound runs twice (start then end key parts) and stashes
-    // text_holders.back().data() into StoolapValue.text.ptr after each
-    // call. A vector realloc between the two phases would invalidate
-    // pointers stored from the start phase. (Same fix bulk_text_holders_
-    // got earlier for the same shape of bug.)
+    // deque, not vector: append_bound runs twice and stashes
+    // text_holders.back().data() into StoolapValue.text.ptr; a vector
+    // realloc between phases would invalidate pointers from phase one.
     std::deque<std::string> text_holders;
     int next_param = 1;
     bool any_pred = false;
 
-    // Lex-aware bound emitter. For nparts > 1 with a non-equality
-    // last_op, emits an OR-chain:
+    // For nparts > 1 with non-eq last_op emits the OR-chain:
     //   (p0 <strict> v0) OR (p0 = v0 AND p1 <last_op> v1)
-    // For "=" or single-part bounds, falls through to the per-part
-    // AND form (still correct for those shapes).
     auto append_lex_bound = [&](const char* col, const char* op, int param_no,
                                 bool is_first_pred) {
         sql += is_first_pred ? " WHERE " : " AND ";
@@ -3473,8 +2832,7 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         const char* last_op = op_fn(range->flag);
         if (!last_op) return HA_ERR_UNSUPPORTED;
         const bool is_eq_op = (last_op[0] == '=' && last_op[1] == '\0');
-        // Strict variant of last_op for the prefix legs of an OR-chain:
-        // ">=" / ">" -> ">"; "<=" / "<" -> "<".
+        // Strict variant for OR-chain prefix legs: ">=" / ">" -> ">".
         const char strict = (last_op[0] == '>') ? '>' : '<';
 
         uint nparts = 0, klen = 0;
@@ -3488,10 +2846,9 @@ int ha_stoolap::read_range_first(const key_range* start_key,
             static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
         move_fields(table, d);
 
-        // Lex OR-chain for composite non-equality bounds.
+        // OR-chain for composite non-eq bounds.
         if (nparts > 1 && !is_eq_op) {
-            // Pre-extract every key-part value once (we reference them
-            // once per leg of the OR chain).
+            // Bind every key-part value once; each is referenced per leg.
             std::vector<int> param_nos;
             param_nos.reserve(nparts);
             for (uint i = 0; i < nparts; ++i) {
@@ -3581,13 +2938,8 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         return rc;
     if (int rc = append_bound(end_key, op_for_end, /*is_end=*/true)) return rc;
 
-    // Index-order iteration. Skip the ORDER BY when:
-    //   - the start bound is an exact match on a unique index (at most
-    //     one row, so order is irrelevant), or
-    //   - the caller didn't ask for sorted output (MariaDB sets `sorted`
-    //     to indicate whether the range plan needs index-ordered rows).
-    // Skipping the sort lets stoolap pick the cheapest scan and avoids a
-    // gratuitous order step on the result set.
+    // Skip ORDER BY when an exact unique-index lookup (one row) or when
+    // MariaDB's `sorted` flag says the range plan doesn't need order.
     bool exact_unique = false;
     if (start_key && start_key->flag == HA_READ_KEY_EXACT &&
         (key_info.flags & HA_NOSAME)) {
@@ -3621,9 +2973,8 @@ int ha_stoolap::read_range_first(const key_range* start_key,
 }
 
 int ha_stoolap::read_range_next() {
-    // Route through index_next so the ci-collation filter fires on
-    // ranges punted to handler::read_range_first (ci-string keys).
-    // For non-ci scans index_next is just rnd_next, so no overhead.
+    // Route through index_next so the ci-collation filter fires on punted
+    // ranges. Non-ci scans just hit rnd_next via index_next; no overhead.
     return index_next(table->record[0]);
 }
 
@@ -3631,26 +2982,11 @@ void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,
                                     ulonglong nb_desired_values,
                                     ulonglong* first_value,
                                     ulonglong* nb_reserved_values) {
-    // MariaDB asks for the next auto-increment value before write_row
-    // stamps it onto the field. Reserve ids process-wide: per-connection
-    // caches are fast but unsafe under concurrent sessions and explicit
-    // high-id inserts.
-    //
-    // `offset` and `increment` come from the session's
-    // auto_increment_offset / auto_increment_increment, used by
-    // multi-writer replication to give each writer a disjoint id ladder
-    // (writer 1 issues 1, 5, 9, ...; writer 2 issues 2, 6, 10, ...).
-    // The contract: the returned id and the (nb_reserved_values - 1)
-    // ids that follow MUST satisfy (id % increment == offset % increment).
-    // MariaDB itself rounds the value we return up to satisfy the
-    // modulus, so we could just return ai_next_ verbatim. The trap is
-    // that MariaDB then advances by `increment` for each subsequent row
-    // in the same batch -- and a *concurrent* session would still see
-    // our cursor at the un-stepped position, hand it a colliding id,
-    // and produce ER_DUP_ENTRY at write_row time. Reserving with
-    // `step=increment` and `offset_mod=offset%increment` makes the
-    // engine cursor jump past every id MariaDB will logically issue
-    // within the batch, so concurrent sessions skip the whole window.
+    // Reserve ids process-wide: per-connection caches collide under
+    // concurrent sessions + explicit high-id inserts. Reserving with
+    // step=increment makes our cursor jump past every id MariaDB
+    // logically issues in this batch (offset/increment is the multi-
+    // writer replication ladder).
     *first_value = ~ulonglong(0);
     *nb_reserved_values = nb_desired_values ? nb_desired_values : 1;
 
@@ -3683,13 +3019,9 @@ void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,
     uint64_t current_max = 0;
     if (stoolap_rows_next(rows) == STOOLAP_ROW &&
         !stoolap_rows_column_is_null(rows, 0)) {
-        // Floor at 0: a row with an explicit negative AI value (e.g.
-        // INSERT VALUES (-2, ...)) makes MAX() return a negative int64.
-        // Casting that to uint64 wraps to ULLONG_MAX-1, then +1
-        // overflows and the next generated insert fails
-        // ER_AUTOINC_READ_FAILED. AUTO_INCREMENT only ever issues
-        // positive ids, so negatives below the cursor are irrelevant
-        // and safe to clamp to 0.
+        // Floor at 0: an explicit negative AI value (INSERT VALUES (-2)
+        // ...) gives a negative MAX(); uint64 wrap + 1 overflows and the
+        // next generated insert fails ER_AUTOINC_READ_FAILED.
         const int64_t raw = stoolap_rows_column_int64(rows, 0);
         current_max = (raw > 0) ? static_cast<uint64_t>(raw) : 0;
     }
@@ -3766,32 +3098,23 @@ void ha_stoolap::set_count_exact(uint64_t value) {
 }
 
 ha_rows ha_stoolap::cached_records() {
-    // Lookup order: handler-local (this handler) -> tx-local for active
-    // transactions, or engine-global for autocommit -> live COUNT(*).
-    // The tx-local layer is deliberately per-THD so uncommitted/snapshot
-    // visible counts never leak into another connection's planning stats.
+    // Lookup order: handler-local -> tx-local (in tx) or engine-global
+    // (autocommit) -> live count via FFI. The tx-local layer is
+    // per-THD so snapshot-visible counts never leak between connections.
     if (cached_records_valid_) return cached_records_;
     if (stoolap_table_.empty()) return stats.records;
 
     THD* thd = ha_thd();
-    // Some optimizer/statistics callers reach records() before MariaDB has
-    // taken the handler through external_lock(). That means the normal
-    // statement registration path may not have opened the session's Stoolap
-    // transaction yet. If this is an explicit transaction, register here too
-    // so COUNT(*) observes the same snapshot/own-writes view the later row
-    // access path will use; otherwise a pre-lock stats probe can silently
-    // seed planning with an autocommit-visible count.
+    // Optimizer/stat callers can reach here before external_lock has
+    // registered the tx. Register now so COUNT observes the same view
+    // the later row access path will use; otherwise a pre-lock probe
+    // seeds planning with an autocommit-visible count.
     if (thd && thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)) {
         if (register_trx(thd) != 0) return stats.records;
     }
     auto* ctx = thd ? get_thd_ctx(thd) : nullptr;
-    // Skip the cross-session cache while a stoolap tx is open: the
-    // tx-side COUNT(*) sees this session's uncommitted writes (and not
-    // other sessions' post-snapshot writes), which is the right answer
-    // for *us* but wrong for any other connection that reads the cache.
-    // The reverse is also true: a cached value placed by an autocommit
-    // reader in another session can be stale relative to our own
-    // in-flight changes. Use only handler-local / tx-local cache here.
+    // Skip cross-session cache during an open tx: tx-side counts see this
+    // session's uncommitted writes -- right for us, wrong to publish.
     const bool in_tx = ctx && ctx->has_tx();
 
     if (in_tx) {
@@ -3812,12 +3135,8 @@ ha_rows ha_stoolap::cached_records() {
         }
     }
 
-    // MVCC-safe count via stoolap_(tx_)table_count. Inside an open
-    // tx, the tx-side call returns the snapshot-correct count (sees
-    // this session's uncommitted INSERT/DELETE, hides other sessions'
-    // post-snapshot writes); outside, the db-side call returns the
-    // autocommit-visible count via the SegmentedTable fast path --
-    // O(1) atomic loads, safe on the hot loop.
+    // O(1) MVCC-safe count: tx-side sees own uncommitted writes,
+    // db-side returns autocommit-visible count via SegmentedTable.
     stoolap_mariadb::g_stats.records_live_counts.fetch_add(
         1, std::memory_order_relaxed);
     uint64_t count = 0;
@@ -3830,14 +3149,10 @@ ha_rows ha_stoolap::cached_records() {
     if (in_tx) {
         ctx->records_set(stoolap_table_, count);
     }
-    // Do not publish tx-visible counts into the process-wide cache.
-    // Some optimizer/stat callers can run before MariaDB has called
-    // external_lock/register_trx for the statement, so detecting an
-    // active transaction here is not reliable enough to prevent a
-    // transaction-visible count from leaking to other sessions. Keep
-    // this as a handler-local + tx-local cache only; explicit DDL
-    // paths such as TRUNCATE may still seed exact global values
-    // themselves.
+    // Never publish here to the process-wide cache: pre-external_lock
+    // probes can't reliably distinguish autocommit from in-tx, so a
+    // tx-visible count could leak across sessions. DDL (TRUNCATE) seeds
+    // exact global values via set_count_exact instead.
     return stats.records;
 }
 
@@ -3854,32 +3169,20 @@ ha_rows ha_stoolap::records_in_range(uint inx, const key_range* min_key,
                                      page_range* /*res*/) {
     // The default handler::records_in_range returns 10, which is the
     // optimizer's signal of "I have no idea." That number drives join
-    // ordering and index-vs-table-scan choices, so giving MariaDB a real
-    // estimate matters for plan quality on multi-table queries.
-    //
-    // We don't have stoolap-side histograms exposed through the C ABI, so
-    // approximate: divide the table's row count by the index's distinct-
-    // value estimate (rec_per_key) when available, otherwise fall back to
-    // a fraction of the table that scales with bound tightness.
+    // ordering and index-vs-scan choices. No stoolap-side histograms,
+    // so divide row count by rec_per_key when populated, else estimate
+    // by bound shape.
     if (inx >= table->s->keys) return 10;
     const KEY& k = table->key_info[inx];
-    // Use the same cached COUNT(*) path as records()/info(). Depending on
-    // MariaDB's optimizer call order, records_in_range() can be reached
-    // before HA_STATUS_VARIABLE has warmed stats.records; treating that as
-    // a one-row table causes wildly optimistic range costs and poor joins.
+    // records_in_range() can fire before HA_STATUS_VARIABLE has warmed
+    // stats.records, so use cached_records directly.
     const ha_rows cached_total = cached_records();
     const ha_rows total = cached_total ? cached_total : 1;
 
-    // ci-leading ref/range access in this handler runs a full table
-    // scan in index_next (the only collation-correct option without a
-    // stoolap-side ci index). The planner needs to see that real cost
-    // so it doesn't sort joins as if ref returns one row -- a big
-    // outer would otherwise drive O(outer * inner) probes that each
-    // scan the inner table. Reporting `total` here makes the optimizer
-    // treat ci ref access as no cheaper than a scan, and it picks a
-    // sane join order (or a hash join). Skip the inflation when the
-    // user opted into byte semantics: there the engine does a real
-    // byte-equal index lookup and ref really is O(1)-ish.
+    // ci-leading ref runs a full scan in index_next (no stoolap-side ci
+    // index). Report `total` so the planner treats ci ref as no cheaper
+    // than a scan, picking sane join order / hash join. trust_binary_strings
+    // opts into byte-equal lookup where ref really is O(1)-ish.
     if (!stoolap_thd_trust_binary_strings(ha_thd())) {
         for (uint i = 0; i < k.user_defined_key_parts; ++i) {
             Field* f = k.key_part[i].field;
@@ -3919,19 +3222,12 @@ ha_rows ha_stoolap::records_in_range(uint inx, const key_range* min_key,
         return static_cast<ha_rows>(rpk);
     }
 
-    // No rec_per_key. Pick a coarse estimate based on the bound shape.
-    // A previous attempt at this pushed MariaDB onto index_merge_intersect
-    // plans on composite-key tables and produced wrong results, but we
-    // now advertise HA_KEY_SCAN_NOT_ROR everywhere -- which tells the
-    // optimizer our index scans aren't rowid-ordered and disables that
-    // family of plans -- so it's safe to give a more honest answer.
-    //
-    //   - exact equality on a non-unique key: ~0.1% (key with many
-    //     distinct values; near-unique would have hit the unique branch).
-    //   - tight range (both bounds): ~1%.
-    //   - half-open range (one bound): ~10%.
-    //
-    // Floor of 10 so tiny tables don't get pushed onto bad plans.
+    // Coarse estimate by bound shape (HA_KEY_SCAN_NOT_ROR keeps us out
+    // of index_merge_intersect plans):
+    //   exact eq on non-unique key: ~0.1%
+    //   tight range (both bounds):  ~1%
+    //   half-open range:            ~10%
+    // Floor at 10 so tiny tables don't pick bad plans.
     const bool exact =
         (min_key && max_key && min_key->flag == HA_READ_KEY_EXACT);
     const bool tight = (min_key && max_key && !exact);
@@ -3947,13 +3243,9 @@ ha_rows ha_stoolap::records_in_range(uint inx, const key_range* min_key,
 }
 
 IO_AND_CPU_COST ha_stoolap::scan_time() {
-    // Default handler::scan_time() uses stats.data_file_length, which
-    // is 0 for our handler (stoolap is in-memory or behind FFI; we
-    // don't have a meaningful file length). Approximate scan cost as
-    // `stats.records` cost units split between cpu and io so the ci
-    // ref cost gate (keyread_time below) has a non-zero quantity to
-    // multiply by, and the optimizer's scan-vs-ref tie-break has real
-    // numbers to compare.
+    // We have no file length (stoolap is in-memory / behind FFI); the
+    // default scan_time() returns 0. Approximate as stats.records so the
+    // ci ref cost gate below has a non-zero quantity to multiply by.
     IO_AND_CPU_COST cost;
     const double n = static_cast<double>(stats.records ? stats.records : 1);
     cost.io = n * 0.5;
@@ -3996,14 +3288,9 @@ IO_AND_CPU_COST ha_stoolap::keyread_time(uint index, ulong ranges,
         return handler::keyread_time(index, ranges,
                                      /*rows=*/stats.records, blocks);
     }
-    // Replace the cheap-keylookup estimate with full-scan equivalent.
-    // The handler's ci fallback walks every row of the inner table in
-    // index_next, so each ref/range probe really is a scan. Override
-    // the caller's `rows` estimate too -- MariaDB passes rec_per_key
-    // there, which we cannot poison without leaking state across
-    // sessions. Fall back on stats.records * ranges for both halves
-    // of the cost so the planner can no longer see ci ref as a cheap
-    // point lookup.
+    // ci fallback walks every row in index_next, so each probe is a
+    // full scan. Override caller's `rows` (which is rec_per_key and
+    // would leak ci-folded counts across sessions if persisted).
     IO_AND_CPU_COST scan = scan_time();
     const double mult = static_cast<double>(ranges ? ranges : 1);
     IO_AND_CPU_COST cost;
@@ -4017,21 +3304,15 @@ int ha_stoolap::info(uint flag) {
     stats.data_file_length = 0;
     stats.index_file_length = 0;
 
-    // get_dup_key() clears errkey then calls info(HA_STATUS_ERRKEY) to ask
-    // us to re-populate it. We remember the violated key from write_row.
     if (flag & HA_STATUS_ERRKEY) {
+        // get_dup_key() calls us to re-publish the violated key.
         errkey = last_dup_key_;
     }
 
-    // Refresh the row count when MariaDB asks for variable stats. This
-    // is an optimizer-planning estimate, not user-facing -- so prefer
-    // any cached value (handler-local OR tx-local/process-wide) over running a
-    // fresh stoolap COUNT(*). info() fires several times per statement
-    // (planning + records_in_range loops + post-statement), and a tight
-    // mutation loop invalidates the cache after each row, so calling
-    // cached_records() here would re-COUNT(*) the whole table N times
-    // per statement. The user's actual SELECT COUNT(*) goes through
-    // records() -> cached_records() which still refreshes on demand.
+    // Cache-only refresh on purpose: info() fires several times per
+    // statement and a mutation loop invalidates after each row, so
+    // calling cached_records() here would re-COUNT N times per stmt.
+    // User-visible SELECT COUNT(*) still routes through records().
     if (flag & HA_STATUS_VARIABLE) {
         if (!stoolap_table_.empty()) {
             if (cached_records_valid_) {
@@ -4053,10 +3334,9 @@ int ha_stoolap::info(uint flag) {
                     cached_records_valid_ = true;
                     stats.records = cached_records_;
                 }
-                // Both caches missed: leave stats.records at whatever
-                // the previous statement left, falling back to a
-                // non-zero placeholder so the optimizer doesn't see
-                // "Impossible WHERE" on a freshly-loaded table.
+                // Both caches missed: keep prior stats.records; the 1000
+                // placeholder below avoids "Impossible WHERE" on a fresh
+                // load.
             }
         }
         if (stats.records == 0) stats.records = 1000;
@@ -4094,11 +3374,8 @@ static MYSQL_SYSVAR_STR(
     /*check=*/nullptr, /*update=*/nullptr,
     /*default=*/"memory://");
 
-// Backing variable + update callback for the perf-trace toggle. Kept as
-// a plain bool that the system-var update writes; the real consumer is
-// the std::atomic<bool> in stoolap_bridge.cc, which the hot paths read
-// without taking the THD context. The update callback synchronises the
-// two whenever a user runs `SET GLOBAL stoolap_perf_trace = 1`.
+// MYSQL_SYSVAR writes here; the update callback mirrors into the atomic
+// in stoolap_bridge.cc that the hot paths read without taking THD ctx.
 static char stoolap_perf_trace_var = 0;
 static void stoolap_perf_trace_update(MYSQL_THD, struct st_mysql_sys_var*,
                                       void* var_ptr, const void* save) {
@@ -4117,15 +3394,6 @@ static MYSQL_SYSVAR_BOOL(
     /*check=*/nullptr, stoolap_perf_trace_update,
     /*default=*/false);
 
-// Per-session opt-in: bypass the ci-collation guard for SELECT pushdown.
-// Stoolap compares strings byte-wise; MariaDB's default VARCHAR collation
-// is utf8mb3_general_ci. With the guard ON (default behaviour), queries
-// that touch a non-binary string column in WHERE/HAVING/ORDER/GROUP fall
-// to the row pump so MariaDB's collation rules apply. With this flag
-// flipped, pushdown proceeds anyway -- the user takes responsibility for
-// the semantic difference (LIKE 'a%' won't match 'A...', ORDER BY name
-// is byte-order, etc.). Safe when the data is ASCII/already-cased or the
-// app doesn't depend on case folding.
 static MYSQL_THDVAR_BOOL(
     trust_binary_strings, PLUGIN_VAR_OPCMDARG,
     "Push string predicates / sorts / groups to stoolap even on "
@@ -4135,12 +3403,6 @@ static MYSQL_THDVAR_BOOL(
     /*check=*/nullptr, /*update=*/nullptr,
     /*default=*/false);
 
-// When ON, every successful pushdown runs `EXPLAIN <pushed-sql>` through
-// stoolap before the real query and dumps each plan line to the server
-// error log. Lets users see what stoolap actually planned (MariaDB's
-// `EXPLAIN` only reports the engine accepted the SELECT as one plan).
-// Off by default; use only for diagnosis -- adds one extra stoolap call
-// per pushed query.
 static MYSQL_THDVAR_BOOL(
     explain_pushdown, PLUGIN_VAR_OPCMDARG,
     "Log stoolap's EXPLAIN of every pushed SELECT to the server error "
@@ -4164,17 +3426,10 @@ extern "C" int stoolap_thd_explain_pushdown(MYSQL_THD thd) {
 struct st_mysql_storage_engine stoolap_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
 
-// SHOW STATUS LIKE 'Stoolap_%' surface. Counters live in stoolap_bridge.cc;
-// SHOW_LONGLONG against std::atomic<uint64_t> is safe because both are 8
-// bytes and a relaxed atomic load on aarch64 is just a plain load -- the
-// status reader doesn't synchronise with writers, and approximate counts
-// are fine for SHOW STATUS.
-//
-// We deliberately spell each row out instead of hiding the cast in a
-// macro. Function-style macros with multi-line bodies trigger
-// version-specific clang-format reformatting (LLVM 18 vs 22 disagree on
-// backslash-continuation alignment), and the format gate is a hard fail.
-// One row per counter is cheap; the alternative was a moving target.
+// SHOW_LONGLONG over std::atomic<uint64_t>: same 8 bytes; relaxed load
+// is a plain load on aarch64; approximate counts are fine for SHOW STATUS.
+// Single-line _SS_PTR macro to avoid LLVM 18 vs 22 backslash-continuation
+// disagreement that would break the format gate.
 #define _SS_PTR(member) \
     reinterpret_cast<char*>(&stoolap_mariadb::g_stats.member)
 
@@ -4186,27 +3441,13 @@ static struct st_mysql_show_var stoolap_status_vars[] = {
      SHOW_LONGLONG},
     {"Stoolap_buffered_scans", _SS_PTR(buffered_scans), SHOW_LONGLONG},
     {"Stoolap_buffered_rows", _SS_PTR(buffered_rows), SHOW_LONGLONG},
-    // Drift detectors for the error mapping table.
-    //
-    // Stoolap_unmapped_errors: BOTH the typed errcode AND the prose
-    // pattern table came back generic for a non-empty stoolap message.
-    // Either stoolap added a STOOLAP_ERR_* we don't recognise OR
-    // reworded the message away from every known anchor. case_18
-    // pins this at 0 across every known error class.
-    //
-    // Stoolap_typed_fallback_hits: typed errcode said GENERIC but the
-    // prose pattern still classified the message into a specific
-    // HA_ERR_*. Means stoolap returned a generic typed code for an
-    // error we know how to pin down by text -- a stoolap-side typed-
-    // error gap. Once both stay 0 across a real run the prose fallback
-    // can retire.
+    // Strict drift counter (case_18 pins at 0); see PushdownStats.
     {"Stoolap_unmapped_errors", _SS_PTR(unmapped_errors), SHOW_LONGLONG},
+    // Stoolap-side typed-error gap signal; allowlisted in runner.
     {"Stoolap_typed_fallback_hits", _SS_PTR(typed_fallback_hits),
      SHOW_LONGLONG},
-    // PERF DEBUG: aggregate nanoseconds per phase across all pushed
-    // SELECTs. Divide by Stoolap_perf_query_count (or _next_row_count
-    // for next_row_ns) to read off per-query / per-row averages. Always
-    // on; cost is two clock_gettime calls per phase, ~20ns total.
+    // Per-phase ns; divide by Stoolap_perf_query_count (or
+    // _next_row_count) for averages. Two clock_gettime per phase (~20ns).
     {"Stoolap_perf_factory_setup_ns", _SS_PTR(perf_factory_setup_ns),
      SHOW_LONGLONG},
     {"Stoolap_perf_eager_query_ns", _SS_PTR(perf_eager_query_ns),

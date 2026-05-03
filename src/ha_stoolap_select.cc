@@ -46,48 +46,25 @@ class Engine;
 }
 extern stoolap_mariadb::Engine g_engine;
 
-// Defined in ha_stoolap.cc. Same logic external_lock uses to register
-// the engine with MariaDB's tx manager and open a stoolap tx when the
-// THD is inside an explicit BEGIN block. Pushdown factories call it
+// Defined in ha_stoolap.cc. Pushdown factories call register_trx
 // defensively because create_select can fire before any handler's
-// external_lock when the planner installs us as the whole-statement
-// executor; without it a pushed SELECT inside START TRANSACTION (or
-// WITH CONSISTENT SNAPSHOT) would run on the autocommit handle and
-// miss the session's snapshot.
+// external_lock; without it a pushed SELECT inside START TRANSACTION
+// would miss the session's snapshot.
 extern int register_trx(THD* thd);
 
-// Defined in ha_stoolap.cc. Bundles a typed STOOLAP_ERR_* code with
-// the populated StoolapErrorDetails captured from one
-// stoolap_*_errdetails call. Pointers in `details` remain valid only
-// until the next FFI call on the originating handle.
+// Defined in ha_stoolap.cc. Pointers in `details` are valid only until
+// the next FFI call on the originating handle.
 struct StoolapErrorView {
     int32_t code;
     StoolapErrorDetails details;
 };
 
-// Defined in ha_stoolap.cc. Capture the live error from a tx / db /
-// stmt / rows handle into a view that report_stoolap_error and
-// errkey_from_view can consume.
 extern StoolapErrorView fetch_db_error(StoolapDB* db);
 extern StoolapErrorView fetch_tx_error(StoolapTx* tx);
-
-// Defined in ha_stoolap.cc. Maps a stoolap error view to the right
-// HA_ERR_* code and, for generic-class codes, surfaces the original
-// text via my_printf_error so the user sees the real cause instead of
-// "Got error 168".
 extern int report_stoolap_error(const StoolapErrorView& v);
-
-// Defined in ha_stoolap.cc. From a stoolap typed UNIQUE / PRIMARY KEY
-// error (with details.constraint / details.column populated), returns
-// the matching MariaDB key index so the handler can publish errkey
-// for ON DUPLICATE KEY / REPLACE.
 extern unsigned errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share);
 
-// Brewed mariadbd doesn't ship the my_print_error_service struct that
-// `mysql/plugin.h` rewires my_error / my_printf_error through, so we undef
-// the macros and bind directly to the exported symbols. This lets us hand
-// the real stoolap error to the user instead of the generic "Got error 122
-// (unspecified)" fallback.
+// brewed mariadbd doesn't ship my_print_error_service; bind directly.
 #undef my_error
 #undef my_printf_error
 extern "C" void my_error(unsigned int nr, unsigned long MyFlags, ...);
@@ -411,16 +388,9 @@ bool any_on_expr_matches_chain(TABLE_LIST* head, ItemPred pred);
 
 namespace stoolap_pushdown {
 
-// Returns true if any leaf table the rewriter would touch -- outer
-// FROM, derived tables, AND every inner-unit subquery -- has a column
-// whose name (case-insensitively) matches its bare table name. This
-// is the unsafe shape for the text-based rewriter: every word-boundary
-// occurrence of the table's bare name gets replaced with the
-// stoolap-flat name, which mangles SET / WHERE column tokens that
-// happen to share the table name.
-//
-// Mirrors collect_leaf_names()'s walk so the guard covers exactly
-// the same set of names the rewriter will touch.
+// True if any leaf the rewriter touches has a column sharing its bare
+// table name. The text-based rewriter's word-boundary replace would
+// mangle that column token. Mirrors collect_leaf_names's walk.
 bool any_leaf_has_shadow_column(SELECT_LEX* sel_lex);
 
 void collect_leaf_table_names(SELECT_LEX* sel_lex,
@@ -496,15 +466,10 @@ bool any_leaf_table_name_collides_with_any_column(
     return false;
 }
 
-// Cross-leaf shadow detector. The text rewriter replaces every word-
-// boundary occurrence of EVERY leaf table name with that table's
-// stoolap-flat form. So even if a leaf's own table name doesn't
-// collide with its columns, an OTHER leaf's table name can: e.g.
-// `UPDATE u SET o = o + 1 WHERE EXISTS (SELECT 1 FROM o ...)` has
-// outer leaf `u` (column `o`) and subquery leaf `o`. The bare `o`
-// tokens in `SET o = o + 1` get rewritten to the flat form of table
-// `o`, mangling the SET column. Refuse direct DML when any leaf's
-// columns share a name with any (other) leaf's table.
+// Cross-leaf shadow: another leaf's table name can collide with this
+// leaf's column. UPDATE u SET o=o+1 WHERE EXISTS(SELECT 1 FROM o ...)
+// has outer leaf `u` with column `o` and subquery leaf `o` -- bare `o`
+// in SET gets rewritten to table `o`'s flat form, mangling the column.
 bool any_leaf_has_shadow_column(SELECT_LEX* sel_lex) {
     std::vector<std::string> all_names;
     collect_leaf_table_names(sel_lex, all_names);
@@ -530,10 +495,8 @@ bool can_direct_modify(THD* thd) {
         return false;  // ORDER BY / LIMIT
     if (sel->uncacheable & UNCACHEABLE_SIDEEFFECT) return false;
 
-    // Helper: walk a list of Items and report whether any contains an
-    // unsafe field reference. Used for both the WHERE clause AND the
-    // SET RHS expressions; both end up evaluated server-side and would
-    // miscompare against Stoolap's bytewise / text storage.
+    // True if `root` references a ci-string or DECIMAL field. Both
+    // would miscompare against stoolap's bytewise/TEXT storage.
     auto items_unsafe_for_pushdown = [&](Item* root) {
         if (!root) return false;
         const bool ci_unsafe =
@@ -544,9 +507,7 @@ bool can_direct_modify(THD* thd) {
     };
 
     if (items_unsafe_for_pushdown(sel->where)) return false;
-    // Direct DML over a JOIN (multi-table UPDATE/DELETE is already
-    // blocked above, but a single-table UPDATE may still carry a
-    // semi-join-lifted on_expr). Walk every TABLE_LIST's ON-expressions.
+    // Single-table UPDATE may still carry a semi-join-lifted on_expr.
     if (any_on_expr_matches_chain(sel->get_table_list(), item_uses_ci_string) &&
         !stoolap_thd_trust_binary_strings(thd))
         return false;
@@ -554,31 +515,19 @@ bool can_direct_modify(THD* thd) {
                                   item_uses_decimal_field))
         return false;
 
-    // The SET RHS expressions live in `thd->lex->value_list` for UPDATE
-    // statements (DELETE has no SET, so this loop is empty there). A
-    // scalar subquery like
-    //   UPDATE u SET n = (SELECT COUNT(*) FROM o WHERE status='completed')
-    // would otherwise direct-route to stoolap which compares bytewise
-    // against rows storing 'COMPLETED' and silently writes the wrong
-    // value. Same gate as the WHERE walk: ci is opt-in via
-    // trust_binary_strings, DECIMAL is unconditional.
     if (cmd == SQLCOM_UPDATE) {
+        // SET RHS expressions live in lex->value_list. A scalar subquery
+        // like SET n = (SELECT COUNT(*) FROM o WHERE status='completed')
+        // would route to stoolap and bytewise-compare against 'COMPLETED'.
         List_iterator<Item> it(thd->lex->value_list);
         Item* expr;
         while ((expr = it++)) {
             if (items_unsafe_for_pushdown(expr)) return false;
         }
-        // Also bail when the UPDATE TARGET column is DECIMAL. Stoolap
-        // stores DECIMAL as TEXT; assignments like `SET dec_v = 2.50`
-        // pass a numeric literal/param to stoolap which rounds through
-        // float before writing back as TEXT, dropping scale and (for
-        // high-precision DECIMALs) losing low-order digits. The SET
-        // LHS columns live in `first_select_lex()->item_list` for
-        // UPDATE statements; walk them and bail on any DECIMAL target.
-        // The row-pump path is correct because Field::store on the
-        // DECIMAL field receives the bound MariaDB value at full
-        // precision and writes it through `extract_field` -> stoolap
-        // text without an intermediate float conversion.
+        // DECIMAL targets: stoolap stores DECIMAL as TEXT. Assignments
+        // pass a numeric param that rounds through float before write,
+        // dropping scale. The row-pump path is faithful because
+        // Field::store on the DECIMAL receives the value at full precision.
         List_iterator<Item> tit(sel->item_list);
         Item* tgt;
         while ((tgt = tit++)) {
@@ -597,16 +546,9 @@ bool can_direct_modify(THD* thd) {
     if (!every_table_is_stoolap(sel, any)) return false;
     if (!any) return false;
 
-    // The direct-DML rewriter is text-based: it rewrites every
-    // word-boundary occurrence of any leaf table's bare name to the
-    // stoolap-flat name. If ANY of those leaves -- outer FROM, derived
-    // tables, EXISTS / IN / scalar-subquery FROMs -- has a column
-    // sharing its table name, that column token gets rewritten too.
-    // Stoolap then sees an UPDATE/WHERE/SET clause assigning or
-    // comparing against a quoted table identifier, which yields a
-    // generic engine error (already after we've claimed the direct
-    // path). Decline up front; the row-pump fallback handles those
-    // statements correctly via per-row callback.
+    // Decline if any leaf has a shadow column; the text-based rewriter
+    // would mangle SET/WHERE tokens that share a table name. Row-pump
+    // handles those via per-row callbacks.
     if (any_leaf_has_shadow_column(sel)) return false;
     return true;
 }
@@ -663,34 +605,17 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
         const char* msg =
             *verr.details.message ? verr.details.message : "unknown error";
         sql_print_error("stoolap: direct DML failed: %s", msg);
-        // Map to the right HA_ERR_* so UNIQUE / FK / lock errors
-        // surface with their real SQLSTATE class. For dup-key, also
-        // publish errkey via the out-param so the handler can hand
-        // a real key index to MariaDB's get_dup_key / ON DUPLICATE
-        // KEY routing.
-        //
-        // MariaDB's direct-DML path does not always invoke
-        // print_error after the engine returns, so a mapped FK or
-        // dup-key would otherwise rollback silently with no client
-        // diagnostic. Always surface the stoolap text via
-        // my_printf_error so the user sees a real reason. The
-        // structured HA_ERR_* still drives SQLSTATE classification
-        // and any handler-level retry logic.
+        // MariaDB's direct-DML path does not always call print_error
+        // after the engine returns, so a mapped FK / dup-key would
+        // otherwise rollback silently. Emit the concrete error number
+        // for the mapped classes; report_stoolap_error already raised
+        // 1296 for GENERIC/UNSUPPORTED, so skip those here.
         const int mapped = report_stoolap_error(verr);
         if (mapped == HA_ERR_FOUND_DUPP_KEY && errkey_out) {
             TABLE_LIST* tl = thd->lex->query_tables;
             TABLE_SHARE* share = (tl && tl->table) ? tl->table->s : nullptr;
             *errkey_out = errkey_from_view(verr, share);
         }
-        // MariaDB's direct-DML hooks don't always call print_error
-        // after the engine returns, so the user would otherwise see a
-        // silent rollback. Emit the concrete MariaDB error number for
-        // the mapped codes so a UNIQUE collision shows up as 1062
-        // (ER_DUP_ENTRY) and an FK violation as 1452
-        // (ER_NO_REFERENCED_ROW_2) -- matching what the row-pump path
-        // produces. report_stoolap_error already raises a 1296 for
-        // the HA_ERR_GENERIC / HA_ERR_UNSUPPORTED bucket, so skip
-        // those here to avoid double-publishing.
         switch (mapped) {
             case HA_ERR_FOUND_DUPP_KEY:
                 my_printf_error(ER_DUP_ENTRY, "stoolap: %s", MYF(0), msg);
@@ -711,8 +636,6 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
                 my_printf_error(ER_NO_SUCH_TABLE, "stoolap: %s", MYF(0), msg);
                 break;
             default:
-                // HA_ERR_GENERIC / HA_ERR_UNSUPPORTED already
-                // surfaced via report_stoolap_error.
                 break;
         }
         return mapped;
@@ -731,39 +654,17 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
 
 namespace {
 
-/**
- * Recursively check whether `item` references a non-binary string field
- * in a position where stoolap's byte-wise compare would diverge from
- * MariaDB's collation rules. Used by the ci-collation guard to bail
- * pushdown when the offending column appears in WHERE / HAVING / ORDER
- * BY / GROUP BY -- *not* when it's just projected back, where stoolap
- * is indistinguishable from MariaDB.
- *
- * Walks Item_field (terminal), Item_func / Item_sum (args[]), Item_cond
- * (argument_list), Item_ref (deref), and Item_subselect (recurse into
- * the inner unit's WHERE/HAVING/ORDER/GROUP). Anything else is a leaf.
- *
- * Without the subquery recursion, predicates like
- *   WHERE EXISTS (SELECT 1 FROM o WHERE o.status = 'completed')
- * would slip the guard and push to stoolap, which would then byte-match
- * 'completed' against rows that say 'COMPLETED' -- silently returning
- * fewer rows than MariaDB's ci compare expects.
- */
+// True if `item` references a ci-string field in a compare-sensitive
+// position. Recurses into Item_func/sum/cond/ref/subselect; subquery
+// recursion is required so EXISTS(...WHERE s='completed'...) doesn't
+// byte-match 'COMPLETED' under MariaDB's ci semantics.
 bool item_uses_ci_string(Item* item);
 bool order_list_uses_ci_string(SQL_I_List<ORDER>& lst);
 bool select_lex_pushdown_uses_ci(SELECT_LEX* sel, bool include_projection);
 
-/** Run `pred` against every ON-expression reachable from the FROM list
- *  of `sel` -- the explicit `on_expr`, the optimizer-staged
- *  `prep_on_expr`, AND the semi-join lifted `sj_on_expr`. Recurses
- *  into nested-joins (`tl->nested_join->join_list`) so a multi-level
- *  outer join chain is fully covered. Returns true on the first
- *  predicate hit.
- *
- *  Used by both the ci and DECIMAL guards: a JOIN ON predicate that
- *  compares ci-collated columns or a DECIMAL column would silently
- *  miscompare on stoolap (ON r.s = l.s on `_general_ci` VARCHAR
- *  byte-matches on stoolap; same for DECIMAL stored as TEXT). */
+// Walk every ON-expression (on_expr, prep_on_expr, sj_on_expr) reachable
+// from `sel`'s FROM list, recursing into nested joins. Used by both ci
+// and DECIMAL guards: a JOIN ON predicate over those types miscompares.
 bool any_on_expr_matches(List<TABLE_LIST>* join_list, ItemPred pred);
 
 bool any_on_expr_matches_chain(TABLE_LIST* head, ItemPred pred) {
@@ -795,27 +696,15 @@ bool any_on_expr_matches(List<TABLE_LIST>* join_list, ItemPred pred) {
     return false;
 }
 
-/** Unit-level ci check: returns true when a multi-leg SELECT_LEX_UNIT
- *  would compare ci-string projections byte-wise on stoolap.
- *
- *  Three surfaces matter:
- *    - UNION DISTINCT / INTERSECT / EXCEPT dedup compares projection bytes.
- *    - Tail-level ORDER BY / GROUP BY (on global_parameters()) compares
- *      projection bytes.
- *    - Per-leg WHERE/HAVING/etc. via select_lex_pushdown_uses_ci.
- *
- *  Used by both create_stoolap_unit_handler (when the unit is the whole
- *  query) AND by the derived-table recursion in select_lex_pushdown_uses_ci
- *  (when the unit is materialised as a derived inside a larger plan that
- *  then pushes as a whole-SELECT). */
+// True when a multi-leg unit would compare ci-string projections
+// byte-wise on stoolap: UNION DISTINCT / INTERSECT / EXCEPT dedup,
+// tail-level ORDER/GROUP, or any per-leg compare-sensitive clause.
 bool unit_pushdown_uses_ci(SELECT_LEX_UNIT* unit) {
     if (!unit) return false;
     SELECT_LEX* first = unit->first_select();
     if (!first) return false;
     const bool multi_leg = (first->next_select() != nullptr);
 
-    // Per-leg compare-sensitive clauses get the same recursive treatment
-    // as a stand-alone SELECT.
     for (SELECT_LEX* sel = first; sel; sel = sel->next_select()) {
         if (select_lex_pushdown_uses_ci(sel, /*include_projection=*/true))
             return true;
@@ -850,27 +739,10 @@ bool unit_pushdown_uses_ci(SELECT_LEX_UNIT* unit) {
     return false;
 }
 
-/** ci-string check for a SELECT considered as a whole-query pushdown target.
- *
- *  Same shape as the inline checks below, but recurses into derived
- *  TABLE_LIST entries -- their inner SELECTs run as part of the same
- *  pushed plan, so their compare-sensitive clauses must be ci-safe too.
- *  Without this recursion `SELECT COUNT(*) FROM (SELECT s FROM t WHERE
- *  s='x') d` would slip past: the outer SELECT has no ci surfaces and
- *  the derived's WHERE was never inspected, so stoolap byte-matched
- *  'x' against rows that say 'X'.
- *
- *  `include_projection` controls whether SELECT-list expressions are
- *  inspected. The outer pushdown context wants this on (a non-bare
- *  projection like `LOWER(s)` performs ci-sensitive work whose result
- *  flows out to the client). EXISTS subqueries set it to false: the
- *  EXISTS predicate is pure row-existence, so its SELECT list is
- *  semantically ignored and a projection like `EXISTS (SELECT
- *  LOWER(s) ...)` is byte-safe regardless of what's in the SELECT.
- *  The flag propagates through derived-TABLE_LIST recursion so a
- *  derived nested inside an EXISTS body is also free of projection
- *  inspection (its rows are materialized but never compared).
- */
+// ci-string check for whole-query pushdown. Recurses into derived
+// TABLE_LISTs so their inner WHERE/HAVING/etc. are inspected too.
+// `include_projection` is false for EXISTS bodies (their projection
+// is semantically ignored).
 bool select_lex_pushdown_uses_ci(SELECT_LEX* sel,
                                  bool include_projection = true) {
     if (!sel) return false;
@@ -879,25 +751,15 @@ bool select_lex_pushdown_uses_ci(SELECT_LEX* sel,
     if (sel->having && item_uses_ci_string(sel->having)) return true;
     if (order_list_uses_ci_string(sel->order_list)) return true;
     if (order_list_uses_ci_string(sel->group_list)) return true;
-    // JOIN ON predicates compare in the engine the same way WHERE
-    // does. Without this walk, `LEFT JOIN ... ON r.s = l.s` over ci
-    // VARCHAR pushed and stoolap byte-matched 'COMPLETED' vs
-    // 'completed' to NULL.
+    // JOIN ON compares like WHERE does in the engine.
     if (any_on_expr_matches_chain(sel->get_table_list(), item_uses_ci_string)) {
         return true;
     }
     if (include_projection) {
-        // Bare field refs are byte-safe in plain SELECT pushdown
-        // (`SELECT s FROM t` -- the bytes flow to the client unchanged).
-        // Same for an Item_ref that resolves to a bare field: that's
-        // how MariaDB models projections of derived-table columns
-        // (`SELECT y.name FROM (SELECT name FROM t) y`), and the
-        // bytes still flow through unchanged.
-        // EXCEPT when SELECT DISTINCT is in play: dedup compares the
-        // projected bytes positionally, same shape as UNION DISTINCT.
-        // With ci collation MariaDB folds 'COMPLETED' and 'completed'
-        // to one row, but stoolap byte-dedups to two. Treat bare ci
-        // refs as unsafe in that mode.
+        // Bare field refs and Item_ref-to-bare-field are byte-safe
+        // (bytes flow to the client unchanged). EXCEPT under SELECT
+        // DISTINCT, which dedups projected bytes positionally and
+        // would byte-split 'COMPLETED' from 'completed'.
         const bool distinct_dedups = (sel->options & SELECT_DISTINCT) != 0;
         auto strip_to_bare_field = [](Item* it) -> Item* {
             for (int hops = 0; it && hops < 8; ++hops) {
@@ -920,15 +782,11 @@ bool select_lex_pushdown_uses_ci(SELECT_LEX* sel,
             if (item_uses_ci_string(pi)) return true;
         }
     }
-    // Recurse into derived TABLE_LIST entries -- the derived's clauses
-    // run inside the pushed plan and need the same protection.
+    // Derived clauses run inside the pushed plan; same protection.
     for (TABLE_LIST* tl = sel->get_table_list(); tl; tl = tl->next_local) {
         if (!tl->derived) continue;
-        // For derived tables that ARE multi-leg units (UNION / INTERSECT
-        // / EXCEPT), the unit-level set-op semantics also apply within
-        // the pushed plan: dedup compares projection bytes, tail ORDER
-        // BY compares projection bytes. Use the unit-level check so
-        // those surfaces are caught here too.
+        // Multi-leg derived units inherit set-op semantics (dedup +
+        // tail ORDER compare projection bytes); use unit-level check.
         if (tl->derived->first_select() &&
             tl->derived->first_select()->next_select()) {
             if (unit_pushdown_uses_ci(tl->derived)) return true;
@@ -982,22 +840,8 @@ bool item_uses_ci_string(Item* item) {
             auto* ss = static_cast<Item_subselect*>(item);
             SELECT_LEX_UNIT* u = ss->unit;
             if (!u) return false;
-            // Walk every leg of the subquery's unit (handles UNION-shaped
-            // subqueries too). Use the recursive variant so derived
-            // TABLE_LIST entries nested inside the subquery -- e.g.
-            // `EXISTS (SELECT 1 FROM (SELECT s FROM t WHERE s='x') d)` --
-            // get their compare-sensitive clauses inspected too. Items
-            // that bridge to outer queries (correlated refs) are wrapped
-            // as Item_field at this point; they're already covered by
-            // FIELD_ITEM in the outer walk.
-            //
-            // EXISTS is a pure row-existence predicate -- its SELECT
-            // list is semantically ignored. Skip projection inspection
-            // entirely (both bare ci fields AND non-bare expressions
-            // like LOWER(s) are harmless when the projection is never
-            // compared). IN / scalar / ALL / ANY all consume the
-            // projected value, so they still need full inspection
-            // including bare fields.
+            // EXISTS ignores its projection; IN/scalar/ALL/ANY consume it
+            // and need full inspection including bare ci fields.
             const bool exists_only =
                 ss->substype() == Item_subselect::EXISTS_SUBS;
             for (SELECT_LEX* sel = u->first_select(); sel;
@@ -1006,14 +850,9 @@ bool item_uses_ci_string(Item* item) {
                         sel, /*include_projection=*/!exists_only))
                     return true;
                 if (exists_only) continue;
-                // Stricter than the outer-pushdown projection rule: a
-                // scalar/IN subquery `(SELECT col)` whose result row is
-                // consumed by an outer compare needs to bail even on a
-                // bare ci field, because that outer compare runs
-                // bytewise on stoolap. select_lex_pushdown_uses_ci
-                // intentionally lets bare FIELD_ITEM through for the
-                // outer SELECT pushdown case (pure projection without
-                // an outer compare); re-walk here to catch it.
+                // Stricter than outer projection: an outer bytewise
+                // compare on the consumed result needs us to bail even
+                // on bare ci fields here.
                 List_iterator<Item> it(sel->item_list);
                 Item* proj;
                 while ((proj = it++)) {
@@ -1030,17 +869,10 @@ bool item_uses_ci_string(Item* item) {
     }
 }
 
-// True when `item` references a DECIMAL column anywhere -- directly,
-// inside a function, inside a subquery's compare surface, or via a
-// nested derived table. DECIMAL columns are stored as Stoolap TEXT, so
-// any pushed predicate that compares a DECIMAL column against a
-// numeric literal silently misses (text 'v=1.50' vs numeric 1.50
-// returns no match in stoolap). Pure projection of a bare DECIMAL
-// field IS safe (the text round-trips through Field::store), so this
-// walker mirrors the ci-string one and skips bare FIELD_ITEM in the
-// projection-only case via the `select_lex_uses_decimal_field`
-// recursion below. This guard is NOT gated by stoolap_trust_binary_strings:
-// DECIMAL is a type-mismatch issue, orthogonal to collation.
+// True if `item` references a DECIMAL column. Stoolap stores DECIMAL
+// as TEXT, so a pushed predicate against a numeric literal silently
+// misses ('1.50' vs 1.50). Bare projection is safe; not gated by
+// trust_binary_strings (type mismatch, not collation).
 bool item_uses_decimal_field(Item* item);
 bool select_lex_uses_decimal_field(SELECT_LEX* sel, bool include_projection);
 
@@ -1161,11 +993,8 @@ bool unit_uses_decimal_field(SELECT_LEX_UNIT* unit) {
     return false;
 }
 
-// True when `item` contains an Item_param (a `?` placeholder) anywhere
-// in its tree. dynamic_cast catches the bound case: at EXECUTE time
-// Item_param::type() returns CONST_ITEM (or NULL_ITEM if bound to
-// NULL), not PARAM_ITEM, so a tag-based check would miss it.
-// dynamic_cast hits the actual subclass regardless of declared type.
+// dynamic_cast required: at EXECUTE time Item_param::type() returns
+// CONST_ITEM (or NULL_ITEM), not PARAM_ITEM, so the tag check misses.
 bool item_contains_param(Item* item) {
     if (!item) return false;
     if (dynamic_cast<Item_param*>(item)) return true;
@@ -1215,8 +1044,7 @@ bool item_contains_param(Item* item) {
     }
 }
 
-// Counter walker: returns the number of Item_param nodes reachable
-// from `item`. Mirrors item_contains_param's recursion.
+// Counts Item_param nodes; mirrors item_contains_param's recursion.
 size_t item_count_params(Item* item) {
     if (!item) return 0;
     if (dynamic_cast<Item_param*>(item)) return 1;
@@ -1266,9 +1094,8 @@ size_t item_count_params(Item* item) {
     }
 }
 
-// Count Item_params reachable from WHERE / HAVING surfaces (stoolap
-// binds those correctly). Recurses into derived tables and inner
-// units so subquery predicates get counted at every depth.
+// Count `?` in WHERE/HAVING (stoolap binds these). Recurses into
+// derived tables and inner units.
 size_t select_count_predicate_params(SELECT_LEX* sel) {
     if (!sel) return 0;
     size_t total = 0;
@@ -1290,20 +1117,14 @@ size_t select_count_predicate_params(SELECT_LEX* sel) {
     return total;
 }
 
-// Returns true when this SELECT (or any nested derived / subquery)
-// has a `?` placeholder in a projection / ORDER BY / GROUP BY surface
-// where stoolap silently returns NULL instead of the bound value.
-// Predicates (WHERE / HAVING) are NOT checked: stoolap binds those
-// correctly and our pushdown depends on it.
+// True if this SELECT (or any nested derived/subquery) has `?` in a
+// projection / ORDER BY / GROUP BY surface (stoolap returns NULL there
+// instead of the bound value). WHERE/HAVING are NOT checked: stoolap
+// binds those, and we depend on it.
 //
-// This is the per-SELECT walker, safe to call per-leg of a unit.
-// The statement-wide count backstop (compare `param_list.elements`
-// against placeholders found in predicates across the whole
-// statement) is intentionally NOT applied here -- a per-leg call
-// would see the statement total but only its own leg's predicate
-// count, falsely bailing on a prepared UNION whose params split
-// across legs. The factory wrappers below apply the backstop at
-// the top scope (single-SELECT factory or unit factory) instead.
+// Per-leg only. The statement-wide count backstop is applied by the
+// factory wrappers at the top scope; doing it per-leg would falsely
+// bail on a prepared UNION whose params split across legs.
 bool select_param_in_unsafe_surface(SELECT_LEX* sel) {
     if (!sel) return false;
     {
@@ -1319,8 +1140,8 @@ bool select_param_in_unsafe_surface(SELECT_LEX* sel) {
     for (ORDER* o = sel->group_list.first; o; o = o->next) {
         if (o->item && *o->item && item_contains_param(*o->item)) return true;
     }
-    // Recurse into derived TABLE_LISTs (their projections become
-    // values in the outer plan).
+    // Derived projections become values in the outer plan; subqueries
+    // live in inner units.
     for (TABLE_LIST* tl = sel->get_table_list(); tl; tl = tl->next_local) {
         if (!tl->derived) continue;
         for (SELECT_LEX* inner = tl->derived->first_select(); inner;
@@ -1328,7 +1149,6 @@ bool select_param_in_unsafe_surface(SELECT_LEX* sel) {
             if (select_param_in_unsafe_surface(inner)) return true;
         }
     }
-    // Subqueries (Item_subselect) live in inner units.
     for (SELECT_LEX_UNIT* u = sel->first_inner_unit(); u; u = u->next_unit()) {
         for (SELECT_LEX* sub = u->first_select(); sub;
              sub = sub->next_select()) {
@@ -1338,17 +1158,9 @@ bool select_param_in_unsafe_surface(SELECT_LEX* sel) {
     return false;
 }
 
-// Statement-scope backstop: bail when the predicate placeholders we
-// can account for don't sum to `thd->lex->param_list.elements`. The
-// shortfall means a placeholder lives in an Item subclass our
-// per-SELECT walker doesn't reach -- conservatively reject pushdown
-// rather than hand a NULL projection back to the user.
-//
-// `predicate_param_count` is the running tally across whatever
-// SELECTs the caller already walked (single SELECT, or every leg of
-// a unit plus global_parameters). It must NOT be re-computed per
-// leg; that's the whole reason this lives outside
-// `select_param_in_unsafe_surface`.
+// Backstop: bail when accounted predicate `?` count < lex param_list
+// total. The gap means a placeholder lives in an Item subclass our
+// walker doesn't reach.
 bool statement_param_backstop_unsafe(THD* thd, size_t predicate_param_count) {
     if (!thd || !thd->lex) return false;
     return thd->lex->param_list.elements > predicate_param_count;
@@ -1360,9 +1172,7 @@ bool unit_param_in_unsafe_surface(SELECT_LEX_UNIT* unit) {
          sel = sel->next_select()) {
         if (select_param_in_unsafe_surface(sel)) return true;
     }
-    // global_parameters() carries the unit-level ORDER BY / GROUP BY /
-    // LIMIT (e.g. `... UNION ... ORDER BY ?`); a placeholder there is
-    // also non-predicate and bails.
+    // global_parameters() carries unit-level ORDER/GROUP/LIMIT.
     SELECT_LEX* gp = unit->global_parameters();
     if (gp) {
         for (ORDER* o = gp->order_list.first; o; o = o->next) {
@@ -1377,9 +1187,7 @@ bool unit_param_in_unsafe_surface(SELECT_LEX_UNIT* unit) {
     return false;
 }
 
-// Tally predicate-only placeholders across every SELECT in a unit
-// (legs + global_parameters). Used by the unit factory to pair with
-// `statement_param_backstop_unsafe`.
+// Predicate `?` total across every leg; pairs with the backstop.
 size_t unit_count_predicate_params(SELECT_LEX_UNIT* unit) {
     if (!unit) return 0;
     size_t total = 0;
@@ -1397,8 +1205,7 @@ bool order_list_uses_ci_string(SQL_I_List<ORDER>& lst) {
     return false;
 }
 
-/** Build a stoolap-flavoured SQL string for the current SELECT. Reuses the
- *  same identifier rewriter as the direct-DML path so naming stays in sync. */
+// Reuses the direct-DML identifier rewriter.
 bool build_pushdown_select_sql(THD* thd, SELECT_LEX* sel_lex,
                                std::string& out_sql) {
     if (!thd || !sel_lex) return false;
@@ -1413,18 +1220,9 @@ bool build_pushdown_select_sql(THD* thd, SELECT_LEX* sel_lex,
     return !out_sql.empty();
 }
 
-/**
- * Collect bound parameter values from LEX::param_list into a StoolapValue
- * array. Returns false if any param has an unsupported type so the caller
- * can bail to the row pump.
- *
- * `storage` keeps owning copies of any string values so the StoolapValue
- * text pointers stay valid for the duration of the stoolap call.
- *
- * In PREPARE phase params are NO_VALUE; we don't get here in that case
- * (factory bails earlier on is_stmt_prepare()). In EXECUTE phase each
- * Item_param has a bound value reachable via val_int/val_real/val_str.
- */
+// `storage` owns string copies so StoolapValue.text.ptr stays valid
+// for the duration of the stoolap call. PREPARE phase is filtered out
+// upstream (factory bails on is_stmt_prepare).
 bool collect_bound_params(THD* thd, std::vector<StoolapValue>& out,
                           std::vector<std::string>& storage) {
     if (!thd || !thd->lex) return true;
@@ -1448,14 +1246,8 @@ bool collect_bound_params(THD* thd, std::vector<StoolapValue>& out,
                 v.v.float64 = p->val_real();
                 break;
             case DECIMAL_RESULT: {
-                // Bind DECIMAL as exact TEXT, never as FLOAT. val_real()
-                // would round through double, losing low-order digits
-                // for integer values above 2^53 (DECIMAL params often
-                // come from JDBC / numeric ranges that exceed double's
-                // 53-bit mantissa) and dropping scale on real DECIMALs.
-                // Stoolap accepts a TEXT param against a numeric column
-                // via implicit conversion at full precision -- verified
-                // for INT64 values above 2^53.
+                // Bind DECIMAL as TEXT, never FLOAT: val_real() rounds
+                // through double, losing low-order digits above 2^53.
                 String tmp;
                 String* s = p->val_str(&tmp);
                 if (!s || p->null_value) {
@@ -1493,53 +1285,28 @@ bool collect_bound_params(THD* thd, std::vector<StoolapValue>& out,
     return true;
 }
 
-/** SELECT pushdown eligibility. Returning false here makes the factory
- *  return NULL so MariaDB falls back to the row-pump path; that's the
- *  correct behaviour for any case stoolap can't reproduce semantically. */
+// false -> factory returns NULL -> MariaDB falls back to row pump.
 bool can_pushdown_select(THD* thd, SELECT_LEX* sel_lex,
                          SELECT_LEX_UNIT* sel_unit) {
     if (!thd || !sel_lex) return false;
-
-    // Phase 1: single-SELECT only. Unit pushdown (UNION/EXCEPT/INTERSECT)
-    // and partial pushdown (sel_lex inside a unit) are deferred -- we'd
-    // need to emit the right unit-shape SQL and stoolap accepts the
-    // surface form, but the column-binding rules differ enough to warrant
-    // dedicated tests before turning it on.
+    // Single-SELECT only. Unit / partial pushdown handled elsewhere.
     if (sel_unit) return false;
-
-    // PREPARE phase: we don't have the bound parameters yet, so we'd
-    // serialize "?" placeholders and stoolap would reject them. EXECUTE
-    // phase, by contrast, lands here with bound params reachable through
-    // LEX::param_list -- collect_bound_params() picks them up later and
-    // routes the call through stoolap_query_params().
+    // PREPARE: still has `?` placeholders; stoolap would reject. EXECUTE
+    // lands here with bound params via LEX::param_list.
     if (thd->stmt_arena && thd->stmt_arena->is_stmt_prepare()) return false;
-
-    // Stored-procedure context: thd->query() inside SP execution carries
-    // the literal SP body text, so SP locals appear by name (`i`, not
-    // `5`); stoolap would reject the resulting SQL. Substituting them
-    // requires an Item-walker that's not feasible from the plugin (no
-    // hookable Item processor). Defer -- SP loops fall to the row pump.
+    // SP body text uses local names, not bound values; needs an Item-
+    // walker we can't hook from the plugin. Triggers/sub_stmt: row pump
+    // preserves MariaDB semantics for side-effects.
     if (thd->spcont) return false;
-
-    // Triggers / sub-statements: side-effect-sensitive; let the row pump
-    // handle them so MariaDB's semantics are preserved.
     if (thd->in_sub_stmt) return false;
-
     if (thd->lex->sql_command != SQLCOM_SELECT) return false;
-    // lex->result is set for ANY SELECT execution path -- in particular,
-    // it's a select_send (or its binary-protocol cousin) for normal
-    // prepared-statement EXECUTE, which we DO want to push. Bail only
-    // for INTO @var / INTO OUTFILE / INTO DUMPFILE, which subclass
-    // select_result_interceptor.
+    // SELECT INTO @var/OUTFILE/DUMPFILE subclass select_result_interceptor;
+    // plain select_send (incl. binary protocol) is non-interceptor.
     if (thd->lex->result && thd->lex->result->result_interceptor() != nullptr)
         return false;
-
     if (sel_lex->uncacheable & UNCACHEABLE_SIDEEFFECT) return false;
     if (sel_lex->uncacheable & UNCACHEABLE_RAND) return false;
-
-    // FOR UPDATE / LOCK IN SHARE MODE: stoolap has its own MVCC semantics,
-    // but the mapping from MariaDB's lock surface to stoolap's snapshot
-    // model is non-trivial. Keep these on the row pump for now.
+    // FOR UPDATE / LOCK IN SHARE MODE: lock-mode mapping non-trivial.
     if (sel_lex->select_lock != SELECT_LEX::select_lock_type::NONE)
         return false;
 
@@ -1557,16 +1324,9 @@ bool can_pushdown_select(THD* thd, SELECT_LEX* sel_lex,
     // and need the same gate.
     if (stoolap_pushdown::any_leaf_has_shadow_column(sel_lex)) return false;
 
-    // Bare COUNT(*) over a single base table with no filters: keep this off
-    // Stoolap pushdown for now. Stoolap's bare COUNT(*) can use table-count
-    // metadata that is not MVCC-safe around in-flight / rolled-back
-    // transactions. Bailing here makes MariaDB use the row-pump aggregate,
-    // which counts visible rows rather than metadata.
-    //
-    // Restricted to single base-table FROM. For
-    // `SELECT COUNT(*) FROM (SELECT ... GROUP BY ...) z` the FROM has
-    // one entry but it's a derived; records() doesn't know what to
-    // count there -- pushing the whole query is the only way to win.
+    // Bare COUNT(*) over a single base table: punt to row-pump aggregate.
+    // Stoolap's bare COUNT can use non-MVCC-safe table-count metadata.
+    // Derived FROMs still push (no records() shortcut applies).
     if (sel_lex->table_list.elements == 1 && sel_lex->item_list.elements == 1 &&
         sel_lex->where == nullptr && sel_lex->having == nullptr &&
         sel_lex->group_list.elements == 0 &&
@@ -1581,55 +1341,27 @@ bool can_pushdown_select(THD* thd, SELECT_LEX* sel_lex,
                 if (sum->sum_func() == Item_sum::COUNT_FUNC &&
                     sum->get_arg_count() == 1) {
                     Item* a = sum->get_arg(0);
-                    // COUNT(*) parses as COUNT(0) -- the arg is an integer
-                    // literal. COUNT(col) gives an Item_field. Bail only
-                    // on the literal-arg shape so COUNT(col), which
-                    // excludes NULLs and needs a real query, keeps pushing.
+                    // COUNT(*) parses as COUNT(literal); COUNT(col) is
+                    // Item_field. Bail only on the literal-arg shape so
+                    // COUNT(col), which excludes NULLs, keeps pushing.
                     if (a && a->const_item()) return false;
                 }
             }
         }
     }
 
-    // Stoolap compares strings byte-wise. MariaDB's default VARCHAR
-    // collation is utf8mb3_general_ci, which case-folds. If a non-binary
-    // string column appears in WHERE/HAVING/ORDER BY/GROUP BY the pushed
-    // query would return different rows or order than the row-pump path
-    // (e.g. `s = 'banana'` skipping 'BANANA'). Bail in those clauses --
-    // unless the user has explicitly opted into byte-wise semantics via
-    // SET stoolap_trust_binary_strings = 1.
-    //
-    // Pure projection of a ci-string column -- `SELECT s FROM ...` with
-    // no collation-dependent comparison -- is fine: stoolap returns the
-    // bytes, MariaDB writes them to the result row, no collation work
-    // happens either side. But projection items that *aren't* bare
-    // field refs (scalar subqueries, functions like LOWER/UPPER) DO
-    // perform compare-like work whose ci semantics matter; check those.
+    // ci guard: bail when ci columns appear in WHERE/HAVING/ORDER/GROUP
+    // or in non-bare projections (LOWER(s), scalar subqueries, ...).
+    // trust_binary_strings opts out.
     if (!stoolap_thd_trust_binary_strings(thd)) {
-        // One walker that covers WHERE/HAVING/ORDER/GROUP, non-bare-field
-        // projection items (catches `SELECT (SELECT MAX(s)...)` shapes),
-        // and crucially recurses into derived TABLE_LIST units so that
-        // `SELECT COUNT(*) FROM (SELECT s FROM t WHERE s='x') d` doesn't
-        // bypass the guard via the derived's WHERE.
         if (select_lex_pushdown_uses_ci(sel_lex)) return false;
     }
-    // DECIMAL bail is unconditional (not gated by trust_binary_strings).
-    // Stoolap stores DECIMAL columns as TEXT; pushed numeric predicates
-    // against them silently miss because stoolap compares text vs
-    // numeric and returns no rows.
+    // DECIMAL is unconditional (type mismatch, not collation): stored as
+    // TEXT, pushed numeric predicates miss.
     if (select_lex_uses_decimal_field(sel_lex)) return false;
-    // Stoolap currently binds prepared params only in predicate
-    // surfaces (WHERE / HAVING). Placeholders in the projection,
-    // ORDER BY, or GROUP BY come back as NULL instead of the bound
-    // value. Bail when the SELECT has any param outside predicates
-    // -- but only when the statement actually has bound params
-    // (avoids penalising plain SELECTs that share the gating path).
-    // Per-SELECT walker: detects placeholders in projection / ORDER /
-    // GROUP / derived / inner-unit. Statement-wide count backstop runs
-    // at the factory level (after this returns), not here -- a per-leg
-    // call from the unit factory would otherwise compare a single
-    // leg's predicate count against the statement total and falsely
-    // bail on prepared UNIONs whose params split across legs.
+    // Stoolap binds `?` only in WHERE/HAVING; placeholders elsewhere
+    // come back as NULL. Statement-wide count backstop runs at factory
+    // level, not here, to handle prepared UNIONs.
     if (thd->lex && thd->lex->param_list.elements > 0 &&
         select_param_in_unsafe_surface(sel_lex)) {
         return false;
@@ -1874,25 +1606,12 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
         return nullptr;  // unsupported param type -> row-pump fallback
     }
 
-    // Eagerly run the query so we can fall back to the row pump on any
-    // stoolap-side error (unknown function, type mismatch, plan failure).
-    // Once we return non-NULL, MariaDB has committed to this handler --
-    // a later failure inside init_scan/next_row would surface as a query
-    // error to the user instead of a clean fallback. stoolap_prepare()
-    // only catches syntax errors; semantic errors like "Function not
-    // found: MICROSECOND" surface only at execute time, which is why the
-    // validation has to be a real query, not just a prepare.
-    //
-    // Why not stoolap_prepare + stoolap_stmt_query with a per-THD stmt
-    // cache (which would skip stoolap's normalize/hash/RwLock cache
-    // lookup on every call)? Tested twice with single-slot caching:
-    // (a) LEFT JOIN+GROUP BY: 776us baseline -> 789us cached. (b) 5K
-    // SELECT-by-id prepared: 30.40us baseline -> 29.87us cached. Both
-    // within run-to-run noise. Stoolap's existing semantic cache
-    // already keeps the parsed plan warm for repeated SQL strings, so
-    // an additional plugin-side stmt cache is redundant. If a future
-    // stoolap release changes that property, revisit. Until then the
-    // direct query path is the simplest correct option.
+    // Eagerly run so we can fall back to row-pump on any stoolap-side
+    // error (unknown function, type mismatch, ...). Once we return
+    // non-NULL, MariaDB has committed and a later init_scan/next_row
+    // failure surfaces to the user instead of a clean fallback.
+    // stoolap_prepare catches only syntax; semantic errors like
+    // "Function not found: MICROSECOND" surface at execute time only.
     StoolapRows* raw = nullptr;
     int rc;
     const uint64_t t_eager_start = trace ? now_ns() : 0;
@@ -1912,9 +1631,7 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
             eager_ns, std::memory_order_relaxed);
     }
     if (rc != STOOLAP_OK) {
-        // Don't surface the error here -- the caller falls back to the
-        // row pump which may complete the query successfully (server-side
-        // function applied after our handler streams base rows).
+        // No error surfacing: row-pump fallback may still complete.
         stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
             1, std::memory_order_relaxed);
         return nullptr;
@@ -1946,18 +1663,11 @@ select_handler* create_stoolap_unit_handler(THD* thd, SELECT_LEX_UNIT* unit) {
     SELECT_LEX* first = unit->first_select();
     if (!first) return nullptr;
 
-    // No second SELECT means this isn't really a unit -- the SELECT
-    // factory handles that case. Avoid claiming the work twice.
+    // Single-leg "unit" is handled by the SELECT factory; avoid claiming twice.
     if (!first->next_select()) return nullptr;
 
-    // Per-leg eligibility: each SELECT in the union chain must be
-    // pushable on its own (every leaf is stoolap, no FOR UPDATE, no
-    // ci-string in WHERE/HAVING/ORDER/GROUP). One ineligible leg sinks
-    // the whole unit. The bare-COUNT(*) carve-out fires per leg too,
-    // so a UNION of literal-COUNT-only SELECTs falls back; rare in
-    // practice, and MariaDB's records() shortcut doesn't combine
-    // through UNION anyway, so the pushed path wouldn't strictly win
-    // on those.
+    // Each leg must push on its own. The bare-COUNT carve-out fires
+    // per leg too -- rare in practice for UNIONs.
     for (SELECT_LEX* sel = first; sel; sel = sel->next_select()) {
         if (!can_pushdown_select(thd, sel, /*sel_unit=*/nullptr)) {
             stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
@@ -1966,14 +1676,9 @@ select_handler* create_stoolap_unit_handler(THD* thd, SELECT_LEX_UNIT* unit) {
         }
     }
 
-    // Set-op-level ci guard. The per-leg pushdown check intentionally
-    // lets bare ci-string projections through (byte-safe in a single
-    // SELECT pushdown). At the UNIT level, UNION DISTINCT / INTERSECT /
-    // EXCEPT dedup compares projection bytes, and a tail-level ORDER BY
-    // or GROUP BY does the same. Stoolap's compare is byte-wise so a ci
-    // VARCHAR projected from any leg diverges: 'COMPLETED' and
-    // 'completed' dedup to one row in MariaDB but stay separate in
-    // stoolap.
+    // Set-op-level ci guard: per-leg lets bare ci projections through
+    // (byte-safe in single SELECT) but UNION DISTINCT / INTERSECT /
+    // EXCEPT dedup compares projection bytes; a ci VARCHAR diverges.
     if (!stoolap_thd_trust_binary_strings(thd) && unit_pushdown_uses_ci(unit)) {
         stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
             1, std::memory_order_relaxed);
@@ -1985,13 +1690,8 @@ select_handler* create_stoolap_unit_handler(THD* thd, SELECT_LEX_UNIT* unit) {
             1, std::memory_order_relaxed);
         return nullptr;
     }
-    // Same prepared-param surface check as the SELECT factory: bail
-    // when any leg has a placeholder in projection / ORDER / GROUP,
-    // OR when the unit-level statement-scope count backstop trips.
-    // The backstop pairs the *unit-wide* predicate-param tally
-    // (across all legs + global_parameters) against the statement
-    // total; per-leg comparison would falsely bail on prepared UNIONs
-    // whose placeholders split across legs.
+    // Unit-wide param backstop (per-leg comparison would mis-bail on
+    // UNIONs whose placeholders split across legs).
     if (thd->lex && thd->lex->param_list.elements > 0) {
         if (unit_param_in_unsafe_surface(unit)) {
             stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
@@ -2006,10 +1706,8 @@ select_handler* create_stoolap_unit_handler(THD* thd, SELECT_LEX_UNIT* unit) {
         }
     }
 
-    // Build SQL via SELECT_LEX_UNIT::print() -- canonical UNION form
-    // with all legs and any tail clauses (ORDER BY / LIMIT after the
-    // final UNION). The same QT_PARSABLE flag that worked for the
-    // derived path applies here.
+    // SELECT_LEX_UNIT::print() emits canonical UNION form with all legs
+    // + tail clauses; QT_PARSABLE keeps it round-trippable.
     String tmp;
     unit->print(
         &tmp, static_cast<enum_query_type>(QT_PARSABLE | QT_TO_SYSTEM_CHARSET));
@@ -2019,8 +1717,7 @@ select_handler* create_stoolap_unit_handler(THD* thd, SELECT_LEX_UNIT* unit) {
         return nullptr;
     }
 
-    // Collect leaves from EVERY leg so the rewriter can normalise table
-    // identifiers across the whole union.
+    // Leaves from every leg -- rewriter normalises across the union.
     std::vector<LeafName> leaves;
     for (SELECT_LEX* sel = first; sel; sel = sel->next_select()) {
         collect_leaf_names(sel, leaves);
@@ -2048,9 +1745,8 @@ select_handler* create_stoolap_unit_handler(THD* thd, SELECT_LEX_UNIT* unit) {
     StoolapDB* db = ctx->db();
     if (!db) return nullptr;
 
-    // See create_stoolap_select_handler for why this defensive call is
-    // needed: ensures the stoolap tx is open if the THD is inside an
-    // explicit BEGIN, even when create_unit fires before external_lock.
+    // create_unit can fire before external_lock; open the tx now so a
+    // pushed UNION inside START TRANSACTION sees the session's snapshot.
     if (register_trx(thd) != 0) {
         stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
             1, std::memory_order_relaxed);
@@ -2158,13 +1854,9 @@ private:
     PushdownPacked packed_;
 };
 
-/**
- * Build SQL for a single SELECT_LEX. Unlike the whole-query case where we
- * use thd->query() (the user's original text), the derived path needs
- * just the inner SELECT in isolation, so we let MariaDB's parser print()
- * it canonically. QT_PARSABLE keeps the output round-trippable through
- * any SQL parser that follows the spec, including stoolap's.
- */
+// SELECT_LEX::print(QT_PARSABLE) emits the inner SELECT in spec-canonical
+// form so stoolap's parser accepts it; thd->query() would carry the outer
+// statement text, not what we need to push.
 bool build_derived_sql(THD* thd, SELECT_LEX* sel_lex, std::string& out_sql) {
     if (!thd || !sel_lex) return false;
     String tmp;
@@ -2213,19 +1905,12 @@ derived_handler* create_stoolap_derived_handler(THD* thd, TABLE_LIST* derived) {
         return nullptr;
     }
 
-    // Decline prepared derived pushdown until per-SELECT parameter
-    // mapping exists. The factory builds SQL from only the inner
-    // SELECT, but `LEX::param_list` is statement-wide. If the OUTER
-    // statement has placeholders that appear in the SQL text BEFORE
-    // the derived's placeholders, stoolap (which numbers `?` from 1
-    // when reparsing the isolated inner SQL) would silently bind the
-    // wrong THD-side values to the derived's placeholders. Today
-    // MariaDB's `print(QT_PARSABLE)` happens to substitute bound
-    // literals so the bug doesn't bite empirically, but that's an
-    // implementation detail. Bail here so future MariaDB releases or
-    // not-yet-substituted Item_param shapes can't introduce silent
-    // result-row corruption. Whole-SELECT and unit pushdown stay safe
-    // because their factories build SQL from the entire statement.
+    // Refuse prepared statements: LEX::param_list is statement-wide, but
+    // we build SQL from only the inner SELECT. Stoolap re-numbers `?`
+    // from 1 when reparsing isolated inner SQL, so outer placeholders
+    // ahead of ours would silently mis-bind the derived's params.
+    // print(QT_PARSABLE) currently substitutes bound literals; we don't
+    // rely on that.
     if (thd->lex && thd->lex->param_list.elements > 0) {
         stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
             1, std::memory_order_relaxed);
@@ -2241,9 +1926,7 @@ derived_handler* create_stoolap_derived_handler(THD* thd, TABLE_LIST* derived) {
     StoolapDB* db = ctx->db();
     if (!db) return nullptr;
 
-    // See create_stoolap_select_handler for the same reasoning: open the
-    // stoolap tx if we're inside an explicit BEGIN before the eager
-    // query, since create_derived can run before external_lock.
+    // create_derived can run before external_lock; open the tx now.
     if (register_trx(thd) != 0) {
         stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
             1, std::memory_order_relaxed);
@@ -2294,9 +1977,6 @@ derived_handler* create_stoolap_derived_handler(THD* thd, TABLE_LIST* derived) {
 }
 
 bool item_safe_for_byte_comparison(Item* item) {
-    // Reuse the same walker the SELECT eligibility check uses for
-    // ci-collation guarding. An Item is "safe" iff it doesn't reference
-    // a non-binary string column.
     return !item_uses_ci_string(item);
 }
 

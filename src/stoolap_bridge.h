@@ -49,12 +49,9 @@ using TxPtr = std::unique_ptr<StoolapTx, TxDeleter>;
 using RowsPtr = std::unique_ptr<StoolapRows, RowsDeleter>;
 using StmtPtr = std::unique_ptr<StoolapStmt, StmtDeleter>;
 
-/**
- * Owns the packed buffer returned by stoolap_rows_fetch_all(). Frees via
- * stoolap_buffer_free in the destructor. Lets the buffered scan path
- * skip the std::vector::assign copy that doubled memory bandwidth on
- * the very path meant to reduce FFI overhead.
- */
+// Owns the packed buffer from stoolap_rows_fetch_all(); destructor calls
+// stoolap_buffer_free. Avoids the std::vector::assign memcpy on the very
+// path designed to cut FFI overhead.
 class StoolapBuffer {
 public:
     StoolapBuffer() = default;
@@ -78,7 +75,6 @@ public:
     StoolapBuffer(const StoolapBuffer&) = delete;
     StoolapBuffer& operator=(const StoolapBuffer&) = delete;
 
-    /// Take ownership of a buffer returned by stoolap_rows_fetch_all().
     void take(uint8_t* buf, int64_t len) {
         reset();
         buf_ = buf;
@@ -103,82 +99,39 @@ private:
     int64_t len_ = 0;
 };
 
-/**
- * Process-wide database handle. Each MariaDB handler instance clones from this
- * via stoolap_clone() to get a thread-local handle.
- */
+// Process-wide handle; each handler clones via stoolap_clone for thread safety.
 class Engine {
 public:
-    /** Open the underlying stoolap database. dsn must be a valid stoolap DSN. */
     int open(std::string_view dsn);
-
-    /** Close the database. Idempotent. */
     void close() noexcept;
-
-    /** Clone a per-thread handle. Caller owns the returned DbPtr. */
     DbPtr clone_handle() const;
-
     StoolapDB* raw() const noexcept { return db_.get(); }
-
-    /** Last error message captured from a stoolap call. */
     const std::string& last_error() const noexcept { return last_error_; }
-
     void set_error(std::string msg) { last_error_ = std::move(msg); }
 
-    /** Per-process cache of tables we've already reconciled (i.e. issued
-     *  the CREATE TABLE IF NOT EXISTS for). ha_stoolap::open() runs every
-     *  time MariaDB opens a handler instance -- in tight benchmark loops
-     *  that's once per statement -- so caching avoids repeated SQL
-     *  construction + parsing on the stoolap side for tables we've
-     *  already verified exist.
-     *
-     *  Invalidated by drop_reconciled / clear_reconciled on DROP / TRUNCATE
-     *  / RENAME so a subsequent open re-runs the create.
-     */
+    // CREATE TABLE IF NOT EXISTS short-circuit cache. Per-handler open()
+    // fires per-statement in tight loops; caching avoids repeated SQL
+    // construction + parsing for tables we've already verified.
+    // Invalidated by DROP/TRUNCATE/RENAME.
     bool is_reconciled(const std::string& name);
     void mark_reconciled(const std::string& name);
     void drop_reconciled(const std::string& name);
     void clear_reconciled();
 
-    /** Approximate row count cache shared across handler instances on
-     *  the same stoolap table. The per-handler cache (`ha_stoolap::
-     *  cached_records_`) dies when MariaDB closes the handler -- which
-     *  in tight loops happens once per statement, defeating the cache.
-     *  This process-wide layer survives that.
-     *
-     *  records_lookup() returns true and fills `out` on hit. Exact DDL paths
-     *  may seed records_set(); ordinary live COUNT(*) results stay
-     *  handler-local or transaction-local so snapshot-visible counts do not
-     *  leak to other sessions. Mutations from any connection invalidate via
-     *  records_invalidate(); DDL (DROP, RENAME) calls records_drop().
-     *
-     *  This is approximate: cross-connection writes that bypass the
-     *  plugin (direct stoolap_exec) leave the cache stale, and we
-     *  don't try to atomically delta the count -- mutating handlers
-     *  invalidate the entry and the next reader re-counts. Stats must
-     *  be approximate per HA_STATS_RECORDS_IS_EXACT not being set, so
-     *  the consequences of staleness are limited to optimizer planning. */
+    // Approximate cross-handler row count cache; the per-handler cache
+    // dies on close() (per-statement in tight loops). HA_STATS_RECORDS_IS_EXACT
+    // is unset so staleness only affects optimizer planning. Mutating
+    // handlers invalidate; the next reader re-counts.
     bool records_lookup(const std::string& name, uint64_t* out);
     void records_set(const std::string& name, uint64_t count);
     void records_invalidate(const std::string& name);
     void records_drop(const std::string& name);
 
-    /**
-     * Process-wide AUTO_INCREMENT reservation cache. Per-connection
-     * counters are not safe: two sessions can both cache "next=2" and
-     * collide, or one session can miss another's explicit INSERT(id=100).
-     * These helpers reserve ids under a single mutex while still avoiding
-     * SELECT MAX(col) per row once a table has been seeded.
-     *
-     * `step` and `offset_mod` model MariaDB's session
-     * `auto_increment_increment` / `auto_increment_offset`. Multi-writer
-     * replication relies on the engine returning ids that satisfy
-     * `id % step == offset_mod` and on the engine's internal cursor
-     * advancing past *every* id in MariaDB's logical sequence (not just
-     * the count contiguous ids the engine literally hands back). With
-     * step=1 the behaviour is the historical "reserve count contiguous
-     * ids" path, so existing call sites remain correct.
-     */
+    // Process-wide AUTO_INCREMENT reservation. Per-connection counters
+    // collide under concurrency / explicit INSERTs.
+    // step/offset_mod model MariaDB's auto_increment_increment/offset
+    // for multi-writer replication: the cursor must advance past EVERY
+    // id MariaDB will logically issue, not just `count` contiguous ones.
     bool ai_reserve(const std::string& name, uint64_t count, uint64_t step,
                     uint64_t offset_mod, uint64_t* first);
     void ai_seed_and_reserve(const std::string& name, uint64_t seed,
@@ -201,63 +154,37 @@ private:
     std::unordered_map<std::string, uint64_t> ai_next_;
 };
 
-/** Convert a stoolap status code to a short human-readable label (for logs). */
+// Stoolap status code -> short label, for logs.
 const char* status_label(int32_t code);
 
-/**
- * Process-wide engine counters surfaced via SHOW STATUS.
- * Increment from any handler thread (atomic, relaxed). Read by the
- * status_vars callbacks in the plugin descriptor; the SHOW STATUS code
- * snapshots on demand.
- */
+// Status counters; relaxed atomics, snapshot by SHOW STATUS.
 struct PushdownStats {
-    std::atomic<uint64_t> pushdown_hits{0};  // select_handler took the query
-    std::atomic<uint64_t> pushdown_misses{
-        0};  // factory returned NULL, fell to row pump
-    std::atomic<uint64_t> buffered_scans{
-        0};  // rnd_init completed via fetch_all (Tier 3)
-    std::atomic<uint64_t> buffered_rows{0};  // rows materialised through Tier 3
-    std::atomic<uint64_t> direct_modify_hits{
-        0};  // direct_update_rows / direct_delete_rows took it
-    std::atomic<uint64_t> records_live_counts{
-        0};  // cached_records() cache miss that had to fetch a fresh
-             // count from stoolap via stoolap_(tx_)table_count
-             // (O(1) atomic load). High values mean the handler /
-             // tx / global record-count caches are not being reused
-             // for this workload.
-    std::atomic<uint64_t> unmapped_errors{
-        0};  // BOTH the typed errcode AND the prose pattern table came back
-             // generic. Either stoolap added a STOOLAP_ERR_* code we don't
-             // recognise OR it returned a brand-new message wording. Either
-             // way the user sees ER_GET_ERRMSG (1296) with the raw text.
-    std::atomic<uint64_t> typed_fallback_hits{
-        0};  // typed errcode was STOOLAP_ERR_GENERIC but the prose pattern
-             // still classified the message into a specific HA_ERR_*. Means
-             // stoolap returned a generic code for an error we know how to
-             // pin down by text -- a stoolap-side typed-error gap. When this
-             // and unmapped_errors both stay 0 across a real run, the prose
-             // fallback can be retired.
+    std::atomic<uint64_t> pushdown_hits{0};
+    std::atomic<uint64_t> pushdown_misses{0};
+    std::atomic<uint64_t> buffered_scans{0};  // rnd_init via fetch_all
+    std::atomic<uint64_t> buffered_rows{0};
+    std::atomic<uint64_t> direct_modify_hits{0};
+    // cached_records() miss that hit stoolap_(tx_)table_count (O(1)).
+    // High values = the handler/tx/global caches aren't being reused.
+    std::atomic<uint64_t> records_live_counts{0};
+    // BOTH typed errcode AND prose pattern came back generic for a
+    // non-empty stoolap message. case_18 pins this at 0.
+    std::atomic<uint64_t> unmapped_errors{0};
+    // Typed errcode was GENERIC but prose still classified the message.
+    // Stoolap-side typed-error gap; not a plugin regression.
+    std::atomic<uint64_t> typed_fallback_hits{0};
 
-    // Per-phase timing buckets for pushdown latency profiling. Gated by
-    // perf_trace_enabled below (default OFF) because the per-row clocks
-    // and atomic increments are visible on microsecond-scale point
-    // queries -- ~50ns per next_row that the user shouldn't pay just for
-    // having the plugin loaded. Flip with `SET GLOBAL stoolap_perf_trace=1`
-    // when investigating; flip back to drop the cost.
-    std::atomic<uint64_t> perf_factory_setup_ns{
-        0};  // factory time minus eager_query
-    std::atomic<uint64_t> perf_eager_query_ns{0};  // stoolap_(tx_)query call
+    // Per-phase ns; gated by g_perf_trace_enabled (~50ns/next_row off-path).
+    std::atomic<uint64_t> perf_factory_setup_ns{0};
+    std::atomic<uint64_t> perf_eager_query_ns{0};
     std::atomic<uint64_t> perf_init_scan_ns{0};
-    std::atomic<uint64_t> perf_next_row_ns{0};  // summed over all calls
+    std::atomic<uint64_t> perf_next_row_ns{0};
     std::atomic<uint64_t> perf_end_scan_ns{0};
     std::atomic<uint64_t> perf_query_count{0};
     std::atomic<uint64_t> perf_next_row_count{0};
 };
 
-// Process-wide on/off switch for the Stoolap_perf_* counters. Loaded with
-// memory_order_relaxed in the hot paths -- a single bool read + branch,
-// effectively free when off. Toggled by the stoolap_perf_trace system
-// variable's update callback.
+// Hot-path read with memory_order_relaxed; bool read + branch, free off.
 extern std::atomic<bool> g_perf_trace_enabled;
 
 extern PushdownStats g_stats;
