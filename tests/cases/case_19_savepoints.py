@@ -1,6 +1,6 @@
 """Savepoint plumbing: SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO
-routes through the new bucket-A FFI (stoolap_tx_savepoint /
-stoolap_tx_release_savepoint / stoolap_tx_rollback_to_savepoint).
+routes through stoolap_tx_savepoint / stoolap_tx_release_savepoint /
+stoolap_tx_rollback_to_savepoint.
 
 MariaDB does not pass the user's SAVEPOINT name to the engine; the
 plugin synthesises "sp<id>" from a per-connection counter and stashes

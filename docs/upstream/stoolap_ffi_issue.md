@@ -5,12 +5,23 @@ Title: FFI APIs to simplify MariaDB plugin correctness workarounds
 The MariaDB plugin currently carries several compatibility workarounds that can
 be deleted if Stoolap exposes a few small FFI surfaces. Proposed sequence:
 
-**Landed (in stoolap `main`):** #1 typed errors, #2 table count, #5 read-only
-DSN, #6 savepoints. Plugin-side consumption tracked in the
-"Plugin-side consumption sequence" section at the bottom.
+**Landed upstream:** #1 typed errors, #2 table count, #6 savepoints (merged
+to stoolap `main`); #5 read-only DSN (currently on stoolap's
+`read-only-trait-split` branch -- the prior `main` PR was reverted).
 
-**Still pending:** #3 MVCC-safe bare COUNT, #4 stable rowid, #7 bytes type,
-#8 wider DATETIME, #9 composite keys, #10 AUTO_INCREMENT seed.
+**Consumed in plugin:** #1 (commit `9a11b66`), #2 (`5256cc5`), #6 (`26cf1db`).
+#5 is intentionally NOT consumed -- see "Plugin-side consumption sequence".
+
+**Still pending upstream:** #3 MVCC-safe bare COUNT, #4 stable rowid, #7 bytes
+type, #8 wider DATETIME, #9 composite keys, #10 AUTO_INCREMENT seed.
+
+**Open follow-up ask:** stoolap currently returns `STOOLAP_ERR_INTERNAL` (21)
+for write-conflict messages of the shape `row N has uncommitted changes from
+transaction M`. Should classify as `STOOLAP_ERR_TX_ABORTED` (15) or
+`STOOLAP_ERR_DB_LOCKED` (18) so the plugin's prose-grep fallback can retire.
+The plugin observes this gap via `Stoolap_typed_fallback_hits` (3 hits per
+suite run) and logs each occurrence as `[Note] stoolap typed-error gap:
+code=21 msg='...'`.
 
 ## 1. Typed Error Codes And Details ✅ Landed
 
@@ -394,83 +405,72 @@ propagated" known limitation goes away.
 
 ## Plugin-side consumption sequence (for the four landed asks)
 
-Each consumes one upstream API as a separate plugin PR per the
-hardening roadmap's PR 6 plan ("file four plugin deletion PRs in
-dependency order, one workaround removed per PR"). Order picked by
-risk-ascending so the early PRs build confidence in the cross-repo
-cadence:
+PR-A through PR-C consumed the corresponding upstream API as a separate
+commit per the hardening roadmap's "one workaround removed per PR" plan,
+ordered risk-ascending so the early PRs built confidence in the cross-
+repo cadence. PR-D was reviewed and intentionally dropped after the
+write-up below.
 
-**PR-A: Typed errors (#1)** — smallest plugin diff, biggest visibility.
-- Wire `stoolap_*_errcode` / `stoolap_*_errdetails` calls.
-- Replace `map_stoolap_error(const char*)` substring table with a
-  switch on the int32_t code.
-- Replace `guess_errkey`'s `"on column ..."` regex parser with
-  `details.constraint` (the actual stoolap index name).
-- Keep the prose-grep path as a fallback for any unmapped code so
-  the PR can land before every site is audited.
-- Drop the `Stoolap_unmapped_errors` drift counter once we're sure
-  every code routes through the typed path; until then it still
-  earns its keep.
-- Rough size: ~120 lines changed in `ha_stoolap.cc::map_stoolap_error`
-  + report_stoolap_error + guess_errkey, ~30 lines deleted from the
-  prose-grep table.
+**PR-A: Typed errors (#1)** — landed `9a11b66`. ~500 lines.
+- Wires `stoolap_*_errcode` / `stoolap_*_errdetails` via per-handle
+  `fetch_*_error` helpers returning a `StoolapErrorView` (typed code +
+  populated details).
+- `map_stoolap_errcode(int32_t)` returns `{ha_err, known}` so the prose
+  fallback only runs for codes stoolap explicitly flagged generic
+  (`STOOLAP_ERR_GENERIC` / `STOOLAP_ERR_INTERNAL`) or unknown future
+  codes (`!known`). Codes deliberately mapped to HA_ERR_GENERIC because
+  no specific MariaDB code exists (NOT_NULL, CHECK, ...) skip prose.
+- `errkey_from_view` prefers `details.constraint` (the index name
+  stoolap hands us directly) over message-grep for UNIQUE collisions.
+- `finish_view` promotes `STOOLAP_ERR_OK` -> `STOOLAP_ERR_GENERIC` so an
+  empty fetch (NULL handle, FFI returned no live error after a known
+  failure rc) cannot silently turn into a HA_ERR_OK return.
+- `Stoolap_typed_fallback_hits` counter + `[Note] stoolap typed-error
+  gap: code=N msg='...'` log surface the upstream typed-error gap.
 
-**PR-B: Table count (#2)** — collapses the records-cache subsystem.
-- In `cached_records()`, replace the live `SELECT COUNT(*) FROM t
-  WHERE 1 = 1` with `stoolap_tx_table_count` (in-tx) or
-  `stoolap_table_count` (autocommit). Both are O(1) atomic loads.
-- Drop the `WHERE 1 = 1` MVCC-fast-path workaround entirely.
-- The three-layer cache (handler-local / tx-local / global) can stay
-  -- it amortizes per-statement -- but the cache-miss path becomes
-  cheap, so `Stoolap_records_live_counts` stops being a "cold
-  caches" warning and becomes pure telemetry.
-- Updates `docs/architecture/records_cache_architecture.md`
-  ... but wait, that doc was deleted in the docs cleanup. Update
-  the in-code comment block in `ha_stoolap.cc::cached_records()`
-  instead.
-- Rough size: ~30 lines in `cached_records()`, ~15 lines deleted
-  from the live-count fallback.
+**PR-B: Table count (#2)** — landed `5256cc5`. ~70 lines.
+- `cached_records()`'s live `SELECT COUNT(*) FROM t WHERE 1 = 1` is
+  now `stoolap_tx_table_count` (in-tx) or `stoolap_table_count`
+  (autocommit) via a `count_via` helper. Cost dropped from full scan
+  to O(1) atomic load.
+- `info(HA_STATUS_VARIABLE)` deliberately still does NOT call
+  `cached_records()` even at O(1) cost: it fires multiple times per
+  statement during planning + records_in_range loops + post-statement,
+  and the cache-only lookup avoids that multiplier on every connection.
 
-**PR-C: Savepoints (#6)** — additive, doesn't disturb existing paths.
-- Add `savepoint_set` / `savepoint_release` / `savepoint_rollback`
-  handlerton callbacks.
-- Set `handlerton::savepoint_offset` to whatever chunk size we need
-  (probably 0 -- we can read the name from MariaDB's surrounding
-  `st_savepoint` struct).
-- Each callback pulls the savepoint name from the chunk and forwards
-  to `stoolap_tx_{savepoint, release_savepoint, rollback_to_savepoint}`
-  with `name_len` from MariaDB's `st_savepoint::length`.
-- Add `case_19_savepoints.py` covering: SAVEPOINT inside BEGIN,
-  ROLLBACK TO SAVEPOINT inside same tx, RELEASE SAVEPOINT, error on
-  reference to undeclared name.
-- Removes the "SAVEPOINT name | No (not in Stoolap C ABI yet)" row
-  from the README transactions matrix and the matching open-question
-  bullet.
-- Rough size: ~50 lines added to `ha_stoolap.cc` (three callbacks +
-  hton init), ~70 lines for the new test case.
+**PR-C: Savepoints (#6)** — landed `26cf1db`. ~310 lines + test case.
+- Three handlerton callbacks (`savepoint_set` / `savepoint_release` /
+  `savepoint_rollback`) wired through `stoolap_tx_savepoint` /
+  `stoolap_tx_release_savepoint` / `stoolap_tx_rollback_to_savepoint`.
+- MariaDB does not pass the user's SAVEPOINT name to the engine, so
+  the plugin synthesises `sp<id>` from a per-connection monotonic
+  counter (`ThdContext::next_savepoint_id`) and stashes id+name in
+  the engine-private chunk MariaDB allocates per SAVEPOINT (sized via
+  `hton->savepoint_offset`). All three callbacks share the chunk.
+- `ROLLBACK TO` invalidates the tx-local record-count cache (we track
+  count deltas at tx granularity, not savepoint granularity).
+- `case_19_savepoints.py` covers ROLLBACK TO undo, RELEASE persistence,
+  nested savepoints, ROLLBACK TO unknown -> errno 1305, and reused
+  savepoint names overriding the prior.
 
-**PR-D: Read-only DSN (#5)** — biggest refactor, land last.
-- Parse `?read_only=...` in `Engine::open`.
-- `Engine::db_` becomes a tagged union: `(rw StoolapDB*, ro StoolapRoDB*)`.
-- Every FFI call site dispatches on the tag. The bridge layer
-  (`exec_via`, `query_via`, `query_params_via`) gains an RO branch
-  that calls `stoolap_ro_query` / `_query_params` and refuses
-  exec/begin entirely.
-- `register_trx` returns early when RO (no tx state to track).
-- `cached_records()` uses `stoolap_ro_table_count` on RO handles.
-- Write paths (`write_row`, `update_row`, `delete_row`,
-  `direct_*_rows`) check the tag up front and return
-  `HA_ERR_TABLE_READONLY` (errno 1036).
-- DDL paths (`create`, `delete_table`, `rename_table`, etc.) refuse
-  too -- with a matching ER_OPEN_AS_READONLY (errno 1036) or
-  ER_READ_ONLY_MODE.
-- Add `case_20_read_only.py` covering: read query works, write
-  rejected with the right errno, DDL rejected, COUNT(*) routes
-  through ro_table_count.
-- Removes the "read-only mode (DSN with ?read_only=1) | Yes" row's
-  caveat and updates the README install instructions.
-- Rough size: ~250 lines (touches every FFI call site), ~100 lines
-  for the test case.
+**PR-D: Read-only DSN (#5)** — intentionally dropped.
+- Use case for the MariaDB plugin is narrow: MariaDB already exposes
+  `read_only=1` / `super_read_only=1` server variables that block
+  writes at the SQL layer; replication scales reads across separate
+  MariaDB instances. The single remaining case (MariaDB as a read-only
+  query layer over a stoolap file written by another process) is
+  niche and not actively requested.
+- Cost is high: ~350 lines of restructuring (`Engine::db_` tagged
+  union, every read path forks, every write path needs a RO rejection,
+  `info()` / `cached_records()` / error helpers all dual-pathed) plus
+  ongoing maintenance (every future read-path change has to be
+  considered for both modes) plus a parallel RO test surface.
+- Stoolap's `Database::open` already rejects `?read_only=true` flags
+  with `STOOLAP_ERR_INVALID_ARGUMENT` and a message pointing at
+  `stoolap_open_read_only`, so accidental misconfiguration produces a
+  clean error today.
+- Status: documented as out-of-scope for the plugin; revisit only if
+  a concrete user surfaces.
 
 ## Sequencing recap
 

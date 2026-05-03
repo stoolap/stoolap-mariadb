@@ -74,8 +74,7 @@ extern StoolapErrorView fetch_tx_error(StoolapTx* tx);
 // Defined in ha_stoolap.cc. Maps a stoolap error view to the right
 // HA_ERR_* code and, for generic-class codes, surfaces the original
 // text via my_printf_error so the user sees the real cause instead of
-// "Got error 168". Direct DML used to skip this and always returned
-// HA_ERR_GENERIC, hiding constraint failures behind error 1296.
+// "Got error 168".
 extern int report_stoolap_error(const StoolapErrorView& v);
 
 // Defined in ha_stoolap.cc. From a stoolap typed UNIQUE / PRIMARY KEY
@@ -103,10 +102,10 @@ namespace {
  *  caller falls back to MariaDB's per-row callback path.
  *
  *  Iterates this SELECT_LEX's local FROM list (`next_local`) and recurses
- *  explicitly into derived tables' inner SELECT_LEX(s). Relying on the
- *  global TABLE_LIST chain (`next_global`) used to work but mixed in
- *  TABLE_LIST entries from other parts of the LEX (subqueries in WHERE,
- *  etc.); explicit recursion is both narrower and easier to reason about.
+ *  explicitly into derived tables' inner SELECT_LEX(s). The global
+ *  TABLE_LIST chain (`next_global`) mixes in entries from other parts
+ *  of the LEX (subqueries in WHERE, etc.); explicit recursion is both
+ *  narrower and easier to reason about.
  */
 bool every_table_is_stoolap_impl(SELECT_LEX* sel_lex, bool& has_any_table);
 
@@ -664,11 +663,11 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
         const char* msg =
             *verr.details.message ? verr.details.message : "unknown error";
         sql_print_error("stoolap: direct DML failed: %s", msg);
-        // Map to the right HA_ERR_* (used to be a blanket
-        // HA_ERR_GENERIC, which hid UNIQUE / FK / lock errors as a
-        // single error class). For dup-key, also publish errkey via
-        // the out-param so the handler can hand a real key index to
-        // MariaDB's get_dup_key / ON DUPLICATE KEY routing.
+        // Map to the right HA_ERR_* so UNIQUE / FK / lock errors
+        // surface with their real SQLSTATE class. For dup-key, also
+        // publish errkey via the out-param so the handler can hand
+        // a real key index to MariaDB's get_dup_key / ON DUPLICATE
+        // KEY routing.
         //
         // MariaDB's direct-DML path does not always invoke
         // print_error after the engine returns, so a mapped FK or

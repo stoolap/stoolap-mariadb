@@ -22,10 +22,10 @@ versus InnoDB while staying pluggable into the MariaDB ecosystem
 Beta. Plugin maturity is declared `MariaDB_PLUGIN_MATURITY_ALPHA`
 because the persistent storage path is still relatively young; in-memory
 mode and the read pipeline are heavily tested. Verified end-to-end
-against MariaDB 11.4.10 with 17 Python integration test files (517+
+against MariaDB 11.4.10 with 18 Python integration test files (531
 assertions, all green on `memory://` and `file://` DSNs).
 
-Recent releases focus on:
+Subsystems that have settled recently:
 - Whole-SELECT and derived-table pushdown (`select_handler` /
   `derived_handler` / unit pushdown), including derived projections
   whose outer reference is an `Item_ref`.
@@ -37,6 +37,17 @@ Recent releases focus on:
   read-committed otherwise. `START TRANSACTION WITH CONSISTENT
   SNAPSHOT` is hooked through the `start_consistent_snapshot`
   handlerton callback.
+- `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT` route
+  through `stoolap_tx_savepoint` / `stoolap_tx_release_savepoint` /
+  `stoolap_tx_rollback_to_savepoint`. Names are synthesised
+  per-connection because MariaDB does not pass the user's SAVEPOINT
+  name to the engine.
+- Typed error mapping: `STOOLAP_ERR_*` codes drive HA_ERR_*
+  selection directly; a prose-grep fallback runs only for codes
+  stoolap explicitly flagged as generic so it can retire once the
+  upstream typed surface fully covers every observed error.
+- MVCC-safe `cached_records()` via `stoolap_(tx_)table_count`
+  (O(1) atomic load instead of a SQL `SELECT COUNT(*)`).
 - Composite `PRIMARY KEY` / `UNIQUE` / multi-column or self-FK
   refused at `CREATE TABLE` (Stoolap enforces single-column only;
   silently accepting them would let duplicates and FK-violating
@@ -51,7 +62,6 @@ Recent releases focus on:
   demand.
 - A correctness guard for case-insensitive collations vs. Stoolap's
   byte-wise compare semantics.
-- Read-only mode and DSN handling for production deployments.
 
 ## Architecture
 
@@ -242,9 +252,8 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 | `START TRANSACTION WITH CONSISTENT SNAPSHOT`   | Yes (snapshot anchored at BEGIN time via the handlerton callback) |
 | Write-write conflicts → `ER_LOCK_DEADLOCK`     | Yes (SQLSTATE 40001) |
 | Crash recovery via WAL replay on `open()`      | Yes |
-| `SAVEPOINT name`                               | No (not in Stoolap C ABI yet) |
+| `SAVEPOINT name` / `RELEASE` / `ROLLBACK TO`   | Yes (per-connection synthesised name; MariaDB does not pass the user's name to engines) |
 | 2PC / XA                                       | No |
-| Read-only mode (`stoolap_dsn` with `?read_only=1`) | Yes |
 
 ### Error mapping
 
@@ -440,7 +449,7 @@ Plugin-level (`SET GLOBAL ...`):
 
 | Variable                       | Type | Default     | Effect                                           |
 | ------------------------------ | ---- | ----------- | ------------------------------------------------ |
-| `stoolap_dsn`                  | str  | `memory://` | Stoolap DSN. Use `file:///path` for persistence. Append `?read_only=1` for read-only mode. |
+| `stoolap_dsn`                  | str  | `memory://` | Stoolap DSN. Use `file:///path` for persistence. |
 | `stoolap_perf_trace`           | bool | `OFF`       | Populate `Stoolap_perf_*` status counters.       |
 
 Session-level (`SET SESSION ...`):
@@ -456,10 +465,11 @@ Session-level (`SET SESSION ...`):
 | `Stoolap_pushdown_hits`           | Whole-query plans accepted by the factory. |
 | `Stoolap_pushdown_misses`         | Plans that fell back to the row pump.    |
 | `Stoolap_direct_modify_hits`      | UPDATE / DELETE that took the direct path. |
-| `Stoolap_records_live_counts`     | `cached_records()` had to issue a live MVCC-visible `COUNT(*)`. |
+| `Stoolap_records_live_counts`     | `cached_records()` cache miss that fetched a fresh count via `stoolap_(tx_)table_count` (O(1) atomic load). High values mean the handler / tx / global record-count caches are not being reused. |
 | `Stoolap_buffered_scans`          | `rnd_init` calls that used `fetch_all`.  |
 | `Stoolap_buffered_rows`           | Rows delivered through the buffered path. |
-| `Stoolap_unmapped_errors`         | Stoolap error strings the plugin couldn't classify (degraded to ER_GET_ERRMSG 1296). Non-zero means the error-mapping table in `map_stoolap_error` has fallen behind stoolap's wording — see `case_18_error_mapping`. |
+| `Stoolap_unmapped_errors`         | Both the typed `STOOLAP_ERR_*` code AND the prose-grep fallback came back generic for a non-empty stoolap message. Non-zero means an unrecognised code or wording -- see `case_18_error_mapping`. |
+| `Stoolap_typed_fallback_hits`     | Typed code was generic but the prose pattern still classified the message into a specific HA_ERR_*. Stoolap-side typed-error gap; the plugin still produces the right SQLSTATE via the fallback. Each occurrence emits `[Note] stoolap typed-error gap: code=N msg='...'` so the wording can be filed upstream. |
 | `Stoolap_perf_factory_setup_ns`   | Time spent inside `create_select` / `create_derived`. |
 | `Stoolap_perf_eager_query_ns`     | Time spent inside `stoolap_query` / `fetch_all`. |
 | `Stoolap_perf_init_scan_ns`       | Time spent in `init_scan` per pushed query. |
@@ -525,9 +535,13 @@ aggregations + joins, edge cases (NULLs, BLOB/TEXT, boundary
 numerics), strings, numerics, concurrency, DDL surface, scale
 (50K rows vs InnoDB), error message parity, transactional
 visibility / isolation (`REPEATABLE READ` snapshot stability,
-`READ COMMITTED` post-commit visibility), and unsupported-DDL
+`READ COMMITTED` post-commit visibility), unsupported-DDL
 rejection (composite PK/UNIQUE/FK, direct UPDATE/DELETE error
-mapping to ER_DUP_ENTRY 1062 / ER_NO_REFERENCED_ROW_2 1452).
+mapping to ER_DUP_ENTRY 1062 / ER_NO_REFERENCED_ROW_2 1452),
+error-class round-trip (every known `STOOLAP_ERR_*` reaches the
+client with the right MariaDB errno; drift counters stay at
+baseline), and savepoint plumbing (SAVEPOINT / RELEASE / ROLLBACK
+TO including nested and reused names).
 
 ## Performance
 
@@ -584,8 +598,6 @@ materials are kept in `third_party/` with their own license files.
   magnitude faster engine. Adaptive projection on the pushdown path and
   per-template prepared-statement caching for hot point lookups should
   recover most of that gap.
-- **SAVEPOINT.** Requires `stoolap_tx_savepoint_create / release / rollback`
-  in the Stoolap C ABI; tracked upstream.
 - **2PC / XA.** Needs a `prepare` callback and per-THD txn-id, neither of
   which Stoolap currently exposes.
 - **Charset / collation propagation.** Today the plugin's response to

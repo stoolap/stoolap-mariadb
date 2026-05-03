@@ -165,11 +165,11 @@ class ServerCtx:
         # destination is at least as new as our build artifact -- that's
         # the CI flow, where the workflow has already done a `sudo
         # install` before invoking the runner and the runner itself
-        # doesn't have sudo. Comparing mtimes catches "you forgot to
+        # doesn't have sudo. mtime comparison catches "you forgot to
         # re-copy after rebuilding" without needing a content hash;
-        # byte-size used to be the gate but two different builds can
-        # produce identically-sized .so files (different inline expansion,
-        # same total bytes), silently masking edits.
+        # byte-size equality is not safe because two builds can produce
+        # identically-sized .so files (different inline expansion, same
+        # total bytes) and silently mask edits.
         dst = f"{self.plugin_dir}/ha_stoolap.so"
         try:
             if (os.path.exists(dst) and

@@ -27,6 +27,10 @@ tests/
     case_13_ddl_surface.py           column types / DEFAULT / RENAME / SHOW CREATE
     case_14_scale.py                 50K/120K row loads, parity vs InnoDB
     case_15_error_messages.py        error-message plumbing
+    case_16_tx_isolation.py          REPEATABLE READ snapshot, READ COMMITTED post-commit visibility, CONSISTENT SNAPSHOT
+    case_17_unsupported_ddl.py       composite PK/UNIQUE/FK refused at CREATE; direct UPDATE 1062/1452 strict errno
+    case_18_error_mapping.py         every STOOLAP_ERR_* round-trips to the right MariaDB errno; drift counters stay at baseline
+    case_19_savepoints.py            SAVEPOINT / RELEASE / ROLLBACK TO, nested + reused names, unknown-name error
 ```
 
 ## Requirements
@@ -97,7 +101,14 @@ file stem, e.g. `case_06_pushdown` -> `stoolap_test_06_pushdown`). The
 - `section(name)` - print a section banner
 
 The runner snapshots `SHOW STATUS LIKE 'Stoolap_%'` before and after each case.
-Normal activity counters are allowlisted centrally; drift counters such as
-`Stoolap_unmapped_errors` must stay pinned. If a case intentionally moves a
-non-activity counter, declare `STOOLAP_COUNTERS_ALLOW_DELTA = {"CounterName"}`
-next to its `run(harness)` function.
+Normal activity counters are allowlisted centrally. `Stoolap_unmapped_errors`
+is a strict drift counter -- non-zero means the typed-error map and the
+prose-grep fallback both gave up on a real error wording, which is a
+plugin-side regression. `Stoolap_typed_fallback_hits` is allowlisted because
+it signals a stoolap-side typed-error gap, not a plugin regression: the
+plugin still produces the right SQLSTATE via the prose fallback, and each
+occurrence emits a `[Note] stoolap typed-error gap: code=N msg='...'` log
+line so the wording can be filed upstream. If a case intentionally moves
+some other non-activity counter, declare
+`STOOLAP_COUNTERS_ALLOW_DELTA = {"CounterName"}` next to its `run(harness)`
+function.

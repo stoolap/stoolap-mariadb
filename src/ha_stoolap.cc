@@ -356,14 +356,11 @@ int query_params_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
 }
 
 /**
- * MVCC-safe table count via the typed FFI (Bucket A). Inside an open
- * tx, stoolap_tx_table_count returns the snapshot-correct count
- * including the session's uncommitted INSERT/DELETE; otherwise
- * Database::table_count returns the autocommit-visible count via
- * the SegmentedTable fast path (O(1) atomic loads). Replaces the old
- * SELECT COUNT(*) ... WHERE 1=1 trick that existed solely to defeat
- * stoolap's pre-typed bare-COUNT(*) metadata fast path, which used
- * to leak rows from in-flight/rolled-back transactions.
+ * MVCC-safe table count. Inside an open tx, stoolap_tx_table_count
+ * returns the snapshot-correct count including the session's
+ * uncommitted INSERT/DELETE; otherwise Database::table_count returns
+ * the autocommit-visible count via the SegmentedTable fast path
+ * (O(1) atomic loads), safe on the hot loop.
  */
 int count_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
               const char* table, uint64_t* out_count) {
@@ -1094,8 +1091,8 @@ size_t copy_one_fk_clause(std::string_view sql, size_t fk_pos,
     }
 
     // Reject multi-column FKs — stoolap's grammar is single-column only.
-    // Silently dropping them used to let CREATE TABLE succeed and then
-    // accept FK-violating child rows with no client-visible warning.
+    // Silently dropping them lets CREATE TABLE succeed and then accept
+    // FK-violating child rows with no client-visible warning.
     if (count_commas(child_cols) > 0 || count_commas(parent_cols) > 0) {
         my_printf_error(ER_GET_ERRMSG,
                         "stoolap: composite FOREIGN KEY (%s) is not "
@@ -1370,7 +1367,7 @@ int stoolap_init_func(void* p) {
         stoolap_pushdown::create_stoolap_derived_handler;
     // Savepoints route SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO via
     // stoolap_tx_savepoint / stoolap_tx_release_savepoint /
-    // stoolap_tx_rollback_to_savepoint (Bucket A FFI). MariaDB does not
+    // stoolap_tx_rollback_to_savepoint. MariaDB does not
     // pass the user's SAVEPOINT name to the engine; we generate
     // "sp<id>" from a per-connection counter and stash id+name in the
     // engine-private chunk MariaDB allocates per SAVEPOINT (sized via
@@ -3815,16 +3812,12 @@ ha_rows ha_stoolap::cached_records() {
         }
     }
 
-    // MVCC-safe count via the typed FFI. Inside an open tx,
-    // stoolap_tx_table_count returns the snapshot-correct count
-    // (sees this session's uncommitted INSERT/DELETE, hides other
-    // sessions' post-snapshot writes); outside, stoolap_table_count
-    // returns the autocommit-visible count via the SegmentedTable
-    // fast path -- O(1) atomic loads, safe on the hot loop. The old
-    // SELECT COUNT(*) ... WHERE 1=1 trick existed solely to defeat
-    // stoolap's pre-typed bare-COUNT(*) metadata fast path, which
-    // could leak rows from in-flight transactions; the new entry
-    // points are MVCC-aware so that workaround is unnecessary.
+    // MVCC-safe count via stoolap_(tx_)table_count. Inside an open
+    // tx, the tx-side call returns the snapshot-correct count (sees
+    // this session's uncommitted INSERT/DELETE, hides other sessions'
+    // post-snapshot writes); outside, the db-side call returns the
+    // autocommit-visible count via the SegmentedTable fast path --
+    // O(1) atomic loads, safe on the hot loop.
     stoolap_mariadb::g_stats.records_live_counts.fetch_add(
         1, std::memory_order_relaxed);
     uint64_t count = 0;
@@ -4008,9 +4001,9 @@ IO_AND_CPU_COST ha_stoolap::keyread_time(uint index, ulong ranges,
     // index_next, so each ref/range probe really is a scan. Override
     // the caller's `rows` estimate too -- MariaDB passes rec_per_key
     // there, which we cannot poison without leaking state across
-    // sessions (P1 from a prior round). Fall back on stats.records *
-    // ranges for both halves of the cost so the planner can no longer
-    // see ci ref as a cheap point lookup.
+    // sessions. Fall back on stats.records * ranges for both halves
+    // of the cost so the planner can no longer see ci ref as a cheap
+    // point lookup.
     IO_AND_CPU_COST scan = scan_time();
     const double mult = static_cast<double>(ranges ? ranges : 1);
     IO_AND_CPU_COST cost;
