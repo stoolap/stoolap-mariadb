@@ -196,6 +196,33 @@ private:
 
     // Field index -> stoolap result-cell position, or -1 if unprojected.
     std::vector<int> scan_proj_;
+    // read_set | write_set words scan_proj_ was last built from (see
+    // projection_words); empty when built without bitmaps.
+    std::vector<uint32_t> scan_proj_cols_;
+    std::vector<uint32_t> projection_words() const;
+
+    // index_read_map reuses its SQL while the statement shape repeats
+    // (a join probes the same index once per outer row; only the
+    // parameter values change). null_mask marks key parts bound to NULL
+    // (" IS NULL", no parameter).
+    struct IndexReadShape {
+        uint index = MAX_KEY;
+        int find_flag = -1;
+        uint nparts = 0;
+        uint32_t null_mask = 0;
+        bool ci = false;
+        bool order = false;
+        std::vector<uint32_t> cols;
+        bool operator==(const IndexReadShape& o) const {
+            return index == o.index && find_flag == o.find_flag &&
+                   nparts == o.nparts && null_mask == o.null_mask &&
+                   ci == o.ci && order == o.order && cols == o.cols;
+        }
+    };
+    IndexReadShape ir_shape_;
+    std::string ir_sql_;
+    std::vector<StoolapValue> ir_params_;
+    std::vector<std::string> ir_text_;
 
     // INSERT SQL template; stoolap's semantic cache hashes it.
     std::string insert_sql_;

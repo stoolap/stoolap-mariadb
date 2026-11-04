@@ -353,3 +353,25 @@ INSERT INTO rec_u VALUES (1,30,100),(2,25,200);
                 "ALTER TABLE rec_u DROP INDEX idx_rec_age")
     h.assert_ok("re-add secondary index",
                 "ALTER TABLE rec_u ADD KEY idx_rec_age (age)")
+
+    h.section("index_read SQL reuse across a scan with another projection")
+    # index_read_map reuses its SQL while the shape repeats; a full scan
+    # on the same handler in between rebuilds scan_proj_ for a different
+    # projection, which the reused SQL must not inherit.
+    h.exec_script(f"""
+CREATE TABLE irs (id INT NOT NULL PRIMARY KEY, a INT, b INT) ENGINE={h.engine};
+INSERT INTO irs VALUES (1, 10, 1000), (2, 20, 2000), (3, 30, 3000);
+CREATE TABLE irs_drv (k INT NOT NULL PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO irs_drv VALUES (1), (2), (3);
+""")
+    probe = "SELECT SUM(t.a) FROM irs_drv d JOIN irs t ON t.id = d.k"
+    h.assert_not_pushed("eq_ref probe runs through the handler", probe)
+    h.assert_scalar("eq_ref probe", probe, "60")
+    h.assert_scalar("ALL scan with another projection",
+                    "SELECT SUM(t.b) FROM irs_drv d JOIN irs t "
+                    "ON t.b = d.k * 1000", "6000")
+    h.assert_scalar("eq_ref probe again", probe, "60")
+    h.assert_scalar("eq_ref probe, wider projection",
+                    "SELECT SUM(t.a + t.b) FROM irs_drv d JOIN irs t "
+                    "ON t.id = d.k", "6060")
+    h.assert_scalar("eq_ref probe, narrow again", probe, "60")
