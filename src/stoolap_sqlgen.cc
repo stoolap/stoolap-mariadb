@@ -72,7 +72,9 @@ bool numeric(Cls c) {
 class Gen {
 public:
     explicit Gen(THD* thd)
-        : trust_bin_(stoolap_thd_trust_binary_strings(thd) != 0) {}
+        : trust_bin_(stoolap_thd_trust_binary_strings(thd) != 0) {
+        out.reserve(1024);
+    }
 
     // names: output column names, one per visible item; null for
     // positional names (c0, c1, ...).
@@ -89,6 +91,25 @@ public:
     bool exists_list_ = false;
 
 private:
+    // Appends a quoted identifier / a positional column name to out.
+    void ident(std::string_view s) {
+        out.push_back('"');
+        if (s.find('"') == std::string_view::npos) {
+            out.append(s);
+        } else {
+            for (char c : s) {
+                if (c == '"') out.push_back('"');
+                out.push_back(c);
+            }
+        }
+        out.push_back('"');
+    }
+    void pos_name(uint n) {
+        char buf[16];
+        const int len = std::snprintf(buf, sizeof(buf), "\"c%u\"", n);
+        out.append(buf, static_cast<size_t>(len));
+    }
+
     bool fail(const char* w) {
         if (!why) why = w;
         return false;
@@ -296,6 +317,7 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
     // (including correlated subqueries below) refers to it.
     std::string head;
     head.swap(out);
+    out.reserve(512);
     if (sel->table_list.elements == 0) return fail("no table");
     std::vector<Item*> outer_merged;
     outer_merged.swap(merged_where_);
@@ -311,7 +333,8 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
     // Without aggregates, an EXISTS sees rows whatever the list holds,
     // so it need not be translatable.
     if (any_row && !sel->with_sum_func) {
-        out += "SELECT 1 AS " + quote_ident("c0") + from_sql;
+        out += "SELECT 1";
+        out += from_sql;
     } else {
         const bool distinct = sel->options & SELECT_DISTINCT;
         out += distinct ? "SELECT DISTINCT " : "SELECT ";
@@ -332,12 +355,15 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
             } else if (!expr(item)) {
                 return false;
             }
-            out += " AS ";
+            // Rows are read by position; names matter only to a derived
+            // table's outer query and to a set operation's ORDER BY.
             if (names) {
                 if (n >= names->size()) return fail("derived column names");
-                out += quote_ident((*names)[n]);
-            } else {
-                out += quote_ident("c" + std::to_string(n));
+                out += " AS ";
+                ident((*names)[n]);
+            } else if (cols) {
+                out += " AS ";
+                pos_name(n);
             }
         }
         out += from_sql;
@@ -461,7 +487,10 @@ bool Gen::unit(SELECT_LEX_UNIT* u, const std::vector<std::string>* names) {
         first_key = false;
         const uint i = f->field_index - hidden;
         if (names && i >= names->size()) return fail("derived column names");
-        out += quote_ident(names ? (*names)[i] : "c" + std::to_string(i));
+        if (names)
+            ident((*names)[i]);
+        else
+            pos_name(i);
         out += o->direction == ORDER::ORDER_DESC ? " DESC NULLS LAST"
                                                  : " ASC NULLS FIRST";
     }
@@ -603,7 +632,7 @@ bool Gen::table_ref(TABLE_LIST* t) {
     if (!t->table || !t->table->s) return fail("table without share");
     const std::string alias = "t" + std::to_string(next_alias_++);
     alias_[t] = alias;
-    out += quote_ident(stoolap_table_name(t->table->s));
+    ident(stoolap_table_name(t->table->s));
     out += " AS " + alias;
     return true;
 }
@@ -727,8 +756,8 @@ bool Gen::field(Item_field* f) {
     if (a == alias_.end()) return fail("field of unknown table");
     out += a->second;
     out.push_back('.');
-    out += quote_ident(std::string_view(f->field->field_name.str,
-                                        f->field->field_name.length));
+    ident(std::string_view(f->field->field_name.str,
+                           f->field->field_name.length));
     return true;
 }
 
