@@ -1,4 +1,3 @@
--- known-diff-file: read path: an unrepresentable key value (DATETIME 9999, BIGINT UNSIGNED max) errors
 CREATE TABLE t (id INT PRIMARY KEY, dt DATETIME NOT NULL, u BIGINT UNSIGNED NOT NULL, KEY kdt (dt), KEY ku (u)) ENGINE={E};
 INSERT INTO t VALUES (1,'2020-01-01 00:00:00',5);
 CREATE TABLE i (k INT PRIMARY KEY, u BIGINT UNSIGNED) ENGINE=InnoDB;

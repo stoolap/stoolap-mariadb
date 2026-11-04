@@ -160,6 +160,7 @@ private:
         scan_buf_rows_left_ = 0;
         scan_buf_cell_to_field_.clear();
         key_filter_active_ = false;
+        range_filter_active_ = false;
     }
 
     std::string stoolap_table_;
@@ -184,6 +185,18 @@ private:
     KEY* key_filter_key_ = nullptr;
     std::vector<uchar> key_filter_buf_;
 
+    // read_range_filtered: a range over a key part stoolap cannot order
+    // as MariaDB does. read_range_next keeps the rows MariaDB's key
+    // comparison puts inside the start bound (this copy) and end_range.
+    int read_range_filtered(const key_range* start_key,
+                            const key_range* end_key, bool sorted);
+    bool range_in_bounds();
+    bool range_filter_active_ = false;
+    std::vector<uchar> range_start_buf_;
+    uint range_start_len_ = 0;
+    ha_rkey_function range_start_flag_ = HA_READ_KEY_EXACT;
+    bool range_has_start_ = false;
+
     // BLOB/TEXT present? rnd_pos refuses (BLOB in-record bytes are
     // (len, ptr); ptr references prior-rnd_next's value-store).
     bool has_blob_field_ = false;
@@ -207,13 +220,16 @@ private:
         uint index = MAX_KEY;
         int find_flag = -1;
         uint nparts = 0;
-        uint32_t null_mask = 0;
+        uint32_t null_mask = 0;     // part IS NULL
+        uint32_t notnull_mask = 0;  // part IS NOT NULL
+        uint32_t skip_mask = 0;     // no predicate on the part
         uint32_t filter_mask = 0;
         bool order = false;
         std::vector<uint32_t> cols;
         bool operator==(const IndexReadShape& o) const {
             return index == o.index && find_flag == o.find_flag &&
                    nparts == o.nparts && null_mask == o.null_mask &&
+                   notnull_mask == o.notnull_mask && skip_mask == o.skip_mask &&
                    filter_mask == o.filter_mask && order == o.order &&
                    cols == o.cols;
         }

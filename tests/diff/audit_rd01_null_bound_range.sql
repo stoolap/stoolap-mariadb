@@ -1,4 +1,3 @@
--- known-diff-file: read path: a range with a NULL start bound returns 1032
 CREATE TABLE t (id INT PRIMARY KEY, b INT NULL, KEY kb (b)) ENGINE={E};
 INSERT INTO t VALUES (1,1),(2,NULL),(3,7),(4,3);
 CREATE TABLE i (k INT PRIMARY KEY) ENGINE=InnoDB;

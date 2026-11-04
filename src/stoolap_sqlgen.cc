@@ -33,6 +33,7 @@
 #include "item_sum.h"
 #include "item_subselect.h"
 #include "item_windowfunc.h"
+#include "stoolap_types.h"
 #include "sql_window.h"
 
 #include "ha_stoolap.h"
@@ -63,7 +64,14 @@ std::string quote_ident(std::string_view s) {
 
 // What a value is to stoolap, for deciding whether an operation on it
 // means the same thing on both sides.
-enum class Cls { INT, REAL, STR, DATETIME, UNSAFE };
+// DATETIME covers DATE too, and TIME and TSTAMP (TIMESTAMP) are their
+// own: stoolap holds each as an INTEGER that orders like the MariaDB
+// value (stoolap_types.h), and a DATE packs as the DATETIME at midnight.
+enum class Cls { INT, REAL, STR, DATETIME, TIME, TSTAMP, UNSAFE };
+
+bool temporal(Cls c) {
+    return c == Cls::DATETIME || c == Cls::TIME || c == Cls::TSTAMP;
+}
 
 bool numeric(Cls c) {
     return c == Cls::INT || c == Cls::REAL;
@@ -72,7 +80,7 @@ bool numeric(Cls c) {
 class Gen {
 public:
     explicit Gen(THD* thd)
-        : trust_bin_(stoolap_thd_trust_binary_strings(thd) != 0) {
+        : thd_(thd), trust_bin_(stoolap_thd_trust_binary_strings(thd) != 0) {
         out.reserve(1024);
     }
 
@@ -138,6 +146,9 @@ private:
     bool branches(Item_func* f, Item** args, uint n);
     bool frame_bound(Window_frame_bound* b);
     bool binop(Item* a, const char* op, Item* b);
+    bool temporal_literal(Item* col, Item* k, const Type_handler* h,
+                          std::string* lit);
+    bool compare(Item_func* f, Item** a, const char* op);
     bool args_csv(Item** args, uint n);
 
     Cls cls(Item* it);
@@ -147,6 +158,7 @@ private:
     bool orderable(Item* it);
     bool same_family(Item** args, uint n);
 
+    THD* thd_;
     bool trust_bin_;
     std::unordered_map<const TABLE_LIST*, std::string> alias_;
     // Columns of a derived table emitted as a subquery: the items a view
@@ -190,17 +202,27 @@ Cls Gen::cls(Item* it) {
             case MYSQL_TYPE_BLOB:
             case MYSQL_TYPE_MEDIUM_BLOB:
             case MYSQL_TYPE_LONG_BLOB:
-                // Binary strings, INET6 / UUID (no charset) do not
-                // compare as stoolap TEXT does.
-                if (!f->has_charset() || f->charset() == &my_charset_bin)
+                // Binary and non-utf8 strings are stored as hex, INET6 /
+                // UUID as their text: neither compares as stoolap TEXT.
+                if (stoolap_mariadb::field_enc(f) !=
+                        stoolap_mariadb::Enc::PLAIN ||
+                    !f->has_charset() || f->charset() == &my_charset_bin)
                     return Cls::UNSAFE;
                 return Cls::STR;
+            case MYSQL_TYPE_DATE:
+            case MYSQL_TYPE_NEWDATE:
             case MYSQL_TYPE_DATETIME:
             case MYSQL_TYPE_DATETIME2:
                 return Cls::DATETIME;
+            case MYSQL_TYPE_TIME:
+            case MYSQL_TYPE_TIME2:
+                return Cls::TIME;
+            case MYSQL_TYPE_TIMESTAMP:
+            case MYSQL_TYPE_TIMESTAMP2:
+                return Cls::TSTAMP;
             default:
-                // DECIMAL, DATE, TIME, ENUM, SET (TEXT in stoolap), BIT,
-                // TIMESTAMP (session-zone wall clock), JSON, GEOMETRY.
+                // DECIMAL (TEXT in stoolap), ENUM / SET (index / mask),
+                // BIT, JSON, GEOMETRY.
                 return Cls::UNSAFE;
         }
     }
@@ -223,7 +245,10 @@ Cls Gen::cls(Item* it) {
             // against INT / DOUBLE values; a DECIMAL expression does not.
             return it->basic_const_item() ? Cls::REAL : Cls::UNSAFE;
         case STRING_RESULT:
-            return Cls::STR;
+            // A binary or non-utf8 result would be read back as hex.
+            return stoolap_mariadb::text_is_utf8(it->collation.collation)
+                       ? Cls::STR
+                       : Cls::UNSAFE;
         default:
             return Cls::UNSAFE;
     }
@@ -234,6 +259,8 @@ Cls Gen::cls(Item* it) {
 // trailing spaces. Stoolap compares bytes, which only a binary NO PAD
 // collation agrees with, unless the session opted into byte semantics.
 bool Gen::cs_safe(const CHARSET_INFO* cs) {
+    // Other character sets are stored as hex (stoolap_types.h).
+    if (!stoolap_mariadb::text_is_utf8(cs)) return false;
     if (trust_bin_) return true;
     return cs && (cs->state & MY_CS_BINSORT) && (cs->state & MY_CS_NOPAD);
 }
@@ -254,14 +281,14 @@ bool Gen::comparable(Item* a, Item* b, const CHARSET_INFO* cmp_cs) {
     if (numeric(ca) && numeric(cb)) return true;
     if (ca == Cls::STR && cb == Cls::STR)
         return cmp_cs ? cs_safe(cmp_cs) : str_cmp_safe(a) && str_cmp_safe(b);
-    // Only DATETIME columns against each other: a literal or another
-    // temporal type would need MariaDB's conversion rules.
-    return ca == Cls::DATETIME && cb == Cls::DATETIME;
+    // Temporal columns against their own kind: a literal or another kind
+    // would need MariaDB's conversion rules.
+    return ca == cb && temporal(ca);
 }
 
 bool Gen::orderable(Item* it) {
     const Cls c = cls(it);
-    if (numeric(c) || c == Cls::DATETIME) return true;
+    if (numeric(c) || temporal(c)) return true;
     return c == Cls::STR && str_cmp_safe(it);
 }
 
@@ -342,6 +369,12 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
         uint n = 0;
         for (Item* item; (item = it++); ++n) {
             if (distinct && !orderable(item)) return fail("DISTINCT type");
+            // The reader decodes a binary or non-utf8 result column from
+            // hex: only a stored column of such a type comes back so.
+            if (item->cmp_type() == STRING_RESULT &&
+                !stoolap_mariadb::text_is_utf8(item->collation.collation) &&
+                item->real_item()->type() != Item::FIELD_ITEM)
+                return fail("binary / non-utf8 string result");
             if (n) out += ", ";
             if (cols) {
                 // A leg's value must already have the result's type, or
@@ -766,6 +799,118 @@ bool Gen::field(Item_field* f) {
     return true;
 }
 
+// A DATE / DATETIME or TIME column against a constant string, compared
+// the way MariaDB's comparator would (its compare type decides: a DATE
+// column against '2024-02-29 10:00' compares as DATETIME): the string
+// parsed with the comparison flags and packed like the column
+// (stoolap_types.h). Strings that parse with a warning, or to a date
+// with a zero part (sql_mode decides those), are left to MariaDB.
+// h is null for BETWEEN, whose comparator MariaDB does not expose: the
+// column's kind decides there, as it does in MariaDB for a string bound
+// (a DATE BETWEEN times of day also compares as DATETIME).
+bool Gen::temporal_literal(Item* col, Item* k, const Type_handler* h,
+                           std::string* lit) {
+    const Cls c = cls(col);
+    if (c != Cls::DATETIME && c != Cls::TIME) return false;
+    if (!k->basic_const_item() || k->is_null()) return false;
+    bool want_time = c == Cls::TIME;
+    if (h) {
+        switch (h->field_type()) {
+            case MYSQL_TYPE_DATE:
+            case MYSQL_TYPE_NEWDATE:
+            case MYSQL_TYPE_DATETIME:
+            case MYSQL_TYPE_DATETIME2:
+                want_time = false;
+                break;
+            case MYSQL_TYPE_TIME:
+            case MYSQL_TYPE_TIME2:
+                want_time = true;
+                break;
+            default:
+                return false;
+        }
+    }
+    if (want_time != (c == Cls::TIME)) return false;
+    MYSQL_TIME mt;
+    if (k->cmp_type() == TIME_RESULT) {
+        // Of the column's own kind: MariaDB compares a TIME column with a
+        // DATETIME bound (or a DATE one with a TIME bound) as DATETIME.
+        switch (k->field_type()) {
+            case MYSQL_TYPE_TIME:
+            case MYSQL_TYPE_TIME2:
+                if (!want_time) return false;
+                break;
+            case MYSQL_TYPE_DATE:
+            case MYSQL_TYPE_NEWDATE:
+            case MYSQL_TYPE_DATETIME:
+            case MYSQL_TYPE_DATETIME2:
+                if (want_time) return false;
+                break;
+            default:
+                return false;
+        }
+        // A temporal literal MariaDB made while preparing (BETWEEN turns
+        // its string bounds into these): its packed DATETIME / TIME, the
+        // value the comparator reads, is already pack_time()'s.
+        const longlong packed =
+            want_time ? k->val_time_packed(thd_) : k->val_datetime_packed(thd_);
+        if (k->null_value) return false;
+        unpack_time(
+            packed, &mt,
+            want_time ? MYSQL_TIMESTAMP_TIME : MYSQL_TIMESTAMP_DATETIME);
+        if (!want_time && (!mt.year || !mt.month || !mt.day)) return false;
+        *lit = std::to_string(static_cast<long long>(packed));
+        return true;
+    }
+    if (k->cmp_type() != STRING_RESULT) return false;
+    char buf[80];
+    String tmp(buf, sizeof(buf), &my_charset_bin);
+    const String* s = k->val_str(&tmp);
+    if (!s || !s->charset() || s->charset()->mbminlen != 1) return false;
+    MYSQL_TIME_STATUS st;
+    my_time_status_init(&st);
+    if (want_time) {
+        if (str_to_datetime_or_date_or_time(s->ptr(), s->length(), &mt,
+                                            C_TIME_INVALID_DATES, &st,
+                                            TIME_MAX_HOUR, UINT_MAX32) ||
+            mt.time_type != MYSQL_TIMESTAMP_TIME)
+            return false;
+    } else {
+        if (str_to_datetime_or_date(s->ptr(), s->length(), &mt,
+                                    C_TIME_INVALID_DATES, &st) ||
+            !mt.year || !mt.month || !mt.day)
+            return false;
+    }
+    if (st.warnings || st.nanoseconds) return false;
+    *lit = std::to_string(static_cast<long long>(pack_time(&mt)));
+    return true;
+}
+
+bool Gen::compare(Item_func* f, Item** a, const char* op) {
+    // =, <>, <, <=, >, >= and <=> are all Item_bool_rowready_func2.
+    auto* bf = static_cast<Item_bool_func2*>(f);
+    std::string lit;
+    if (temporal_literal(a[0], a[1], bf->compare_type_handler(), &lit)) {
+        out.push_back('(');
+        if (!expr(a[0])) return false;
+        out += op;
+        out += lit;
+        out.push_back(')');
+        return true;
+    }
+    if (temporal_literal(a[1], a[0], bf->compare_type_handler(), &lit)) {
+        out.push_back('(');
+        out += lit;
+        out += op;
+        if (!expr(a[1])) return false;
+        out.push_back(')');
+        return true;
+    }
+    if (!comparable(a[0], a[1], bf->compare_collation()))
+        return fail("comparison");
+    return binop(a[0], op, a[1]);
+}
+
 bool Gen::binop(Item* a, const char* op, Item* b) {
     out.push_back('(');
     if (!expr(a)) return false;
@@ -830,20 +975,12 @@ bool Gen::func(Item_func* f) {
                           : f->functype() == Item_func::LE_FUNC ? 3
                           : f->functype() == Item_func::GT_FUNC ? 4
                                                                 : 5;
-            if (n != 2 ||
-                !comparable(
-                    a[0], a[1],
-                    static_cast<Item_bool_func*>(f)->compare_collation()))
-                return fail("comparison");
-            return binop(a[0], ops[i], a[1]);
+            if (n != 2) return fail("comparison");
+            return compare(f, a, ops[i]);
         }
         case Item_func::EQUAL_FUNC:  // <=>
-            if (n != 2 ||
-                !comparable(
-                    a[0], a[1],
-                    static_cast<Item_bool_func*>(f)->compare_collation()))
-                return fail("<=>");
-            return binop(a[0], " IS NOT DISTINCT FROM ", a[1]);
+            if (n != 2) return fail("<=>");
+            return compare(f, a, " IS NOT DISTINCT FROM ");
         case Item_func::ISNULL_FUNC:
         case Item_func::ISNOTNULL_FUNC:
             if (n != 1) return fail("IS NULL");
@@ -861,6 +998,15 @@ bool Gen::func(Item_func* f) {
         case Item_func::BETWEEN: {
             auto* b = static_cast<Item_func_between*>(f);
             const CHARSET_INFO* cc = b->compare_collation();
+            std::string lo, hi;
+            if (n == 3 && temporal_literal(a[0], a[1], nullptr, &lo) &&
+                temporal_literal(a[0], a[2], nullptr, &hi)) {
+                out.push_back('(');
+                if (!expr(a[0])) return false;
+                out += b->negated ? " NOT BETWEEN " : " BETWEEN ";
+                out += lo + " AND " + hi + ")";
+                return true;
+            }
             if (n != 3 || !comparable(a[0], a[1], cc) ||
                 !comparable(a[0], a[2], cc))
                 return fail("BETWEEN");

@@ -582,7 +582,19 @@ std::string quote_ident(std::string_view s) {
     return out;
 }
 
+// Column type in stoolap; the value encodings are in stoolap_types.h.
 const char* stoolap_type_for(const Field* f) {
+    using stoolap_mariadb::Enc;
+    switch (stoolap_mariadb::field_enc(f)) {
+        case Enc::PACKED_TIME:
+        case Enc::UTC_MICROS:
+        case Enc::INDEX:
+            return "INTEGER";
+        case Enc::HEX:
+            return "TEXT";
+        case Enc::PLAIN:
+            break;
+    }
     switch (f->real_type()) {
         case MYSQL_TYPE_TINY:
         case MYSQL_TYPE_SHORT:
@@ -599,22 +611,11 @@ const char* stoolap_type_for(const Field* f) {
         case MYSQL_TYPE_VAR_STRING:
         case MYSQL_TYPE_STRING:
         case MYSQL_TYPE_NEWDECIMAL:  // round-trip via decimal string
-        case MYSQL_TYPE_DATE:        // YYYY-MM-DD as text
-        case MYSQL_TYPE_NEWDATE:
-        case MYSQL_TYPE_TIME:  // HH:MM:SS[.ffffff] as text
-        case MYSQL_TYPE_TIME2:
-        case MYSQL_TYPE_ENUM:       // val_str() gives the label
-        case MYSQL_TYPE_SET:        // val_str() gives "a,b,c"
-        case MYSQL_TYPE_TINY_BLOB:  // TEXT family stored as BLOB type
-        case MYSQL_TYPE_BLOB:       // ditto
+        case MYSQL_TYPE_TINY_BLOB:   // TEXT family stored as BLOB type
+        case MYSQL_TYPE_BLOB:        // ditto
         case MYSQL_TYPE_MEDIUM_BLOB:
         case MYSQL_TYPE_LONG_BLOB:
             return "TEXT";
-        case MYSQL_TYPE_DATETIME:
-        case MYSQL_TYPE_DATETIME2:
-        case MYSQL_TYPE_TIMESTAMP:
-        case MYSQL_TYPE_TIMESTAMP2:
-            return "TIMESTAMP";
         default:
             return nullptr;
     }
@@ -865,10 +866,9 @@ std::string ci_string_unique_part(TABLE* form) {
             case MYSQL_TYPE_BLOB:
             case MYSQL_TYPE_MEDIUM_BLOB:
             case MYSQL_TYPE_LONG_BLOB:
-            case MYSQL_TYPE_ENUM:
-            case MYSQL_TYPE_SET:
                 break;
             default:
+                // ENUM / SET are stored as their index / mask.
                 return false;
         }
         CHARSET_INFO* cs = f->charset();
@@ -1110,6 +1110,12 @@ ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
                 case MYSQL_TYPE_BLOB:
                 case MYSQL_TYPE_MEDIUM_BLOB:
                 case MYSQL_TYPE_LONG_BLOB: {
+                    // A hex-stored multi-byte charset orders by code point
+                    // in MariaDB, by byte in stoolap (stoolap_types.h).
+                    if (stoolap_mariadb::field_enc(f) ==
+                            stoolap_mariadb::Enc::HEX &&
+                        !stoolap_mariadb::hex_keeps_order(f))
+                        return 0;
                     CHARSET_INFO* cs = f->charset();
                     if (cs && (cs->state & MY_CS_BINSORT)) {
                         return HA_READ_NEXT | HA_READ_RANGE | HA_READ_ORDER |
@@ -1334,6 +1340,8 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
         v.value_type = STOOLAP_TYPE_NULL;
         return true;
     }
+    if (stoolap_mariadb::field_enc(f) != stoolap_mariadb::Enc::PLAIN)
+        return stoolap_mariadb::encode_field(f, v, text_holder);
     switch (f->real_type()) {
         case MYSQL_TYPE_TINY:
         case MYSQL_TYPE_SHORT:
@@ -1364,18 +1372,12 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
         case MYSQL_TYPE_VAR_STRING:
         case MYSQL_TYPE_STRING:
         case MYSQL_TYPE_NEWDECIMAL:
-        case MYSQL_TYPE_DATE:
-        case MYSQL_TYPE_NEWDATE:
-        case MYSQL_TYPE_TIME:
-        case MYSQL_TYPE_TIME2:
-        case MYSQL_TYPE_ENUM:
-        case MYSQL_TYPE_SET:
         case MYSQL_TYPE_TINY_BLOB:
         case MYSQL_TYPE_BLOB:
         case MYSQL_TYPE_MEDIUM_BLOB:
         case MYSQL_TYPE_LONG_BLOB: {
-            // DECIMAL: val_str() formats as the canonical decimal string
-            // (e.g. "123.450"), preserving precision through stoolap TEXT.
+            // utf8 / ascii text as is. DECIMAL: val_str() formats the
+            // canonical decimal string (e.g. "123.450"), keeping precision.
             char tmp[256];
             String tmp_str(tmp, sizeof(tmp), f->charset());
             String* s = f->val_str(&tmp_str);
@@ -1383,44 +1385,6 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
             v.value_type = STOOLAP_TYPE_TEXT;
             v.v.text.ptr = text_holder.data();
             v.v.text.len = static_cast<int64_t>(text_holder.size());
-            return true;
-        }
-        case MYSQL_TYPE_DATETIME:
-        case MYSQL_TYPE_DATETIME2:
-        case MYSQL_TYPE_TIMESTAMP:
-        case MYSQL_TYPE_TIMESTAMP2: {
-            // get_timestamp() works only for TIMESTAMP fields (which store
-            // Unix seconds); DATETIME fields store packed Y/M/D h:m:s.us.
-            // get_date() works for both — it returns parsed components.
-            MYSQL_TIME mt;
-            std::memset(&mt, 0, sizeof(mt));
-            f->get_date(&mt, date_mode_t(0));
-            struct tm tm_;
-            std::memset(&tm_, 0, sizeof(tm_));
-            tm_.tm_year = static_cast<int>(mt.year) - 1900;
-            tm_.tm_mon = static_cast<int>(mt.month) - 1;
-            tm_.tm_mday = static_cast<int>(mt.day);
-            tm_.tm_hour = static_cast<int>(mt.hour);
-            tm_.tm_min = static_cast<int>(mt.minute);
-            tm_.tm_sec = static_cast<int>(mt.second);
-            time_t secs = timegm(&tm_);
-            // Stoolap stores TIMESTAMP as int64 nanoseconds since epoch,
-            // which can only represent ~1678..2262. Reject dates outside
-            // that range explicitly to avoid silent overflow corruption
-            // (e.g. 9999-12-31 wrapping to 1816-03-30).
-            constexpr int64_t kMaxSecs = INT64_MAX / 1000000000LL;
-            constexpr int64_t kMinSecs = INT64_MIN / 1000000000LL;
-            const int64_t s64 = static_cast<int64_t>(secs);
-            if (s64 > kMaxSecs || s64 < kMinSecs) {
-                sql_print_error(
-                    "stoolap: DATETIME '%04u-%02u-%02u %02u:%02u:%02u' is "
-                    "outside the representable range (~1678-2262)",
-                    mt.year, mt.month, mt.day, mt.hour, mt.minute, mt.second);
-                return false;
-            }
-            v.value_type = STOOLAP_TYPE_TIMESTAMP;
-            v.v.timestamp_nanos = s64 * 1000000000LL +
-                                  static_cast<int64_t>(mt.second_part) * 1000LL;
             return true;
         }
         default:
@@ -2273,6 +2237,7 @@ int ha_stoolap::rnd_next(uchar* buf) {
             }
             f->set_notnull();
         }
+        const int32_t c = static_cast<int32_t>(col);
         switch (f->real_type()) {
             case MYSQL_TYPE_TINY:
             case MYSQL_TYPE_SHORT:
@@ -2281,65 +2246,39 @@ int ha_stoolap::rnd_next(uchar* buf) {
             case MYSQL_TYPE_INT24:
             case MYSQL_TYPE_YEAR:
             case MYSQL_TYPE_BIT:
-                // Preserve UNSIGNED_FLAG: without it, INT UNSIGNED > INT32_MAX
-                // stores as negative i64 and BIGINT UNSIGNED > INT64_MAX
-                // silently corrupts. write_row already refuses BIGINT
-                // UNSIGNED > INT64_MAX, so the round-trip is faithful.
-                f->store(stoolap_rows_column_int64(scan_.get(),
-                                                   static_cast<int32_t>(col)),
-                         /*unsigned=*/f->is_unsigned());
+            case MYSQL_TYPE_DATE:
+            case MYSQL_TYPE_NEWDATE:
+            case MYSQL_TYPE_TIME:
+            case MYSQL_TYPE_TIME2:
+            case MYSQL_TYPE_DATETIME:
+            case MYSQL_TYPE_DATETIME2:
+            case MYSQL_TYPE_TIMESTAMP:
+            case MYSQL_TYPE_TIMESTAMP2:
+            case MYSQL_TYPE_ENUM:
+            case MYSQL_TYPE_SET:
+                // INTEGER columns; store_int decodes by the field's type.
+                stoolap_mariadb::store_int(
+                    f, stoolap_rows_column_int64(scan_.get(), c));
                 break;
             case MYSQL_TYPE_FLOAT:
             case MYSQL_TYPE_DOUBLE:
-                f->store(stoolap_rows_column_double(scan_.get(),
-                                                    static_cast<int32_t>(col)));
+                f->store(stoolap_rows_column_double(scan_.get(), c));
                 break;
             case MYSQL_TYPE_VARCHAR:
             case MYSQL_TYPE_VAR_STRING:
             case MYSQL_TYPE_STRING:
             case MYSQL_TYPE_NEWDECIMAL:
-            case MYSQL_TYPE_DATE:
-            case MYSQL_TYPE_NEWDATE:
-            case MYSQL_TYPE_TIME:
-            case MYSQL_TYPE_TIME2:
-            case MYSQL_TYPE_ENUM:
-            case MYSQL_TYPE_SET:
             case MYSQL_TYPE_TINY_BLOB:
             case MYSQL_TYPE_BLOB:
             case MYSQL_TYPE_MEDIUM_BLOB:
             case MYSQL_TYPE_LONG_BLOB: {
                 int64_t len = 0;
-                const char* s = stoolap_rows_column_text(
-                    scan_.get(), static_cast<int32_t>(col), &len);
+                const char* s = stoolap_rows_column_text(scan_.get(), c, &len);
                 if (s) {
-                    f->store(s, static_cast<uint>(len), f->charset());
+                    stoolap_mariadb::store_text(f, s, static_cast<size_t>(len));
                 } else if (f->maybe_null()) {
                     f->set_null();
                 }
-                break;
-            }
-            case MYSQL_TYPE_DATETIME:
-            case MYSQL_TYPE_DATETIME2:
-            case MYSQL_TYPE_TIMESTAMP:
-            case MYSQL_TYPE_TIMESTAMP2: {
-                int64_t nanos = stoolap_rows_column_timestamp(
-                    scan_.get(), static_cast<int32_t>(col));
-                int64_t secs = nanos / 1000000000LL;
-                int64_t us = (nanos % 1000000000LL) / 1000LL;
-                if (us < 0) {
-                    us += 1000000;
-                    secs--;
-                }
-                struct tm tm_;
-                time_t t = static_cast<time_t>(secs);
-                gmtime_r(&t, &tm_);
-                char tbuf[40];
-                int n = std::snprintf(tbuf, sizeof(tbuf),
-                                      "%04d-%02d-%02d %02d:%02d:%02d.%06lld",
-                                      tm_.tm_year + 1900, tm_.tm_mon + 1,
-                                      tm_.tm_mday, tm_.tm_hour, tm_.tm_min,
-                                      tm_.tm_sec, static_cast<long long>(us));
-                f->store(tbuf, static_cast<uint>(n), &my_charset_bin);
                 break;
             }
             default:
@@ -2419,6 +2358,35 @@ int ha_stoolap::index_end() {
     return 0;
 }
 
+namespace {
+
+// A key value stoolap holds no row for: NULL, or a BIGINT UNSIGNED above
+// INT64_MAX (the writer refuses those). What a bound on it selects, in
+// MariaDB's index order, where NULLs come first.
+enum class Beyond { NONE, IS_NULL, NOT_NULL, ALL };
+
+bool unsigned_beyond_i64(Field* f) {
+    return f->real_type() == MYSQL_TYPE_LONGLONG && f->is_unsigned() &&
+           !f->is_null() && f->val_int() < 0;
+}
+
+Beyond bound_beyond(const char* op, bool is_null) {
+    const bool eq = op[0] == '=' && op[1] == '\0';
+    const bool upper = op[0] == '<';
+    const bool inclusive = op[1] == '=' || eq;
+    if (is_null) {
+        // Before every value: = and <= keep the NULLs, > keeps the rest,
+        // >= keeps all, < nothing.
+        if (eq) return Beyond::IS_NULL;
+        if (upper) return inclusive ? Beyond::IS_NULL : Beyond::NONE;
+        return inclusive ? Beyond::ALL : Beyond::NOT_NULL;
+    }
+    // After every stored value: < and <= keep all, the rest nothing.
+    return upper ? Beyond::ALL : Beyond::NONE;
+}
+
+}  // namespace
+
 int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
                                key_part_map keypart_map,
                                enum ha_rkey_function find_flag) {
@@ -2488,19 +2456,28 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     }
 
     // Bind the key values; the SQL text depends only on the shape below.
-    uint32_t null_mask = 0;
+    uint32_t null_mask = 0, notnull_mask = 0, skip_mask = 0;
     {
         for (uint i = 0; i < nparts; ++i) {
             if (filter_mask & (uint32_t(1) << i)) continue;
             Field* f = key_info.key_part[i].field;
-            if (f->is_null()) {
-                // NULL with range op = no rows; equality uses IS NULL.
-                const bool is_last = (i == nparts - 1);
-                if (is_last && std::strcmp(last_op, "=") != 0) {
-                    move_fields(table, -d);
-                    return HA_ERR_KEY_NOT_FOUND;
+            const char* op = (i == nparts - 1) ? last_op : "=";
+            const uint32_t bit = uint32_t(1) << i;
+            if (f->is_null() || unsigned_beyond_i64(f)) {
+                switch (bound_beyond(op, f->is_null())) {
+                    case Beyond::NONE:
+                        move_fields(table, -d);
+                        return HA_ERR_KEY_NOT_FOUND;
+                    case Beyond::IS_NULL:
+                        null_mask |= bit;
+                        break;
+                    case Beyond::NOT_NULL:
+                        notnull_mask |= bit;
+                        break;
+                    case Beyond::ALL:
+                        skip_mask |= bit;
+                        break;
                 }
-                null_mask |= uint32_t(1) << i;
                 continue;
             }
             StoolapValue v{};
@@ -2527,6 +2504,8 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     shape.find_flag = static_cast<int>(find_flag);
     shape.nparts = nparts;
     shape.null_mask = null_mask;
+    shape.notnull_mask = notnull_mask;
+    shape.skip_mask = skip_mask;
     shape.filter_mask = filter_mask;
     shape.order = need_order;
     shape.cols = projection_words();
@@ -2539,14 +2518,19 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
             int next_param = 1;
             bool first = true;
             for (uint i = 0; i < nparts; ++i) {
-                if (filter_mask & (uint32_t(1) << i)) continue;
+                const uint32_t bit = uint32_t(1) << i;
+                if ((filter_mask | skip_mask) & bit) continue;
                 Field* f = key_info.key_part[i].field;
                 sql += first ? " WHERE " : " AND ";
                 first = false;
                 sql += quote_ident(
                     std::string_view(f->field_name.str, f->field_name.length));
-                if (null_mask & (uint32_t(1) << i)) {
+                if (null_mask & bit) {
                     sql += " IS NULL";
+                    continue;
+                }
+                if (notnull_mask & bit) {
+                    sql += " IS NOT NULL";
                     continue;
                 }
                 sql.push_back(' ');
@@ -2704,6 +2688,10 @@ int ha_stoolap::read_range_first(const key_range* start_key,
                 case MYSQL_TYPE_BLOB:
                 case MYSQL_TYPE_MEDIUM_BLOB:
                 case MYSQL_TYPE_LONG_BLOB: {
+                    if (stoolap_mariadb::field_enc(f) ==
+                            stoolap_mariadb::Enc::HEX &&
+                        !stoolap_mariadb::hex_keeps_order(f))
+                        return true;
                     CHARSET_INFO* cs = f->charset();
                     if (cs && (cs->state & MY_CS_BINSORT)) break;
                     return true;
@@ -2719,7 +2707,7 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         return false;
     };
     if (contains_unsafe_part(start_key) || contains_unsafe_part(end_key)) {
-        return handler::read_range_first(start_key, end_key, eq_range, sorted);
+        return read_range_filtered(start_key, end_key, sorted);
     }
 
     // Lexicographic-tuple semantics: (a,b) >= (1,5) is NOT a >= 1 AND b >= 5
@@ -2883,19 +2871,25 @@ int ha_stoolap::read_range_first(const key_range* start_key,
             Field* f = key_info.key_part[i].field;
             const bool is_last = (i == nparts - 1);
             const char* op = is_last ? last_op : "=";
+            Beyond beyond = Beyond::NONE;
+            const bool special = f->is_null() || unsigned_beyond_i64(f);
+            if (special) {
+                beyond = bound_beyond(op, f->is_null());
+                if (beyond == Beyond::NONE) {
+                    move_fields(table, -d);
+                    return HA_ERR_KEY_NOT_FOUND;
+                }
+                if (beyond == Beyond::ALL) continue;
+            }
 
             sql += any_pred ? " AND " : " WHERE ";
             any_pred = true;
 
             sql += quote_ident(
                 std::string_view(f->field_name.str, f->field_name.length));
-            if (f->is_null()) {
-                if (op[0] == '=' && op[1] == '\0') {
-                    sql += " IS NULL";
-                    continue;
-                }
-                move_fields(table, -d);
-                return HA_ERR_KEY_NOT_FOUND;
+            if (special) {
+                sql += beyond == Beyond::IS_NULL ? " IS NULL" : " IS NOT NULL";
+                continue;
             }
             StoolapValue v{};
             text_holders.emplace_back();
@@ -2952,9 +2946,159 @@ int ha_stoolap::read_range_first(const key_range* start_key,
 }
 
 int ha_stoolap::read_range_next() {
-    // Route through index_next so the ci-collation filter fires on punted
-    // ranges. Non-ci scans just hit rnd_next via index_next; no overhead.
+    if (range_filter_active_) {
+        while (true) {
+            const int r = rnd_next(table->record[0]);
+            if (r) return r;
+            if (range_in_bounds()) return 0;
+        }
+    }
     return index_next(table->record[0]);
+}
+
+// The row at record[0] lies inside the range by MariaDB's own key
+// comparison (collation, prefix and NULL aware).
+bool ha_stoolap::range_in_bounds() {
+    KEY& ki = table->key_info[active_index];
+    if (range_has_start_) {
+        const int c =
+            key_cmp(ki.key_part, range_start_buf_.data(), range_start_len_);
+        switch (range_start_flag_) {
+            case HA_READ_AFTER_KEY:
+                if (c <= 0) return false;
+                break;
+            case HA_READ_KEY_EXACT:
+            case HA_READ_PREFIX:
+                if (c != 0) return false;
+                break;
+            default:  // HA_READ_KEY_OR_NEXT
+                if (c < 0) return false;
+                break;
+        }
+    }
+    return !end_range || compare_key(end_range) <= 0;
+}
+
+// A range over a key part stoolap cannot compare as MariaDB does (a ci
+// collation, DECIMAL / ENUM / SET, a multi-byte hex charset): stoolap's
+// order is not the key's, so neither its WHERE nor the usual stop at the
+// first row past the end can be trusted. Stoolap returns candidates
+// bounded only by the leading key part when that part is safe, and
+// read_range_next keeps the rows inside both bounds by MariaDB's own
+// comparison, reading to the end. With `sorted`, rows come in key order
+// over the non-constant parts, up to the first that index_flags offers
+// no order on (MariaDB relies on no order past it).
+int ha_stoolap::read_range_filtered(const key_range* start_key,
+                                    const key_range* end_key, bool sorted) {
+    KEY& ki = table->key_info[active_index];
+    const bool trust_bin = stoolap_thd_trust_binary_strings(ha_thd());
+    // Ordered and compared by stoolap as by MariaDB: not a prefix, PAD
+    // SPACE or ci string (key_part_needs_filter), nor one index_flags
+    // offers no order on.
+    auto part_safe = [&](uint i) {
+        return ki.key_part[i].field &&
+               (index_flags(active_index, i, false) & HA_READ_ORDER) &&
+               !key_part_needs_filter(ki.key_part[i], trust_bin);
+    };
+    // Leading parts every row of the range shares: the bounds agree on
+    // them, byte for byte.
+    uint const_prefix = 0;
+    if (start_key && end_key) {
+        uint off = 0;
+        while (const_prefix < ki.user_defined_key_parts &&
+               (start_key->keypart_map & end_key->keypart_map &
+                (key_part_map(1) << const_prefix))) {
+            const uint len = ki.key_part[const_prefix].store_length;
+            if (std::memcmp(start_key->key + off, end_key->key + off, len))
+                break;
+            off += len;
+            ++const_prefix;
+        }
+    }
+
+    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
+    sql += quote_ident(stoolap_table_);
+    std::vector<StoolapValue> params;
+    std::deque<std::string> holders;
+    if (part_safe(0)) {
+        // Every row of the range has its first part between the bounds'
+        // first parts (inclusive, whatever the flags); NULLs sort first,
+        // so an upper bound keeps them.
+        Field* f = ki.key_part[0].field;
+        const std::string col = quote_ident(
+            std::string_view(f->field_name.str, f->field_name.length));
+        for (const key_range* r : {start_key, end_key}) {
+            if (!r || !(r->keypart_map & 1)) continue;
+            std::memset(table->record[1], 0, table->s->reclength);
+            key_restore(table->record[1], r->key, &ki,
+                        ki.key_part[0].store_length);
+            const my_ptrdiff_t d =
+                static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
+            move_fields(table, d);
+            StoolapValue v{};
+            holders.emplace_back();
+            const bool bind = !f->is_null() && !unsigned_beyond_i64(f) &&
+                              extract_field(f, v, holders.back());
+            move_fields(table, -d);
+            if (!bind) continue;
+            sql += params.empty() ? " WHERE (" : " AND (";
+            sql += col;
+            sql += r == start_key ? " >= $" : " <= $";
+            params.push_back(v);
+            sql += std::to_string(params.size());
+            if (r == end_key && f->real_maybe_null())
+                sql += " OR " + col + " IS NULL";
+            sql.push_back(')');
+        }
+    }
+    if (sorted) {
+        // The order index_flags promised: every part offering it, past
+        // one that does not only when that part is constant, by the
+        // bounds or by the WHERE (MariaDB's const_key_parts, which its
+        // ORDER BY check skips the same way).
+        const key_part_map where_const =
+            table->const_key_parts ? table->const_key_parts[active_index] : 0;
+        bool first = true;
+        for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
+            // A constant part is one value to MariaDB: sorting stoolap's
+            // bytes there could split values its collation calls equal
+            // ('a', 'a ') and break the order of the parts after it.
+            if (i < const_prefix || (where_const & (key_part_map(1) << i)))
+                continue;
+            if (!ki.key_part[i].field ||
+                !(index_flags(active_index, i, false) & HA_READ_ORDER))
+                break;
+            Field* f = ki.key_part[i].field;
+            sql += first ? " ORDER BY " : ", ";
+            first = false;
+            sql += quote_ident(
+                std::string_view(f->field_name.str, f->field_name.length));
+            sql += " NULLS FIRST";
+        }
+    }
+
+    auto* ctx = get_thd_ctx(ha_thd());
+    StoolapRows* rows = nullptr;
+    if (query_params_via(ctx, db_raw(), sql.c_str(), params.data(),
+                         static_cast<int32_t>(params.size()),
+                         &rows) != STOOLAP_OK) {
+        auto verr = fetch_error_via(ctx, db_raw());
+        sql_print_error("stoolap: read_range query failed: %s", verr.message);
+        return report_stoolap_error(verr);
+    }
+    scan_.reset(rows);
+
+    range_has_start_ = start_key != nullptr;
+    if (start_key) {
+        range_start_buf_.assign(start_key->key,
+                                start_key->key + start_key->length);
+        range_start_len_ = start_key->length;
+        range_start_flag_ = start_key->flag;
+    }
+    range_key_part = ki.key_part;
+    set_end_range(end_key);
+    range_filter_active_ = true;
+    return read_range_next();
 }
 
 void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,

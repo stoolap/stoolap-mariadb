@@ -1,4 +1,3 @@
--- known-diff-file: types: zero dates and DATETIME outside ~1678-2262 are mangled
 CREATE TABLE t (id INT PRIMARY KEY, dt DATETIME) ENGINE={E};
 INSERT INTO t VALUES (1, '2020-00-00 00:00:00');
 INSERT INTO t VALUES (2, '0000-00-00 00:00:00');
