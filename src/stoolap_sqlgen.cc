@@ -1623,17 +1623,21 @@ bool Gen::update(TABLE* table, Item* cond, List<Item>& fields,
         const std::string col = out.substr(at);
         out += " = " + sets[i].second;
         if (changed_only) {
-            changed += i ? " AND " : "";
-            changed += name + "." + col + " IS NOT DISTINCT FROM (" +
-                       sets[i].second + ")";
+            // The value never reads NULL into a NOT NULL column (checked
+            // or guarded above), where <> is the cheaper test.
+            changed += i ? " OR " : "";
+            changed +=
+                name + "." + col +
+                (f->real_maybe_null() ? " IS DISTINCT FROM (" : " <> (") +
+                sets[i].second + ")";
         }
     }
     std::string filter = where;
     if (changed_only) {
         // Only rows whose value changes, which MariaDB counts as updated
         // (and leaves alone).
-        filter = (where.empty() ? "" : "(" + where + ") AND ") + "NOT (" +
-                 changed + ")";
+        filter =
+            (where.empty() ? "" : "(" + where + ") AND ") + "(" + changed + ")";
     }
     if (!filter.empty()) out += " WHERE " + filter;
     if (!guard->empty()) {
