@@ -6,6 +6,9 @@ part on the row-pump UPDATE / DELETE path.
 
 Expected values match InnoDB on the same statements."""
 
+import os
+import re
+
 import mysql.connector
 
 
@@ -126,3 +129,27 @@ INSERT INTO ck_drv VALUES (1, 2), (2, 1), (3, 5), (4, 4);
     _assert_errno(h, "the first UNIQUE is still enforced after ALTER",
                   "INSERT INTO ck VALUES (6, 6, 10, 'y', 9)", 1062,
                   key="uq_cd")
+
+    h.section("A composite secondary KEY is one stoolap index on all parts")
+    h.exec_script(f"""
+CREATE TABLE ckx (id INT NOT NULL PRIMARY KEY, x INT NOT NULL,
+                  y INT NOT NULL, KEY ix_xy (x, y)) ENGINE={h.engine};
+INSERT INTO ckx VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, 2, 2);
+""")
+    h.assert_scalar("composite KEY lookup",
+                    "SELECT id FROM ckx WHERE x = 2 AND y = 1", "3")
+    if h.engine == "STOOLAP" and h.errlog and os.path.exists(h.errlog):
+        with open(h.errlog, "r", errors="replace") as f:
+            start = len(f.read())
+        h.run_client(f"""
+USE {h.db};
+SET stoolap_explain_pushdown = 1;
+SELECT COUNT(*) FROM ckx WHERE x = 2 AND y = 1;
+""", use_db=False)
+        with open(h.errlog, "r", errors="replace") as f:
+            plan = f.read()[start:]
+        if re.search(r"CompositeIndex \S+ \(x =, y =\)", plan):
+            h._pass("stoolap probes the composite index on both parts")
+        else:
+            h._fail("no two-part CompositeIndex probe in the pushed plan",
+                    f"plan: {plan.strip()[-400:]}")

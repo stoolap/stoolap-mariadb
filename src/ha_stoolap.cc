@@ -1158,9 +1158,10 @@ int ha_stoolap::close() {
     return 0;
 }
 
-// Stoolap's CREATE INDEX is single-column only; composite KEY (a, b) gets
-// an index on the leading column (b filters per row). Without it, MariaDB
-// advertises an index with no physical backing and degrades to full scan.
+// One stoolap index per non-unique KEY, over all of its parts (stoolap
+// serves leading-part equality and ranges from a composite index too).
+// Without it, MariaDB advertises an index with no physical backing and
+// degrades to a full scan. UNIQUE / PRIMARY KEY are created inline.
 void create_secondary_indexes(StoolapDB* db, const std::string& tbl,
                               TABLE* form) {
     for (uint i = 0; i < form->s->keys; ++i) {
@@ -1168,28 +1169,24 @@ void create_secondary_indexes(StoolapDB* db, const std::string& tbl,
         KEY& k = form->key_info[i];
         if (k.flags & HA_NOSAME) continue;  // UNIQUE handled inline
         if (k.user_defined_key_parts == 0 || !k.key_part) continue;
-        Field* f = k.key_part[0].field;
-        const bool composite = k.user_defined_key_parts > 1;
         std::string idx_sql = "CREATE INDEX IF NOT EXISTS ";
         idx_sql +=
             quote_ident(tbl + "__" + std::string(k.name.str, k.name.length));
         idx_sql += " ON ";
         idx_sql += quote_ident(tbl);
         idx_sql += " (";
-        idx_sql += quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length));
+        for (uint j = 0; j < k.user_defined_key_parts; ++j) {
+            const Field* f = k.key_part[j].field;
+            if (j) idx_sql += ", ";
+            idx_sql += quote_ident(
+                std::string_view(f->field_name.str, f->field_name.length));
+        }
         idx_sql += ")";
         if (stoolap_exec(db, idx_sql.c_str(), nullptr) != STOOLAP_OK) {
             sql_print_warning(
                 "stoolap: failed to create index '%s': %s -- "
-                "queries on this column will full-scan",
+                "queries on this key will full-scan",
                 k.name.str, stoolap_errmsg(db));
-        } else if (composite) {
-            sql_print_information(
-                "stoolap: composite KEY '%s' indexed by leading column '%s' "
-                "(stoolap CREATE INDEX is single-column); trailing key "
-                "parts filter per row",
-                k.name.str, f->field_name.str);
         }
     }
 }

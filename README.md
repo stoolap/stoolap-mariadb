@@ -183,8 +183,8 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 | `CREATE TABLE` with BLOB / VARBINARY           | Partial (UTF-8 only)        |
 | `CREATE TABLE` with JSON                       | Yes (LONGTEXT route)        |
 | `DROP TABLE` / `RENAME TABLE` / `TRUNCATE`     | Yes |
-| `CREATE INDEX` (single-column)                 | Yes |
-| `KEY (a, b)` composite (uses leading column)   | Partial |
+| `CREATE INDEX` (single or multi-column)        | Yes |
+| `KEY (a, b)` composite                         | Yes (one stoolap index over all parts) |
 | `PRIMARY KEY` (single-column inline)           | Yes |
 | `PRIMARY KEY (a, b)` composite                 | Yes (enforced as a NOT NULL composite unique index) |
 | `UNIQUE` constraints (single-column)           | Yes |
