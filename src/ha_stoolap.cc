@@ -2986,9 +2986,9 @@ bool ha_stoolap::range_in_bounds() {
 // bounded only by the leading key part when that part is safe, and
 // read_range_next keeps the rows inside both bounds by MariaDB's own
 // comparison, reading to the end. With `sorted`, rows come in key order
-// over the safe parts, skipping an unsafe one only where the range holds
-// it constant (MariaDB relies on no order past it otherwise: index_flags
-// offers none).
+// over the parts index_flags offers order on, skipping one that offers
+// none only where it is constant (MariaDB relies on no order past it
+// otherwise).
 int ha_stoolap::read_range_filtered(const key_range* start_key,
                                     const key_range* end_key, bool sorted) {
     KEY& ki = table->key_info[active_index];
@@ -3053,12 +3053,18 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
         }
     }
     if (sorted) {
-        // The key's order as far as stoolap can give it: safe parts, and
-        // past an unsafe part only when the range holds it constant.
+        // The order index_flags promised: every part offering it, past
+        // one that does not only when that part is constant, by the
+        // bounds or by the WHERE (MariaDB's const_key_parts, which its
+        // ORDER BY check skips the same way).
+        const key_part_map where_const =
+            table->const_key_parts ? table->const_key_parts[active_index] : 0;
         bool first = true;
         for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
-            if (!part_safe(i)) {
-                if (i < const_prefix) continue;
+            if (!ki.key_part[i].field ||
+                !(index_flags(active_index, i, false) & HA_READ_ORDER)) {
+                if (i < const_prefix || (where_const & (key_part_map(1) << i)))
+                    continue;
                 break;
             }
             Field* f = ki.key_part[i].field;

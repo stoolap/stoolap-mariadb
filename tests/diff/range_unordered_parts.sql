@@ -32,3 +32,10 @@ INSERT INTO co VALUES (1, 1, _utf16le X'4100', 3), (2, 1, _utf16le X'4100', 1), 
                       (4, 2, _utf16le X'4100', 0), (5, 1, _utf16le X'0001', 0), (6, 1, _utf16le X'4100', 2);
 SELECT id, a, b FROM co FORCE INDEX (kacb) WHERE a IN (1, 2) AND c = _utf16le X'4100' ORDER BY a, b;
 SELECT id FROM co FORCE INDEX (kacb) WHERE a IN (1, 2) AND c = _utf16le X'4100' ORDER BY a, b LIMIT 2;
+-- One range (1, 'A')..(2, 'A'): c is constant by the WHERE, not by the bounds.
+SELECT id, a, b FROM co FORCE INDEX (kacb) WHERE a BETWEEN 1 AND 2 AND c = _utf16le X'4100' ORDER BY a, b;
+SELECT id FROM co FORCE INDEX (kacb) WHERE a BETWEEN 1 AND 2 AND c = _utf16le X'4100' ORDER BY a, b LIMIT 3;
+-- A PAD SPACE first part still orders the range.
+INSERT INTO cp VALUES (5, 'ab', _utf16le X'4100'), (6, 'b', _utf16le X'0001');
+SELECT a FROM cp FORCE INDEX (kac) WHERE a BETWEEN 'a' AND 'c' AND c = _utf16le X'4100' ORDER BY a;
+SELECT id FROM cp FORCE INDEX (kac) WHERE a BETWEEN 'a' AND 'c' AND c = _utf16le X'4100' ORDER BY a DESC LIMIT 2;
