@@ -161,6 +161,7 @@ private:
     int update_row_direct(const uchar* old_data, const uchar* new_data);
     int write_error(StoolapDB* db, const char* what);
     StoolapDB* direct_write_db();
+    bool key_row_id(const uchar* record, int64_t* id);
     size_t scan_buf_pos_ = 0;
     uint32_t scan_buf_cols_ = 0;
     uint32_t scan_buf_rows_left_ = 0;

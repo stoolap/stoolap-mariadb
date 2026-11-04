@@ -1506,7 +1506,11 @@ void ha_stoolap::start_bulk_insert(ha_rows rows, uint /*flags*/) {
 int ha_stoolap::end_bulk_insert() {
     if (!bulk_active_) return 0;
     bulk_active_ = false;
-    return flush_bulk_buffer();
+    const int err = flush_bulk_buffer();
+    // mysql_insert reports a failed end_bulk_insert by my_errno (with the
+    // duplicate key from get_dup_key), not by this return value.
+    if (err) my_errno = err;
+    return err;
 }
 
 int ha_stoolap::flush_bulk_buffer(bool partial) {
@@ -1849,6 +1853,8 @@ int ha_stoolap::update_row_direct(const uchar* old_data,
 
 int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
+    if (!cur_row_id_valid_)
+        cur_row_id_valid_ = key_row_id(old_data, &cur_row_id_);
     if (cur_row_id_valid_) {
         const int rc = update_row_direct(old_data, new_data);
         if (rc != -1) return rc;
@@ -1961,6 +1967,7 @@ int ha_stoolap::delete_row(const uchar* buf) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
 
     // The row the last read returned, by its row id.
+    if (!cur_row_id_valid_) cur_row_id_valid_ = key_row_id(buf, &cur_row_id_);
     if (cur_row_id_valid_) {
         StoolapDB* db = direct_write_db();
         if (!db) return HA_ERR_INTERNAL_ERROR;
@@ -2205,12 +2212,22 @@ std::string ha_stoolap::build_scan_columns() {
             scan_proj_[i] = i;
         return "*";
     }
+    // Plus the PRIMARY KEY, which MariaDB leaves out of read_set: a row a
+    // SQL read returns has no row id, so position(), update_row and
+    // delete_row take it from the key (see key_row_id).
+    TABLE_SHARE* share = table->s;
+    if (share->primary_key < share->keys) {
+        const KEY& pk = share->key_info[share->primary_key];
+        for (uint j = 0; j < pk.user_defined_key_parts; ++j) {
+            const uint i = pk.key_part[j].fieldnr - 1;
+            scan_proj_cols_[i / 32] |= uint32_t(1) << (i % 32);
+        }
+    }
 
     std::string cols;
     int proj_pos = 0;
     for (uint i = 0; i < table->s->fields; ++i) {
-        const bool need = bitmap_is_set(table->read_set, i) ||
-                          bitmap_is_set(table->write_set, i);
+        const bool need = scan_proj_cols_[i / 32] & (uint32_t(1) << (i % 32));
         if (!need) continue;
         scan_proj_[i] = proj_pos++;
         if (!cols.empty()) cols += ", ";
@@ -2530,14 +2547,35 @@ int ha_stoolap::rnd_pos(uchar* buf, uchar* pos) {
     return 0;
 }
 
+// The row id of the row in `record` when the last read gave none: a
+// single-column PRIMARY KEY, which stoolap only allows on an INTEGER
+// column, is the row id.
+bool ha_stoolap::key_row_id(const uchar* record, int64_t* id) {
+    TABLE_SHARE* share = table->s;
+    if (share->primary_key >= share->keys) return false;
+    const KEY& pk = share->key_info[share->primary_key];
+    if (pk.user_defined_key_parts != 1) return false;
+    Field* f = table->field[pk.key_part[0].fieldnr - 1];
+    const my_ptrdiff_t d = static_cast<my_ptrdiff_t>(record - table->record[0]);
+    f->move_field_offset(d);
+    StoolapValue v{};
+    std::string holder;
+    const bool ok = !f->is_null() && extract_field(f, v, holder) &&
+                    v.value_type == STOOLAP_TYPE_INTEGER;
+    f->move_field_offset(-d);
+    if (ok) *id = v.v.integer;
+    return ok;
+}
+
 void ha_stoolap::position(const uchar* record) {
-    // A row a direct read returned is named by its row id; one from a SQL
-    // read keeps its record.
-    // A row id alone names the row: the rest stays zero, so cmp_ref()
-    // finds two positions of one row equal.
-    if (cur_row_id_valid_) {
+    // A row is named by its row id, from the read or else from its key; a
+    // row with neither keeps its record. A row id alone names the row:
+    // the rest stays zero, so cmp_ref() finds two positions of one row
+    // equal.
+    int64_t id = cur_row_id_;
+    if (cur_row_id_valid_ || key_row_id(record, &id)) {
         ref[0] = 1;
-        std::memcpy(ref + 1, &cur_row_id_, sizeof(cur_row_id_));
+        std::memcpy(ref + 1, &id, sizeof(id));
         std::memset(ref + 9, 0, table->s->reclength);
         return;
     }
