@@ -146,6 +146,9 @@ private:
     bool branches(Item_func* f, Item** args, uint n);
     bool frame_bound(Window_frame_bound* b);
     bool binop(Item* a, const char* op, Item* b);
+    bool temporal_literal(Item* col, Item* k, const Type_handler* h,
+                          std::string* lit);
+    bool compare(Item_func* f, Item** a, const char* op);
     bool args_csv(Item** args, uint n);
 
     Cls cls(Item* it);
@@ -787,6 +790,84 @@ bool Gen::field(Item_field* f) {
     return true;
 }
 
+// A DATE / DATETIME or TIME column against a constant string, compared
+// the way MariaDB's comparator would (its compare type decides: a DATE
+// column against '2024-02-29 10:00' compares as DATETIME): the string
+// parsed with the comparison flags and packed like the column
+// (stoolap_types.h). Strings that parse with a warning, or to a date
+// with a zero part (sql_mode decides those), are left to MariaDB.
+bool Gen::temporal_literal(Item* col, Item* k, const Type_handler* h,
+                           std::string* lit) {
+    const Cls c = cls(col);
+    if ((c != Cls::DATETIME && c != Cls::TIME) || !h) return false;
+    if (!k->basic_const_item() || k->cmp_type() != STRING_RESULT ||
+        k->is_null())
+        return false;
+    bool want_time;
+    switch (h->field_type()) {
+        case MYSQL_TYPE_DATE:
+        case MYSQL_TYPE_NEWDATE:
+        case MYSQL_TYPE_DATETIME:
+        case MYSQL_TYPE_DATETIME2:
+            want_time = false;
+            break;
+        case MYSQL_TYPE_TIME:
+        case MYSQL_TYPE_TIME2:
+            want_time = true;
+            break;
+        default:
+            return false;
+    }
+    if (want_time != (c == Cls::TIME)) return false;
+    char buf[80];
+    String tmp(buf, sizeof(buf), &my_charset_bin);
+    const String* s = k->val_str(&tmp);
+    if (!s || !s->charset() || s->charset()->mbminlen != 1) return false;
+    MYSQL_TIME mt;
+    MYSQL_TIME_STATUS st;
+    my_time_status_init(&st);
+    if (want_time) {
+        if (str_to_datetime_or_date_or_time(s->ptr(), s->length(), &mt,
+                                            C_TIME_INVALID_DATES, &st,
+                                            TIME_MAX_HOUR, UINT_MAX32) ||
+            mt.time_type != MYSQL_TIMESTAMP_TIME)
+            return false;
+    } else {
+        if (str_to_datetime_or_date(s->ptr(), s->length(), &mt,
+                                    C_TIME_INVALID_DATES, &st) ||
+            !mt.year || !mt.month || !mt.day)
+            return false;
+    }
+    if (st.warnings || st.nanoseconds) return false;
+    *lit = std::to_string(static_cast<long long>(pack_time(&mt)));
+    return true;
+}
+
+bool Gen::compare(Item_func* f, Item** a, const char* op) {
+    // =, <>, <, <=, >, >= and <=> are all Item_bool_rowready_func2.
+    auto* bf = static_cast<Item_bool_func2*>(f);
+    std::string lit;
+    if (temporal_literal(a[0], a[1], bf->compare_type_handler(), &lit)) {
+        out.push_back('(');
+        if (!expr(a[0])) return false;
+        out += op;
+        out += lit;
+        out.push_back(')');
+        return true;
+    }
+    if (temporal_literal(a[1], a[0], bf->compare_type_handler(), &lit)) {
+        out.push_back('(');
+        out += lit;
+        out += op;
+        if (!expr(a[1])) return false;
+        out.push_back(')');
+        return true;
+    }
+    if (!comparable(a[0], a[1], bf->compare_collation()))
+        return fail("comparison");
+    return binop(a[0], op, a[1]);
+}
+
 bool Gen::binop(Item* a, const char* op, Item* b) {
     out.push_back('(');
     if (!expr(a)) return false;
@@ -851,20 +932,12 @@ bool Gen::func(Item_func* f) {
                           : f->functype() == Item_func::LE_FUNC ? 3
                           : f->functype() == Item_func::GT_FUNC ? 4
                                                                 : 5;
-            if (n != 2 ||
-                !comparable(
-                    a[0], a[1],
-                    static_cast<Item_bool_func*>(f)->compare_collation()))
-                return fail("comparison");
-            return binop(a[0], ops[i], a[1]);
+            if (n != 2) return fail("comparison");
+            return compare(f, a, ops[i]);
         }
         case Item_func::EQUAL_FUNC:  // <=>
-            if (n != 2 ||
-                !comparable(
-                    a[0], a[1],
-                    static_cast<Item_bool_func*>(f)->compare_collation()))
-                return fail("<=>");
-            return binop(a[0], " IS NOT DISTINCT FROM ", a[1]);
+            if (n != 2) return fail("<=>");
+            return compare(f, a, " IS NOT DISTINCT FROM ");
         case Item_func::ISNULL_FUNC:
         case Item_func::ISNOTNULL_FUNC:
             if (n != 1) return fail("IS NULL");

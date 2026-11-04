@@ -25,11 +25,27 @@ SELECT id FROM tt WHERE d < d2 ORDER BY id;
 SELECT MIN(d), MAX(d), MIN(dt), MAX(dt), MIN(tm), MAX(tm), MIN(ts), MAX(ts) FROM tt;
 SELECT d2, COUNT(*) FROM tt GROUP BY d2 ORDER BY d2;
 SELECT COUNT(DISTINCT d2) FROM tt;
--- String constants compare by MariaDB's rules (left to MariaDB).
+-- String constants compare by MariaDB's rules: a DATE against a time of
+-- day compares as DATETIME. Pushed when they parse cleanly.
 SELECT id FROM tt WHERE d >= '2024-01-01' ORDER BY id;
-SELECT id FROM tt WHERE dt BETWEEN '2024-02-29' AND '2024-03-01' ORDER BY id;
+SELECT id FROM tt WHERE d = '2024-2-29' ORDER BY id;
+SELECT id FROM tt WHERE d = '20240229' ORDER BY id;
+SELECT id FROM tt WHERE d = '2024-02-29 10:00:00' ORDER BY id;
+SELECT id FROM tt WHERE d < '2024-02-29 10:00:00' ORDER BY id;
+SELECT id FROM tt WHERE '2024-03-01' > dt ORDER BY id;
+SELECT id FROM tt WHERE dt = '2024-02-29 23:59:59.999999' ORDER BY id;
+SELECT id FROM tt WHERE dt > '2024-02-29 23:59:59.9999995' ORDER BY id;
+SELECT id FROM tt WHERE dt <=> '1000-01-01' ORDER BY id;
 SELECT id FROM tt WHERE tm < '00:00:00' ORDER BY id;
+SELECT id FROM tt WHERE tm > '1 10:00:00' ORDER BY id;
+SELECT id FROM tt WHERE tm = '-838:59:59' ORDER BY id;
+SELECT id FROM tt WHERE tm < '2024-01-01 10:00:00' ORDER BY id;
+-- Left to MariaDB: BETWEEN, TIMESTAMP, warnings, zero dates, numbers.
+SELECT id FROM tt WHERE dt BETWEEN '2024-02-29' AND '2024-03-01' ORDER BY id;
 SELECT id FROM tt WHERE ts > '2000-01-01' ORDER BY id;
+SELECT id FROM tt WHERE d = 'garbage' ORDER BY id;
+SELECT id FROM tt WHERE d > '0000-00-00' ORDER BY id;
+SELECT id FROM tt WHERE d = 20240229 ORDER BY id;
 -- Index lookups and ranges through the handler (an InnoDB driver).
 CREATE TABLE drv (k INT NOT NULL PRIMARY KEY, d DATE, tm TIME(3)) ENGINE=InnoDB;
 INSERT INTO drv VALUES (1, '2024-02-29', '-838:59:59'), (2, '9999-12-31', '838:59:59.999'), (3, NULL, NULL);
