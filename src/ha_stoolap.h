@@ -207,13 +207,16 @@ private:
         uint index = MAX_KEY;
         int find_flag = -1;
         uint nparts = 0;
-        uint32_t null_mask = 0;
+        uint32_t null_mask = 0;     // part IS NULL
+        uint32_t notnull_mask = 0;  // part IS NOT NULL
+        uint32_t skip_mask = 0;     // no predicate on the part
         uint32_t filter_mask = 0;
         bool order = false;
         std::vector<uint32_t> cols;
         bool operator==(const IndexReadShape& o) const {
             return index == o.index && find_flag == o.find_flag &&
                    nparts == o.nparts && null_mask == o.null_mask &&
+                   notnull_mask == o.notnull_mask && skip_mask == o.skip_mask &&
                    filter_mask == o.filter_mask && order == o.order &&
                    cols == o.cols;
         }

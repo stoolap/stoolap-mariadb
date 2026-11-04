@@ -2419,6 +2419,35 @@ int ha_stoolap::index_end() {
     return 0;
 }
 
+namespace {
+
+// A key value stoolap holds no row for: NULL, or a BIGINT UNSIGNED above
+// INT64_MAX (the writer refuses those). What a bound on it selects, in
+// MariaDB's index order, where NULLs come first.
+enum class Beyond { NONE, IS_NULL, NOT_NULL, ALL };
+
+bool unsigned_beyond_i64(Field* f) {
+    return f->real_type() == MYSQL_TYPE_LONGLONG && f->is_unsigned() &&
+           !f->is_null() && f->val_int() < 0;
+}
+
+Beyond bound_beyond(const char* op, bool is_null) {
+    const bool eq = op[0] == '=' && op[1] == '\0';
+    const bool upper = op[0] == '<';
+    const bool inclusive = op[1] == '=' || eq;
+    if (is_null) {
+        // Before every value: = and <= keep the NULLs, > keeps the rest,
+        // >= keeps all, < nothing.
+        if (eq) return Beyond::IS_NULL;
+        if (upper) return inclusive ? Beyond::IS_NULL : Beyond::NONE;
+        return inclusive ? Beyond::ALL : Beyond::NOT_NULL;
+    }
+    // After every stored value: < and <= keep all, the rest nothing.
+    return upper ? Beyond::ALL : Beyond::NONE;
+}
+
+}  // namespace
+
 int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
                                key_part_map keypart_map,
                                enum ha_rkey_function find_flag) {
@@ -2488,19 +2517,28 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     }
 
     // Bind the key values; the SQL text depends only on the shape below.
-    uint32_t null_mask = 0;
+    uint32_t null_mask = 0, notnull_mask = 0, skip_mask = 0;
     {
         for (uint i = 0; i < nparts; ++i) {
             if (filter_mask & (uint32_t(1) << i)) continue;
             Field* f = key_info.key_part[i].field;
-            if (f->is_null()) {
-                // NULL with range op = no rows; equality uses IS NULL.
-                const bool is_last = (i == nparts - 1);
-                if (is_last && std::strcmp(last_op, "=") != 0) {
-                    move_fields(table, -d);
-                    return HA_ERR_KEY_NOT_FOUND;
+            const char* op = (i == nparts - 1) ? last_op : "=";
+            const uint32_t bit = uint32_t(1) << i;
+            if (f->is_null() || unsigned_beyond_i64(f)) {
+                switch (bound_beyond(op, f->is_null())) {
+                    case Beyond::NONE:
+                        move_fields(table, -d);
+                        return HA_ERR_KEY_NOT_FOUND;
+                    case Beyond::IS_NULL:
+                        null_mask |= bit;
+                        break;
+                    case Beyond::NOT_NULL:
+                        notnull_mask |= bit;
+                        break;
+                    case Beyond::ALL:
+                        skip_mask |= bit;
+                        break;
                 }
-                null_mask |= uint32_t(1) << i;
                 continue;
             }
             StoolapValue v{};
@@ -2527,6 +2565,8 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     shape.find_flag = static_cast<int>(find_flag);
     shape.nparts = nparts;
     shape.null_mask = null_mask;
+    shape.notnull_mask = notnull_mask;
+    shape.skip_mask = skip_mask;
     shape.filter_mask = filter_mask;
     shape.order = need_order;
     shape.cols = projection_words();
@@ -2539,14 +2579,19 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
             int next_param = 1;
             bool first = true;
             for (uint i = 0; i < nparts; ++i) {
-                if (filter_mask & (uint32_t(1) << i)) continue;
+                const uint32_t bit = uint32_t(1) << i;
+                if ((filter_mask | skip_mask) & bit) continue;
                 Field* f = key_info.key_part[i].field;
                 sql += first ? " WHERE " : " AND ";
                 first = false;
                 sql += quote_ident(
                     std::string_view(f->field_name.str, f->field_name.length));
-                if (null_mask & (uint32_t(1) << i)) {
+                if (null_mask & bit) {
                     sql += " IS NULL";
+                    continue;
+                }
+                if (notnull_mask & bit) {
+                    sql += " IS NOT NULL";
                     continue;
                 }
                 sql.push_back(' ');
@@ -2883,19 +2928,25 @@ int ha_stoolap::read_range_first(const key_range* start_key,
             Field* f = key_info.key_part[i].field;
             const bool is_last = (i == nparts - 1);
             const char* op = is_last ? last_op : "=";
+            Beyond beyond = Beyond::NONE;
+            const bool special = f->is_null() || unsigned_beyond_i64(f);
+            if (special) {
+                beyond = bound_beyond(op, f->is_null());
+                if (beyond == Beyond::NONE) {
+                    move_fields(table, -d);
+                    return HA_ERR_KEY_NOT_FOUND;
+                }
+                if (beyond == Beyond::ALL) continue;
+            }
 
             sql += any_pred ? " AND " : " WHERE ";
             any_pred = true;
 
             sql += quote_ident(
                 std::string_view(f->field_name.str, f->field_name.length));
-            if (f->is_null()) {
-                if (op[0] == '=' && op[1] == '\0') {
-                    sql += " IS NULL";
-                    continue;
-                }
-                move_fields(table, -d);
-                return HA_ERR_KEY_NOT_FOUND;
+            if (special) {
+                sql += beyond == Beyond::IS_NULL ? " IS NULL" : " IS NOT NULL";
+                continue;
             }
             StoolapValue v{};
             text_holders.emplace_back();
