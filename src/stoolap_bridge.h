@@ -168,7 +168,7 @@ const char* status_label(int32_t code);
 struct PushdownStats {
     std::atomic<uint64_t> pushdown_hits{0};
     std::atomic<uint64_t> pushdown_misses{0};
-    std::atomic<uint64_t> buffered_scans{0};  // rnd_init via fetch_all
+    std::atomic<uint64_t> buffered_scans{0};  // direct reads (stoolap_read)
     std::atomic<uint64_t> buffered_rows{0};
     std::atomic<uint64_t> direct_modify_hits{0};
     // cached_records() miss that ran a live COUNT(*).
