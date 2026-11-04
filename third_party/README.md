@@ -8,8 +8,8 @@ include cascade) transitively requires.
 ## wsrep-lib/
 
 Source: <https://github.com/codership/wsrep-lib> commit
-`7010f0ab584ab9cdebb285272a0fb0ff0a5a791d` (the commit pinned by MariaDB
-11.4.10).
+`5eeef4009d52455c44b607e852cb23fbb6e84c99` (the commit pinned by MariaDB
+11.4.13).
 
 License: GPL-2.0 (see `wsrep-lib/COPYING` and `wsrep-lib/LICENSE`).
 
