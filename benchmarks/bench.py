@@ -125,6 +125,11 @@ SECTIONS = [
         "HAVING complex",
         "Compare with subquery",
     ]),
+    ("ROW PUMP (handler API)", [
+        "Mixed JOIN eq_ref (1000 lookups)",
+        "Mixed JOIN ref (1000 lookups)",
+        "UPDATE row-pump (100 rows)",
+    ]),
 ]
 
 
@@ -586,6 +591,30 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
     b("Compare with subquery",
       f"SELECT * FROM {users} WHERE balance > "
       f"(SELECT AVG(amount) * 100 FROM {orders}) LIMIT 100")
+
+    # ---- row pump ----
+    # An InnoDB driver joined to the measured table keeps MariaDB from
+    # pushing the statement, so each outer row is one handler
+    # index_read; a MariaDB-only function in WHERE does the same for
+    # UPDATE (update_row per matched row).
+    drv = f"drv_{suffix}"
+    cur.execute(f"CREATE TABLE {drv} (k INT NOT NULL PRIMARY KEY) "
+                "ENGINE=InnoDB")
+    cur.executemany(f"INSERT INTO {drv} VALUES (%s)",
+                    [(i,) for i in range(1, 1001)])
+    b("Mixed JOIN eq_ref (1000 lookups)",
+      f"SELECT SUM(u.age) FROM {drv} d JOIN {users} u ON u.id = d.k",
+      iters=iters_med)
+    b("Mixed JOIN ref (1000 lookups)",
+      f"SELECT COUNT(*) FROM {drv} d JOIN {orders} o ON o.user_id = d.k",
+      iters=iters_heav)
+    b("UPDATE row-pump (100 rows)",
+      f"UPDATE {users} SET balance = balance + 1 "
+      f"WHERE id BETWEEN %s AND %s AND SHA1(name) <> ''",
+      params_seq=[(s0, s0 + 99) for s0 in
+                  ((i * 100) % (args.rows - 100) + 1
+                   for i in range(iters_med))],
+      iters=iters_med, fetch=False)
 
     cur.close()
     c.close()
