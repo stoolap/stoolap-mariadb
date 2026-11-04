@@ -91,6 +91,15 @@ inline Enc field_enc(const Field* f) {
     }
 }
 
+// Whether a hex-stored column's stoolap order (its bytes) is MariaDB's:
+// true for binary strings and single-byte character sets, whose _bin
+// collations compare bytes; a multi-byte one (utf16le_bin, ...) compares
+// code points. Equality holds either way.
+inline bool hex_keeps_order(const Field* f) {
+    const CHARSET_INFO* cs = f->charset();
+    return !cs || cs == &my_charset_bin || cs->mbmaxlen == 1;
+}
+
 inline enum_mysql_timestamp_type packed_time_type(const Field* f) {
     switch (f->real_type()) {
         case MYSQL_TYPE_TIME:

@@ -125,3 +125,14 @@ SELECT id FROM tt2 WHERE tm BETWEEN TIMESTAMP '2000-01-01 10:00:00' AND TIMESTAM
 SELECT id FROM tt2 WHERE tm BETWEEN TIME '10:00:00' AND TIME '12:00:00' ORDER BY id;
 SELECT id FROM tt2 WHERE d BETWEEN TIME '10:00:00' AND TIME '12:00:00' ORDER BY id;
 SELECT id FROM tt2 WHERE d BETWEEN DATE '2000-01-01' AND TIMESTAMP '2000-01-01 00:00:00' ORDER BY id;
+
+-- A multi-byte _bin collation compares code points, not stored bytes:
+-- utf16le 'A' (41 00) sorts before U+0100 (00 01). Equality still pushes.
+CREATE TABLE tu (id INT NOT NULL PRIMARY KEY,
+                 c VARCHAR(2) CHARACTER SET utf16le COLLATE utf16le_bin,
+                 KEY kc (c)) ENGINE={E};
+INSERT INTO tu VALUES (1, _utf16le X'4100'), (2, _utf16le X'0001'), (3, _utf16le X'4200');
+SELECT id FROM tu FORCE INDEX (kc) WHERE c < _utf16le X'0001' ORDER BY id;
+SELECT id FROM tu FORCE INDEX (kc) WHERE c > _utf16le X'4100' ORDER BY id;
+SELECT HEX(c) FROM tu FORCE INDEX (kc) ORDER BY c;
+SELECT id FROM tu WHERE c = _utf16le X'0001';

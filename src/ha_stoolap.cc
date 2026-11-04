@@ -1110,6 +1110,12 @@ ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
                 case MYSQL_TYPE_BLOB:
                 case MYSQL_TYPE_MEDIUM_BLOB:
                 case MYSQL_TYPE_LONG_BLOB: {
+                    // A hex-stored multi-byte charset orders by code point
+                    // in MariaDB, by byte in stoolap (stoolap_types.h).
+                    if (stoolap_mariadb::field_enc(f) ==
+                            stoolap_mariadb::Enc::HEX &&
+                        !stoolap_mariadb::hex_keeps_order(f))
+                        return 0;
                     CHARSET_INFO* cs = f->charset();
                     if (cs && (cs->state & MY_CS_BINSORT)) {
                         return HA_READ_NEXT | HA_READ_RANGE | HA_READ_ORDER |
@@ -2682,6 +2688,10 @@ int ha_stoolap::read_range_first(const key_range* start_key,
                 case MYSQL_TYPE_BLOB:
                 case MYSQL_TYPE_MEDIUM_BLOB:
                 case MYSQL_TYPE_LONG_BLOB: {
+                    if (stoolap_mariadb::field_enc(f) ==
+                            stoolap_mariadb::Enc::HEX &&
+                        !stoolap_mariadb::hex_keeps_order(f))
+                        return true;
                     CHARSET_INFO* cs = f->charset();
                     if (cs && (cs->state & MY_CS_BINSORT)) break;
                     return true;
