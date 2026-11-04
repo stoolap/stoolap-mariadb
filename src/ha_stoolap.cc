@@ -909,8 +909,11 @@ std::string prefix_unique_part(TABLE* form) {
     return std::string();
 }
 
-std::string build_create_sql(const std::string& table_name, TABLE* form,
-                             bool if_not_exists) {
+// Unique keys stoolap cannot enforce as declared. Checked for new
+// definitions only (create(), which CREATE TABLE and every ALTER TABLE
+// go through): open()'s reconcile must still open a table created before
+// a rule existed, so it can be read and fixed with ALTER TABLE.
+bool refuse_unenforceable_keys(TABLE* form) {
     if (std::string bad = prefix_unique_part(form); !bad.empty()) {
         my_printf_error(ER_GET_ERRMSG,
                         "stoolap: PRIMARY KEY / UNIQUE %s covers a column "
@@ -918,7 +921,7 @@ std::string build_create_sql(const std::string& table_name, TABLE* form,
                         "column values. Key the whole column, or drop the "
                         "constraint.",
                         MYF(0), bad.c_str());
-        return std::string();
+        return true;
     }
     // Refuse ci PK/UNIQUE up front: silent acceptance of case-different
     // duplicates is worse than failing at CREATE.
@@ -930,9 +933,13 @@ std::string build_create_sql(const std::string& table_name, TABLE* form,
                         "utf8mb4_bin) on the column, or drop the "
                         "constraint.",
                         MYF(0), bad.c_str());
-        return std::string();
+        return true;
     }
+    return false;
+}
 
+std::string build_create_sql(const std::string& table_name, TABLE* form,
+                             bool if_not_exists) {
     // A single-column PRIMARY KEY is emitted inline; a composite one goes
     // first among the table-level constraints, which stoolap enforces as a
     // NOT NULL unique index (numbering: see unique_key_by_ordinal).
@@ -1161,6 +1168,16 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
         StoolapDB* d = (ctx && ctx->db()) ? ctx->db() : db_ensure();
         if (!d) return HA_ERR_OUT_OF_MEM;
 
+        // A table created before refuse_unenforceable_keys gained a rule
+        // still opens (to be read, and fixed with ALTER TABLE), but its
+        // key is enforced on whole column values only.
+        if (std::string bad = prefix_unique_part(table); !bad.empty()) {
+            sql_print_warning(
+                "stoolap: table '%s' has PRIMARY KEY / UNIQUE %s over a "
+                "column prefix; stoolap enforces it on whole column values. "
+                "ALTER TABLE ... DROP INDEX it, or key the whole column.",
+                stoolap_table_.c_str(), bad.c_str());
+        }
         std::string sql = build_create_sql(stoolap_table_, table,
                                            /*if_not_exists=*/true);
         if (sql.empty()) return HA_ERR_UNSUPPORTED;
@@ -1234,6 +1251,7 @@ StoolapDB* ha_stoolap::ddl_db() {
 int ha_stoolap::create(const char* name, TABLE* form,
                        HA_CREATE_INFO* /*info*/) {
     const std::string tbl = stoolap_table_from_path(name);
+    if (refuse_unenforceable_keys(form)) return HA_ERR_UNSUPPORTED;
     std::string sql = build_create_sql(tbl, form, /*if_not_exists=*/false);
     if (sql.empty()) return HA_ERR_UNSUPPORTED;
 
