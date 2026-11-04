@@ -37,10 +37,12 @@ public:
 
     int begin(int32_t isolation = STOOLAP_ISOLATION_READ_COMMITTED);
 
-    // Ends the read transaction direct reads opened outside a transaction
-    // (stoolap_read); called at the end of every statement.
-    void end_statement() {
-        if (db_) stoolap_end_statement(db_.get());
+    // Ends the statement's direct access, committing (or rolling back) the
+    // transaction direct reads and writes opened outside an open one;
+    // called at the end of every statement.
+    int end_statement(bool commit) {
+        return db_ ? stoolap_end_statement(db_.get(), commit ? 1 : 0)
+                   : STOOLAP_OK;
     }
     int commit();
     int rollback();

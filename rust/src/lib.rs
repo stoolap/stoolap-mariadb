@@ -14,3 +14,4 @@
 pub mod ffi;
 pub mod read;
 pub mod session;
+pub mod write;

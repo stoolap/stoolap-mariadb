@@ -67,12 +67,13 @@ public:
     int pre_direct_delete_rows_init() override;
     int pre_direct_delete_rows() override;
 
-    // Bulk INSERT: accumulate write_row params into one packed batch
-    // shipped via stoolap_stmt_exec_batch (one FFI call, one tx).
+    // Bulk INSERT: accumulate write_row params into one batch, inserted
+    // directly in one call (stoolap_stmt_exec_batch for a table a foreign
+    // key names).
     void start_bulk_insert(ha_rows rows, uint flags) override;
     int end_bulk_insert() override;
     // Eager flush at kBulkFlushRows threshold; bulk_active_ stays true.
-    int flush_bulk_buffer();
+    int flush_bulk_buffer(bool partial = false);
     int analyze(THD* thd, HA_CHECK_OPT* check_opt) override;
 
     int rnd_init(bool scan) override;
@@ -149,6 +150,17 @@ private:
     int next_chunk();
     const uint8_t* pkt_ = nullptr;
     size_t pkt_len_ = 0;
+    // stoolap's row id of the row the last read returned, which
+    // update_row / delete_row / position name it by. Not valid after a
+    // streaming SQL read, which has none.
+    int64_t cur_row_id_ = 0;
+    bool cur_row_id_valid_ = false;
+    // Direct writes; -1 for a table a foreign key names (write via SQL).
+    int insert_direct(const StoolapValue* values, int32_t nrows,
+                      int64_t* affected);
+    int update_row_direct(const uchar* old_data, const uchar* new_data);
+    int write_error(StoolapDB* db, const char* what);
+    StoolapDB* direct_write_db();
     size_t scan_buf_pos_ = 0;
     uint32_t scan_buf_cols_ = 0;
     uint32_t scan_buf_rows_left_ = 0;

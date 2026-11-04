@@ -313,12 +313,13 @@ it. Tables created by an older build must be re-created.
 
 ## Known limitations
 
-- **`rnd_pos` over BLOB/TEXT tables**: any plan that takes the
-  filesort + rowid-sort path (e.g. `UPDATE ... ORDER BY n LIMIT 2`)
-  fails loudly with a clear error rather than corrupting the row,
-  because the BLOB Field's in-record bytes are a (length, ptr) trio
-  and restoring them blindly would resurrect a freed pointer. Plain
-  WHERE-driven UPDATE/DELETE on BLOB tables works.
+- **Rows read through SQL have no row id.** The handler reads, writes
+  and re-reads rows directly, by stoolap's row id, except the ordered
+  reads `index_first` / `index_last` / `read_range_first`, which still
+  run SQL. A row they return is updated or deleted by its PRIMARY KEY
+  (refused on a table without one), and re-read by position from its
+  record bytes, which is refused on a BLOB/TEXT table (the record's
+  BLOB pointer would be stale).
 - **Composite `PRIMARY KEY` / `UNIQUE` / `FOREIGN KEY` are refused at
   `CREATE TABLE`.** Stoolap enforces single-column constraints only, so
   silently accepting a multi-column constraint would let duplicates
@@ -339,14 +340,10 @@ it. Tables created by an older build must be re-created.
   drop the constraint. Non-unique secondary keys on ci-string columns
   are allowed; the byte-wise stoolap index is just a best-effort access
   hint, not a uniqueness contract.
-- **Row-pump `UPDATE`/`DELETE` on no-PK tables is refused.** Stoolap
-  has no stable row-id and its `UPDATE/DELETE` grammar has no `LIMIT`,
-  so a fingerprint-by-all-columns WHERE could over-mutate byte-identical
-  duplicates when MariaDB's filesort+LIMIT path calls `update_row` per
-  logical row. Add a single-column `PRIMARY KEY`, or write the
-  statement so the WHERE alone selects the rows -- the direct DML hook
-  (`cond_push` -> stoolap WHERE) handles that case as one engine-side
-  query.
+- **Tables a `FOREIGN KEY` names are written through SQL.** Stoolap's
+  executor checks foreign keys, so the handler's inserts, updates and
+  deletes on a child or parent table go through it, one statement per
+  row, each committed on its own outside an explicit transaction.
 - **`ALTER TABLE AUTO_INCREMENT = N` is not propagated.** The plugin
   recomputes the next value from `MAX(col)+1` per connection, with a
   cross-connection epoch invalidating on TRUNCATE/DROP/RENAME.

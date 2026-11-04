@@ -27,6 +27,7 @@ mod statement;
 mod transaction;
 mod types;
 mod value;
+mod write;
 
 // Re-export all extern "C" functions
 pub use database::*;
@@ -38,6 +39,7 @@ pub use types::{
     StoolapBlobData, StoolapDB, StoolapRows, StoolapStmt, StoolapTextData, StoolapTx, StoolapValue,
     StoolapValueData,
 };
+pub use write::*;
 
 // Status codes
 pub const STOOLAP_OK: i32 = 0;

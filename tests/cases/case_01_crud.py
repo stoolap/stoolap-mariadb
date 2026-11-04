@@ -58,31 +58,26 @@ CREATE TABLE t (
     h.assert_ok("drop t2",         "DROP TABLE t2")
     h.assert_ok("drop IF EXISTS no-op", "DROP TABLE IF EXISTS noexist")
 
-    h.section("No-PK row-pump UPDATE/DELETE refused")
-    # Stoolap has no stable row-id, and its UPDATE/DELETE grammar has
-    # no LIMIT clause. append_where_for_row used to identify a row by
-    # every column value when no usable single-column PK existed; with
-    # byte-identical duplicates that WHERE matched every duplicate, so
-    # MariaDB's filesort+LIMIT path (UPDATE/DELETE ... ORDER BY ...
-    # LIMIT N) called update_row/delete_row N times and stoolap
-    # over-mutated every duplicate per call. Fix: refuse the row-pump
-    # path when no usable PK is available, with a clear error pointing
-    # users at the workarounds (add a PK; rewrite as direct DML).
+    h.section("No-PK row-pump UPDATE/DELETE by row id")
+    # A table without a usable PRIMARY KEY names each row by stoolap's
+    # row id: MariaDB's filesort+LIMIT path (UPDATE/DELETE ... ORDER BY
+    # ... LIMIT N) changes exactly N rows, even among byte-identical
+    # duplicates.
     h.exec_script(f"""
 CREATE TABLE nopk (a INT NOT NULL, b INT NOT NULL) ENGINE={h.engine};
 INSERT INTO nopk VALUES (1,10),(1,10),(2,20);
 """)
-    h.assert_err("UPDATE ... ORDER BY LIMIT refused on no-PK",
-                 "UPDATE nopk SET b = b + 100 ORDER BY a LIMIT 1",
-                 r"row-pump UPDATE/DELETE.*PRIMARY KEY")
-    # Refused statement must NOT have mutated any rows.
-    h.assert_scalar("no-PK refusal left rows unchanged",
-                    "SELECT COUNT(*) FROM nopk WHERE b = 10", "2")
-    h.assert_err("DELETE ... ORDER BY LIMIT refused on no-PK",
-                 "DELETE FROM nopk ORDER BY a LIMIT 1",
-                 r"row-pump UPDATE/DELETE.*PRIMARY KEY")
-    h.assert_scalar("no-PK DELETE refusal left rows unchanged",
-                    "SELECT COUNT(*) FROM nopk", "3")
+    h.assert_ok("UPDATE ... ORDER BY LIMIT on no-PK",
+                "UPDATE nopk SET b = b + 100 ORDER BY a LIMIT 1")
+    h.assert_scalar("one duplicate updated",
+                    "SELECT COUNT(*) FROM nopk WHERE b = 110", "1")
+    h.assert_scalar("the other duplicate kept",
+                    "SELECT COUNT(*) FROM nopk WHERE b = 10", "1")
+    h.assert_ok("DELETE ... ORDER BY LIMIT on no-PK",
+                "DELETE FROM nopk ORDER BY a LIMIT 1")
+    h.assert_scalar("one row deleted", "SELECT COUNT(*) FROM nopk", "2")
+    h.assert_scalar("of the a = 1 rows",
+                    "SELECT COUNT(*) FROM nopk WHERE a = 1", "1")
     # Direct DML (WHERE-only, no ORDER BY/LIMIT) still works.
     h.assert_ok("WHERE-only UPDATE on no-PK still works (direct path)",
                 "UPDATE nopk SET b = 999 WHERE a = 2")

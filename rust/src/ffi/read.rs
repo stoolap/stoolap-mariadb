@@ -59,6 +59,42 @@ unsafe fn positions(ptr: *const i32, len: i32) -> Result<Vec<usize>> {
         .collect()
 }
 
+pub(crate) unsafe fn table_name<'a>(table: *const c_char) -> Result<&'a str> {
+    if table.is_null() {
+        return Err(Error::internal("table name is NULL"));
+    }
+    CStr::from_ptr(table)
+        .to_str()
+        .map_err(|e| Error::internal(format!("invalid UTF-8 in table name: {}", e)))
+}
+
+/// Hands out the cursor `result` opened, or records its error on `handle`
+unsafe fn finish_open(
+    handle: &mut StoolapDB,
+    result: std::thread::Result<Result<Cursor>>,
+    out: *mut *mut StoolapCursor,
+    what: &str,
+) -> i32 {
+    match result {
+        Ok(Ok(cursor)) => {
+            *out = Box::into_raw(Box::new(StoolapCursor {
+                cursor,
+                packed: Vec::new(),
+                last_error: None,
+            }));
+            STOOLAP_OK
+        }
+        Ok(Err(e)) => {
+            handle.set_error(&e.to_string());
+            STOOLAP_ERROR
+        }
+        Err(_) => {
+            handle.set_error(&format!("panic during {}", what));
+            STOOLAP_ERROR
+        }
+    }
+}
+
 /// Opens a read of `table`, in the open transaction or else in a read
 /// transaction of the statement's own, which `stoolap_end_statement` ends:
 /// the rows meeting every
@@ -93,12 +129,7 @@ pub unsafe extern "C" fn stoolap_read(
     handle.last_error = None;
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| -> Result<Cursor> {
-        if table.is_null() {
-            return Err(Error::internal("table name is NULL"));
-        }
-        let name = CStr::from_ptr(table)
-            .to_str()
-            .map_err(|e| Error::internal(format!("invalid UTF-8 in table name: {}", e)))?;
+        let name = table_name(table)?;
         let columns = positions(columns, ncolumns)?;
         let order = positions(order, norder)?;
         let mut cond_list = Vec::with_capacity(nconds.max(0) as usize);
@@ -130,42 +161,77 @@ pub unsafe extern "C" fn stoolap_read(
         };
         handle.session.with_table(name, |t| Cursor::open(t, spec))
     }));
-
-    match result {
-        Ok(Ok(cursor)) => {
-            *out = Box::into_raw(Box::new(StoolapCursor {
-                cursor,
-                packed: Vec::new(),
-                last_error: None,
-            }));
-            STOOLAP_OK
-        }
-        Ok(Err(e)) => {
-            handle.set_error(&e.to_string());
-            STOOLAP_ERROR
-        }
-        Err(_) => {
-            handle.set_error("panic during stoolap_read");
-            STOOLAP_ERROR
-        }
-    }
+    finish_open(handle, result, out, "stoolap_read")
 }
 
-/// Ends the read transaction direct reads opened outside a transaction;
-/// called at the end of each MariaDB statement. Cursors must be closed.
+/// Ends the statement's direct access, and the transaction it opened
+/// outside an open one: committed when `commit`, else rolled back. Called
+/// at the end of each MariaDB statement, with its cursors closed. A failed
+/// commit rolls back and reports to `stoolap_errmsg(db)`.
 ///
 /// # Safety
 ///
 /// `db` must be a valid `StoolapDB` pointer or NULL.
 #[no_mangle]
-pub unsafe extern "C" fn stoolap_end_statement(db: *mut StoolapDB) {
-    if let Some(handle) = db.as_ref() {
-        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| handle.session.end_statement()));
+pub unsafe extern "C" fn stoolap_end_statement(db: *mut StoolapDB, commit: i32) -> i32 {
+    let Some(handle) = db.as_mut() else {
+        return STOOLAP_OK;
+    };
+    handle.last_error = None;
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        handle.session.end_statement(commit != 0)
+    }));
+    match result {
+        Ok(Ok(())) => STOOLAP_OK,
+        Ok(Err(e)) => {
+            handle.set_error(&e.to_string());
+            STOOLAP_ERROR
+        }
+        Err(_) => {
+            handle.set_error("panic during stoolap_end_statement");
+            STOOLAP_ERROR
+        }
     }
 }
 
+/// Opens a read of row `row_id` of `table`, carrying `columns`: no row
+/// when it is not visible. As `stoolap_read` otherwise.
+///
+/// # Safety
+///
+/// As `stoolap_read`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_read_row(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    table_columns: i32,
+    columns: *const i32,
+    ncolumns: i32,
+    row_id: i64,
+    out: *mut *mut StoolapCursor,
+) -> i32 {
+    if out.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out = std::ptr::null_mut();
+    let Some(handle) = db.as_mut() else {
+        return STOOLAP_ERROR;
+    };
+    handle.last_error = None;
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| -> Result<Cursor> {
+        let name = table_name(table)?;
+        let columns = positions(columns, ncolumns)?;
+        let table_columns = usize::try_from(table_columns).unwrap_or(usize::MAX);
+        handle
+            .session
+            .with_table(name, |t| Cursor::by_id(t, table_columns, &columns, row_id))
+    }));
+    finish_open(handle, result, out, "stoolap_read_row")
+}
+
 /// Packs the cursor's next rows, at most `max_rows`, in the
-/// `stoolap_rows_fetch_all` format (column names empty). The buffer stays
+/// `stoolap_rows_fetch_all` format (column names empty), each row's id
+/// as a last INTEGER cell. The buffer stays
 /// the cursor's, valid until the next fetch or close. Returns
 /// `STOOLAP_ROW` with at least one row, `STOOLAP_DONE` at the end.
 ///
@@ -194,12 +260,14 @@ pub unsafe extern "C" fn stoolap_cursor_fetch(
         let StoolapCursor { cursor, packed, .. } = handle;
         reset_packed(packed);
         let n = cursor.column_count();
-        let count_at = write_header(std::iter::repeat(&b""[..]).take(n), packed);
+        let count_at = write_header(std::iter::repeat(&b""[..]).take(n + 1), packed);
         let max = usize::try_from(max_rows).unwrap_or(0).max(1);
-        let rows = cursor.next_rows(max, |row, columns| {
+        let rows = cursor.next_rows(max, |id, row, columns| {
             for &c in columns {
                 write_value(row.get(c), packed)?;
             }
+            packed.push(1); // INTEGER
+            packed.extend_from_slice(&id.to_le_bytes());
             Ok(())
         })?;
         packed[count_at..count_at + 4].copy_from_slice(&(rows as u32).to_le_bytes());

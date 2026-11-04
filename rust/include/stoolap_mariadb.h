@@ -359,9 +359,10 @@ const char* stoolap_tx_errmsg(const StoolapTx* tx);
 /* =========================================================================
  * Direct reads
  *
- * A read goes straight to a table: no SQL text, parse or plan. It reads in
- * the handle's open transaction, or else in a read transaction of its own
- * that lasts until stoolap_end_statement(). Columns are named by position, which is MariaDB's field
+ * Reads and writes go straight to a table: no SQL text, parse or plan.
+ * They run in the handle's open transaction, or else in a transaction of
+ * the statement's own that stoolap_end_statement() ends. Rows are named
+ * by their stoolap row id, which every read returns. Columns are named by position, which is MariaDB's field
  * order (the plugin creates every table that way).
  * ========================================================================= */
 
@@ -402,7 +403,8 @@ int32_t stoolap_read(
 
 /**
  * Pack the cursor's next rows, at most `max_rows`, in the
- * stoolap_rows_fetch_all() format with empty column names. The buffer is
+ * stoolap_rows_fetch_all() format with empty column names, each row's id
+ * as one more INTEGER cell after its columns. The buffer is
  * the cursor's, valid until the next fetch or close. Returns STOOLAP_ROW
  * with at least one row, STOOLAP_DONE at the end, STOOLAP_ERROR.
  */
@@ -415,11 +417,62 @@ int32_t stoolap_cursor_fetch(
 
 const char* stoolap_cursor_errmsg(const StoolapCursor* cursor);
 
+/** As stoolap_read(), for the one row `row_id` (no row if not visible). */
+int32_t stoolap_read_row(
+    StoolapDB* db,
+    const char* table,
+    int32_t table_columns,
+    const int32_t* columns, int32_t ncolumns,
+    int64_t row_id,
+    StoolapCursor** out_cursor
+);
+
 /**
- * End the read transaction stoolap_read() opened outside a transaction.
- * Call at the end of every statement, with the statement's cursors closed.
+ * End the statement's direct access, and the transaction it opened
+ * outside an open one: committed when `commit`, else rolled back. Call at
+ * the end of every statement, with its cursors closed. A failed commit
+ * rolls back and reports to stoolap_errmsg(db).
  */
-void stoolap_end_statement(StoolapDB* db);
+int32_t stoolap_end_statement(StoolapDB* db, int32_t commit);
+
+/**
+ * Returned by a direct write on a table a foreign key names, as child or
+ * parent: write it through SQL instead, where stoolap checks the keys.
+ */
+#define STOOLAP_FALLBACK 2
+
+/**
+ * Insert `nrows` rows of `table_columns` values each (field order). The
+ * table checks types, NOT NULL, the primary key and UNIQUE per row.
+ */
+int32_t stoolap_insert(
+    StoolapDB* db,
+    const char* table,
+    int32_t table_columns,
+    const StoolapValue* values,
+    int32_t nrows,
+    int64_t* rows_affected
+);
+
+/** Set `ncolumns` columns of row `row_id`; 0 affected when it is gone. */
+int32_t stoolap_update_row(
+    StoolapDB* db,
+    const char* table,
+    int32_t table_columns,
+    int64_t row_id,
+    const int32_t* columns,
+    const StoolapValue* values,
+    int32_t ncolumns,
+    int64_t* rows_affected
+);
+
+/** Delete row `row_id`; 0 affected when it is gone. */
+int32_t stoolap_delete_row(
+    StoolapDB* db,
+    const char* table,
+    int64_t row_id,
+    int64_t* rows_affected
+);
 
 void stoolap_cursor_close(StoolapCursor* cursor);
 

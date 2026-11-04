@@ -50,7 +50,7 @@ pub struct ReadSpec<'a> {
 
 enum Source {
     Scan(Box<dyn Scanner>),
-    Sorted(std::vec::IntoIter<Row>),
+    Sorted(std::vec::IntoIter<(i64, Row)>),
 }
 
 /// The rows of a read, handed out in chunks
@@ -59,17 +59,42 @@ pub struct Cursor {
     columns: Vec<usize>,
 }
 
+/// Refuses a table whose column count is not the one MariaDB knows
+pub fn check_columns(table: &dyn Table, table_columns: usize) -> Result<()> {
+    let n = table.schema().columns.len();
+    if n != table_columns {
+        return Err(Error::internal(format!(
+            "table {} has {} columns, MariaDB knows {}",
+            table.name(),
+            n,
+            table_columns
+        )));
+    }
+    Ok(())
+}
+
 impl Cursor {
+    /// The row `row_id`, if it is visible
+    pub fn by_id(
+        table: &dyn Table,
+        table_columns: usize,
+        columns: &[usize],
+        row_id: i64,
+    ) -> Result<Cursor> {
+        check_columns(table, table_columns)?;
+        if columns.iter().any(|&c| c >= table_columns) {
+            return Err(Error::internal("column out of range"));
+        }
+        let rows: Vec<(i64, Row)> = table.collect_rows_by_ids(&[row_id])?.into_iter().collect();
+        Ok(Cursor {
+            source: Source::Sorted(rows.into_iter()),
+            columns: columns.to_vec(),
+        })
+    }
+
     pub fn open(table: &dyn Table, spec: ReadSpec<'_>) -> Result<Cursor> {
         let schema = table.schema();
-        if schema.columns.len() != spec.table_columns {
-            return Err(Error::internal(format!(
-                "table {} has {} columns, MariaDB knows {}",
-                table.name(),
-                schema.columns.len(),
-                spec.table_columns
-            )));
-        }
+        check_columns(table, spec.table_columns)?;
         let column_ok = |c: usize| {
             if c < schema.columns.len() {
                 Ok(())
@@ -136,7 +161,7 @@ impl Cursor {
             let mut scanner = scanner;
             let mut rows = Vec::new();
             while scanner.next() {
-                rows.push(scanner.take_row_with_id().1);
+                rows.push(scanner.take_row_with_id());
             }
             if let Some(e) = scanner.err() {
                 return Err(e.clone());
@@ -144,7 +169,7 @@ impl Cursor {
             // Stable, and linear on rows the index already gave in order
             let (order, desc) = (spec.order, spec.desc);
             rows.sort_by(|a, b| {
-                let o = compare_by(a, b, order);
+                let o = compare_by(&a.1, &b.1, order);
                 if desc {
                     o.reverse()
                 } else {
@@ -163,18 +188,18 @@ impl Cursor {
         self.columns.len()
     }
 
-    /// Calls `emit` with each of up to `max` rows and its columns; the
-    /// count is short only at the end
+    /// Calls `emit` with each of up to `max` rows, its row id and the
+    /// columns to read; the count is short only at the end
     pub fn next_rows(
         &mut self,
         max: usize,
-        mut emit: impl FnMut(&Row, &[usize]) -> Result<()>,
+        mut emit: impl FnMut(i64, &Row, &[usize]) -> Result<()>,
     ) -> Result<usize> {
         let mut n = 0;
         match &mut self.source {
             Source::Scan(scanner) => {
                 while n < max && scanner.next() {
-                    emit(scanner.row(), &self.columns)?;
+                    emit(scanner.current_row_id(), scanner.row(), &self.columns)?;
                     n += 1;
                 }
                 if n < max {
@@ -185,8 +210,8 @@ impl Cursor {
             }
             Source::Sorted(rows) => {
                 while n < max {
-                    let Some(row) = rows.next() else { break };
-                    emit(&row, &self.columns)?;
+                    let Some((id, row)) = rows.next() else { break };
+                    emit(id, &row, &self.columns)?;
                     n += 1;
                 }
             }

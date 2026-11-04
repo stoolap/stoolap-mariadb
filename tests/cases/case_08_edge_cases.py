@@ -80,19 +80,21 @@ INSERT INTO big VALUES (1, REPEAT('a', 1024));
     h.assert_scalar("1KB text length", "SELECT LENGTH(body) FROM big", "1024")
     h.assert_scalar("TEXT prefix",     "SELECT LEFT(body, 5) FROM big", "aaaaa")
 
-    h.section("rnd_pos hazard on BLOB/TEXT tables (regression)")
-    # See 08_edge_cases.sh comment: rnd_pos must refuse on BLOB/TEXT tables
-    # so ORDER BY + LIMIT UPDATE surfaces a clean error rather than silently
-    # returning corrupt data when the value-store gets reused.
+    h.section("rnd_pos on BLOB/TEXT tables re-reads by row id")
+    # ORDER BY + LIMIT UPDATE re-reads rows by position; a BLOB's record
+    # bytes point at a reused buffer, so position() keeps stoolap's row id
+    # and rnd_pos() reads the row again.
     h.exec_script(f"""
 CREATE TABLE rp (id INT NOT NULL PRIMARY KEY, body TEXT, n INT) ENGINE={h.engine};
 INSERT INTO rp VALUES (1,'a',10),(2,'b',20),(3,'c',30),(4,'d',5);
 """)
     h.assert_ok("plain UPDATE on BLOB table", "UPDATE rp SET n = n + 100 WHERE id = 2")
     h.assert_scalar("plain UPDATE applied",   "SELECT n FROM rp WHERE id = 2", "120")
-    h.assert_err("rnd_pos refuses on BLOB UPDATE ORDER BY LIMIT",
-                 "UPDATE rp SET n = n + 1 ORDER BY n LIMIT 2",
-                 r"rnd_pos / re-read by position is not supported on tables with BLOB/TEXT")
+    h.assert_ok("BLOB UPDATE ORDER BY LIMIT",
+                "UPDATE rp SET n = n + 1 ORDER BY n LIMIT 2")
+    h.assert_scalar("the two smallest bumped, bodies intact",
+                    "SELECT GROUP_CONCAT(id, body, n ORDER BY id) FROM rp",
+                    "1a11,2b120,3c30,4d6")
 
     h.exec_script(f"""
 CREATE TABLE rp_plain (id INT NOT NULL PRIMARY KEY, n INT) ENGINE={h.engine};
