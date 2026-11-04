@@ -15,7 +15,9 @@
 use std::cmp::Ordering;
 
 use stoolap::core::{Error, Operator, Result, Row, Value};
-use stoolap::storage::expression::{AndExpr, ComparisonExpr, Expression, NullCheckExpr};
+use stoolap::storage::expression::{
+    AndExpr, ComparisonExpr, ConstBoolExpr, Expression, NullCheckExpr,
+};
 use stoolap::storage::traits::{ScanAccess, Scanner, Table};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,7 +76,8 @@ pub fn check_columns(table: &dyn Table, table_columns: usize) -> Result<()> {
 }
 
 impl Cursor {
-    /// The row `row_id`, if it is visible
+    /// The row `row_id`, if it is visible (the transaction's own pending
+    /// rows included, which `collect_rows_by_ids` misses)
     pub fn by_id(
         table: &dyn Table,
         table_columns: usize,
@@ -85,7 +88,10 @@ impl Cursor {
         if columns.iter().any(|&c| c >= table_columns) {
             return Err(Error::internal("column out of range"));
         }
-        let rows: Vec<(i64, Row)> = table.collect_rows_by_ids(&[row_id])?.into_iter().collect();
+        let rows: Vec<(i64, Row)> = table
+            .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr())?
+            .into_iter()
+            .collect();
         Ok(Cursor {
             source: Source::Sorted(rows.into_iter()),
             columns: columns.to_vec(),
@@ -161,7 +167,9 @@ impl Cursor {
             let mut scanner = scanner;
             let mut rows = Vec::new();
             while scanner.next() {
-                rows.push(scanner.take_row_with_id());
+                // take_row_with_id() gives 0 for the id on MVCC scanners
+                let id = scanner.current_row_id();
+                rows.push((id, scanner.take_row()));
             }
             if let Some(e) = scanner.err() {
                 return Err(e.clone());

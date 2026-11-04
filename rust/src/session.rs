@@ -70,11 +70,21 @@ impl Session {
         })
     }
 
-    /// Runs `sql`, in the open transaction when there is one
+    /// Runs `sql`, in the open transaction when there is one. Outside one,
+    /// a SELECT in a statement whose direct access opened a transaction
+    /// reads in it, seeing the statement's direct writes; other SQL stays
+    /// autocommit, as an UPDATE in a transaction would leave UNIQUE to
+    /// commit
     pub fn run(&self, sql: &str, params: ParamVec) -> Result<Box<dyn QueryResult>> {
         if self.in_transaction() {
             let plan = self.exec.get_or_create_plan(sql)?;
             return self.run_plan(&plan, params);
+        }
+        if lock(&self.stmt_tx).is_some() {
+            let plan = self.exec.get_or_create_plan(sql)?;
+            if matches!(*plan.statement, Statement::Select(_)) {
+                return self.run_in_stmt_tx(&plan, params);
+            }
         }
         if params.is_empty() {
             return self.exec.execute(sql);
@@ -100,6 +110,25 @@ impl Session {
             ExecutionContext::with_params(params)
         };
         self.exec.execute_with_cached_plan(plan, &ctx)
+    }
+
+    /// Runs `plan` in the statement's own transaction, lent to the
+    /// executor for the call
+    fn run_in_stmt_tx(
+        &self,
+        plan: &CachedPlanRef,
+        params: ParamVec,
+    ) -> Result<Box<dyn QueryResult>> {
+        let tx = lock(&self.stmt_tx).take().ok_or(Error::TransactionEnded)?;
+        self.exec.install_transaction(tx);
+        let ctx = if params.is_empty() {
+            ExecutionContext::new()
+        } else {
+            ExecutionContext::with_params(params)
+        };
+        let result = self.exec.execute_with_cached_plan(plan, &ctx);
+        *lock(&self.stmt_tx) = self.exec.take_transaction();
+        result
     }
 
     /// The level a transaction begun without naming one runs at
@@ -144,6 +173,11 @@ impl Session {
         table: &str,
         f: impl FnOnce(&mut dyn Table) -> Result<R>,
     ) -> Result<R> {
+        // A table the statement wrote is read through its write handle: a
+        // view taken before the write would not see it
+        if let Some(t) = lock(&self.write_tables).get_mut(table) {
+            return f(t.as_mut());
+        }
         self.with_handle(&self.tables, table, true, f)
     }
 

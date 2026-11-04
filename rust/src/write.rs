@@ -8,16 +8,20 @@
 
 //! Direct writes: the handler's inserts, and updates and deletes of the
 //! row it read, named by its row id. The table checks types, NOT NULL,
-//! the primary key and UNIQUE as each row is written, except UNIQUE on an
-//! update of rows it holds in memory, which it leaves to commit: MariaDB
-//! wants the error from the row's own write (ON DUPLICATE KEY UPDATE,
-//! IGNORE), so `update` asks first.
+//! the primary key and UNIQUE as each row is written, except UNIQUE against
+//! rows it holds in memory: an insert misses the transaction's own pending
+//! rows and an update leaves the check to commit. MariaDB wants the error
+//! from the row's own write (ON DUPLICATE KEY UPDATE, IGNORE, REPLACE), so
+//! both look the keys up first.
 
 use stoolap::core::{Error, Operator, Result, Row, Value};
-use stoolap::storage::expression::{AndExpr, ComparisonExpr, Expression};
+use stoolap::storage::expression::{AndExpr, ComparisonExpr, ConstBoolExpr, Expression};
 use stoolap::storage::traits::{ScanAccess, Table};
 
 use crate::read::check_columns;
+
+/// A row id no row has: the row an insert checks has none yet
+const NO_ROW: i64 = i64::MIN;
 
 /// Inserts `rows`, each a value per column
 pub fn insert(
@@ -27,7 +31,15 @@ pub fn insert(
 ) -> Result<i64> {
     check_columns(table, table_columns)?;
     let n = rows.len() as i64;
-    if rows.len() == 1 {
+    if table.has_unique_non_pk_indexes() {
+        // Row by row, each checked against the ones before it
+        let all: Vec<usize> = (0..table_columns).collect();
+        for values in rows {
+            let row = Row::from_values(values);
+            check_unique(table, NO_ROW, &row, &all)?;
+            table.insert_discard(row)?;
+        }
+    } else if rows.len() == 1 {
         let row = rows.pop().expect("one row");
         table.insert_discard(Row::from_values(row))?;
     } else {
@@ -51,7 +63,10 @@ pub fn update(
     let pk = table.schema().pk_column_index();
     if !pk.is_some_and(|p| columns.contains(&p)) {
         if table.has_unique_non_pk_indexes() {
-            let Some((_, mut row)) = table.collect_rows_by_ids(&[row_id])?.into_iter().next()
+            let Some((_, mut row)) = table
+                .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr())?
+                .into_iter()
+                .next()
             else {
                 return Ok(0);
             };
@@ -70,7 +85,11 @@ pub fn update(
     }
 
     // An INTEGER primary key is the row id: the row moves to its new id
-    let Some((_, old)) = table.collect_rows_by_ids(&[row_id])?.into_iter().next() else {
+    let Some((_, old)) = table
+        .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr())?
+        .into_iter()
+        .next()
+    else {
         return Ok(0);
     };
     let mut row = old.clone();
