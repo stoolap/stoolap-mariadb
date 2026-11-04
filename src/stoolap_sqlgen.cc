@@ -28,6 +28,7 @@
 #include "sql_priv.h"
 #include "sql_class.h"
 #include "sql_lex.h"
+#include "sql_schema.h"
 #include "item_sum.h"
 #include "item_subselect.h"
 #include "item_windowfunc.h"
@@ -608,6 +609,12 @@ bool Gen::cond(Item_cond* c) {
 }
 
 bool Gen::func(Item_func* f) {
+    // A sql_mode variant (sql_mode=ORACLE's CONCAT skips NULLs, its DECODE
+    // matches NULL to NULL) keeps the plain function's name and functype;
+    // only its schema tells it apart. The plain one has none, or MariaDB's.
+    const Schema* schema = f->schema();
+    if (schema && schema != &mariadb_schema)
+        return fail("sql_mode function variant");
     Item** a = f->arguments();
     const uint n = f->argument_count();
     switch (f->functype()) {

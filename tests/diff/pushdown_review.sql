@@ -40,3 +40,8 @@ SELECT k, SUM(v) FROM t GROUP BY k HAVING SUM(v) > 1;
 SELECT id FROM t WHERE EXISTS (SELECT LOWER(tr) FROM t t2 WHERE t2.k = t.v) ORDER BY id;
 SELECT COUNT(*) FROM t WHERE EXISTS (SELECT COUNT(*) FROM t t2 WHERE t2.id > 100);
 SELECT COUNT(*) FROM t WHERE EXISTS (SELECT k FROM t t2 WHERE t2.id > 100 GROUP BY k);
+-- sql_mode=ORACLE variants keep the plain names: CONCAT skips NULLs,
+-- DECODE matches NULL to NULL.
+SET sql_mode = 'ORACLE';
+SELECT id, CONCAT(s, 'x'), DECODE(s, NULL, 'null', 'other') FROM t ORDER BY id;
+SET sql_mode = DEFAULT;
