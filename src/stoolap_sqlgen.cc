@@ -351,6 +351,11 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
                 if (item->type() != Item::NULL_ITEM && have != want &&
                     !(want == Cls::REAL && have == Cls::INT))
                     return fail("set operation column types");
+                // MariaDB dedups a DISTINCT leg's own values, then
+                // converts: 2^53 and 2^53 + 1 stay two rows, which a cast
+                // inside the DISTINCT would merge.
+                if (distinct && want == Cls::REAL && have == Cls::INT)
+                    return fail("DISTINCT leg widened to DOUBLE");
                 if (!branch(item, want)) return false;
             } else if (!expr(item)) {
                 return false;
