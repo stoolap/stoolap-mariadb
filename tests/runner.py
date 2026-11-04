@@ -58,13 +58,6 @@ DEFAULT_COUNTER_DELTA_ALLOWLIST = {
     "Stoolap_records_live_counts",
     "Stoolap_buffered_scans",
     "Stoolap_buffered_rows",
-    # Stoolap-side typed-error gap signal: stoolap returned
-    # STOOLAP_ERR_GENERIC for an error class our prose pattern still
-    # classifies. The plugin behaviour stays correct (right HA_ERR_*,
-    # right SQLSTATE), so this is not a plugin regression -- it's an
-    # upstream signal to file. Read the counter via SHOW STATUS LIKE
-    # 'Stoolap_typed_fallback_hits' to spot which run produced it.
-    "Stoolap_typed_fallback_hits",
 }
 
 

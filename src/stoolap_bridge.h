@@ -167,12 +167,9 @@ struct PushdownStats {
     // cached_records() miss that hit stoolap_(tx_)table_count (O(1)).
     // High values = the handler/tx/global caches aren't being reused.
     std::atomic<uint64_t> records_live_counts{0};
-    // BOTH typed errcode AND prose pattern came back generic for a
-    // non-empty stoolap message. case_18 pins this at 0.
+    // Non-empty stoolap message no map_stoolap_error pattern covers.
+    // case_18 pins this at 0.
     std::atomic<uint64_t> unmapped_errors{0};
-    // Typed errcode was GENERIC but prose still classified the message.
-    // Stoolap-side typed-error gap; not a plugin regression.
-    std::atomic<uint64_t> typed_fallback_hits{0};
 
     // Per-phase ns; gated by g_perf_trace_enabled (~50ns/next_row off-path).
     std::atomic<uint64_t> perf_factory_setup_ns{0};

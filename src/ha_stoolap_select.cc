@@ -52,11 +52,10 @@ extern stoolap_mariadb::Engine g_engine;
 // would miss the session's snapshot.
 extern int register_trx(THD* thd);
 
-// Defined in ha_stoolap.cc. Pointers in `details` are valid only until
-// the next FFI call on the originating handle.
+// Defined in ha_stoolap.cc. `message` is valid only until the next FFI
+// call on the originating handle.
 struct StoolapErrorView {
-    int32_t code;
-    StoolapErrorDetails details;
+    const char* message;
 };
 
 extern StoolapErrorView fetch_db_error(StoolapDB* db);
@@ -602,8 +601,7 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
     if (rc != STOOLAP_OK) {
         StoolapErrorView verr =
             ctx->has_tx() ? fetch_tx_error(ctx->tx()) : fetch_db_error(db);
-        const char* msg =
-            *verr.details.message ? verr.details.message : "unknown error";
+        const char* msg = *verr.message ? verr.message : "unknown error";
         sql_print_error("stoolap: direct DML failed: %s", msg);
         // MariaDB's direct-DML path does not always call print_error
         // after the engine returns, so a mapped FK / dup-key would

@@ -154,6 +154,5 @@ CREATE TABLE sp_t (id INT NOT NULL PRIMARY KEY, n INT) ENGINE={h.engine};
         h._pass(f"Stoolap_unmapped_errors still {val}")
     else:
         h._fail(f"Stoolap_unmapped_errors moved to {val}",
-                "savepoint paths produced an error wording the typed",
-                "and prose mappers both gave up on -- inspect log for",
-                "[Note] stoolap typed-error gap lines")
+                "savepoint paths produced an error wording",
+                "map_stoolap_error does not cover")
