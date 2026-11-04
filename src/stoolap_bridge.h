@@ -164,7 +164,7 @@ struct PushdownStats {
     std::atomic<uint64_t> buffered_scans{0};  // rnd_init via fetch_all
     std::atomic<uint64_t> buffered_rows{0};
     std::atomic<uint64_t> direct_modify_hits{0};
-    // cached_records() miss that hit stoolap_(tx_)table_count (O(1)).
+    // cached_records() miss that ran a live COUNT(*).
     // High values = the handler/tx/global caches aren't being reused.
     std::atomic<uint64_t> records_live_counts{0};
     // Non-empty stoolap message no map_stoolap_error pattern covers.

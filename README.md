@@ -45,8 +45,8 @@ Subsystems that have settled recently:
 - Error mapping: stoolap's error text (`*_errmsg`) is matched against
   a pattern table (`map_stoolap_error`) that picks the HA_ERR_*;
   wordings it doesn't cover bump `Stoolap_unmapped_errors`.
-- MVCC-safe `cached_records()` via `stoolap_(tx_)table_count`
-  (O(1) atomic load instead of a SQL `SELECT COUNT(*)`).
+- MVCC-safe `cached_records()` via a one-call `SELECT COUNT(*)`
+  (`stoolap_query_params_all`) on the session's tx or autocommit view.
 - Composite `PRIMARY KEY` / `UNIQUE` / multi-column or self-FK
   refused at `CREATE TABLE` (Stoolap enforces single-column only;
   silently accepting them would let duplicates and FK-violating
@@ -464,7 +464,7 @@ Session-level (`SET SESSION ...`):
 | `Stoolap_pushdown_hits`           | Whole-query plans accepted by the factory. |
 | `Stoolap_pushdown_misses`         | Plans that fell back to the row pump.    |
 | `Stoolap_direct_modify_hits`      | UPDATE / DELETE that took the direct path. |
-| `Stoolap_records_live_counts`     | `cached_records()` cache miss that fetched a fresh count via `stoolap_(tx_)table_count` (O(1) atomic load). High values mean the handler / tx / global record-count caches are not being reused. |
+| `Stoolap_records_live_counts`     | `cached_records()` cache miss that ran a live `SELECT COUNT(*)`. High values mean the handler / tx / global record-count caches are not being reused. |
 | `Stoolap_buffered_scans`          | `rnd_init` calls that used `fetch_all`.  |
 | `Stoolap_buffered_rows`           | Rows delivered through the buffered path. |
 | `Stoolap_unmapped_errors`         | A non-empty stoolap error message matched no `map_stoolap_error` pattern. Non-zero means stoolap reworded or added an error class -- see `case_18_error_mapping`. |

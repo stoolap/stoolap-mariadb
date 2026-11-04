@@ -292,16 +292,6 @@ int query_params_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
                                 out_rows);
 }
 
-// O(1) MVCC-safe table count. tx-side sees this session's uncommitted
-// INSERT/DELETE; db-side returns the autocommit-visible count.
-int count_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
-              const char* table, uint64_t* out_count) {
-    if (ctx && ctx->has_tx()) {
-        return stoolap_tx_table_count(ctx->tx(), table, out_count);
-    }
-    return stoolap_table_count(warm_db(ctx, fallback), table, out_count);
-}
-
 }  // namespace (helpers below have external linkage so
 // ha_stoolap_select.cc can call them.)
 
@@ -3017,13 +3007,31 @@ ha_rows ha_stoolap::cached_records() {
         }
     }
 
-    // O(1) MVCC-safe count: tx-side sees own uncommitted writes,
-    // db-side returns autocommit-visible count via SegmentedTable.
+    // MVCC-visible COUNT(*): inside the tx it sees this session's own
+    // uncommitted writes; outside it answers from the autocommit view
+    // (stoolap's quiet-epoch row-count fast path).
     stoolap_mariadb::g_stats.records_live_counts.fetch_add(
         1, std::memory_order_relaxed);
-    uint64_t count = 0;
-    int rc = count_via(ctx, db_raw(), stoolap_table_.c_str(), &count);
-    if (rc != STOOLAP_OK) return stats.records;
+    const std::string sql =
+        "SELECT COUNT(*) FROM " + quote_ident(stoolap_table_);
+    const uint8_t* buf = nullptr;
+    int64_t len = 0;
+    int rc = stoolap_query_params_all(warm_db(ctx, db_raw()),
+                                      in_tx ? ctx->tx() : nullptr, sql.c_str(),
+                                      nullptr, 0, &buf, &len);
+    if (rc != STOOLAP_OK || !buf) return stats.records;
+    // One row, one INTEGER column: header, u32 row_count, tag, i64.
+    size_t pos = 0;
+    uint32_t cols = 0;
+    if (!stoolap_mariadb::pkt_parse_header(buf, static_cast<size_t>(len), &pos,
+                                           &cols) ||
+        cols != 1 || pos + 4 + 1 + 8 > static_cast<size_t>(len) ||
+        stoolap_mariadb::pkt_le32(buf + pos) != 1 ||
+        buf[pos + 4] != STOOLAP_TYPE_INTEGER) {
+        return stats.records;
+    }
+    const int64_t n = stoolap_mariadb::pkt_i64(buf + pos + 5);
+    const uint64_t count = n > 0 ? static_cast<uint64_t>(n) : 0;
 
     cached_records_ = static_cast<ha_rows>(count);
     cached_records_valid_ = true;
