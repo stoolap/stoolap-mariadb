@@ -18,6 +18,7 @@ Scenario format:
   fails once the scenario matches, so the note gets removed).
 - Other `--` lines are comments."""
 
+import datetime
 import os
 import re
 from pathlib import Path
@@ -70,6 +71,12 @@ def _cell(v):
         return ("bytes", bytes(v))
     if isinstance(v, str):
         return ("str", v)
+    if isinstance(v, datetime.timedelta):
+        # TIME: _format_cell renders -0.5 s and +0.5 s alike.
+        return ("time", v.days, v.seconds, v.microseconds)
+    if isinstance(v, float):
+        # repr keeps -0.0 apart from 0.0, which _format_cell prints as "0".
+        return ("float", repr(v))
     return ("val", _format_cell(v))
 
 
