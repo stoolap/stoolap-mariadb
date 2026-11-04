@@ -96,6 +96,7 @@ StoolapErrorView fetch_db_error(StoolapDB* db);
 StoolapErrorView fetch_tx_error(StoolapTx* tx);
 StoolapErrorView fetch_stmt_error(StoolapStmt* stmt);
 int report_stoolap_error(const StoolapErrorView& v);
+int raise_commit_error(const char* msg);
 
 namespace {
 
@@ -122,14 +123,12 @@ int stoolap_commit_cb(handlerton* /*hton*/, THD* thd, bool all) {
 
     int rc = ctx->commit();
     if (rc != STOOLAP_OK) {
-        // stoolap_tx_commit consumes the tx handle; querying its error
-        // message after the call is impossible. Dominant failure mode
-        // is write conflict, so map to LOCK_DEADLOCK / 40001 for retry.
-        const char* msg = stoolap_errmsg(ctx->db());
-        sql_print_error(
-            "stoolap: COMMIT failed: %s",
-            (msg && *msg) ? msg : "(no detail; tx already consumed)");
-        return HA_ERR_LOCK_DEADLOCK;
+        // stoolap_tx_commit consumes the tx handle; its error is left in
+        // the thread-local slot stoolap_errmsg(NULL) reads.
+        const char* msg = stoolap_errmsg(nullptr);
+        sql_print_error("stoolap: COMMIT failed: %s",
+                        (msg && *msg) ? msg : "(no detail)");
+        return raise_commit_error(msg);
     }
     return 0;
 }
@@ -475,6 +474,35 @@ int report_stoolap_error(const StoolapErrorView& v) {
     const bool needs_text = (rc == HA_ERR_GENERIC || rc == HA_ERR_UNSUPPORTED);
     if (needs_text && have_text) {
         my_printf_error(ER_GET_ERRMSG, "stoolap: %s", MYF(0), msg);
+    }
+    return rc;
+}
+
+// MariaDB reports any commit-callback failure as ER_ERROR_DURING_COMMIT
+// (1180) unless an error is already raised, and stoolap checks UPDATE's
+// UNIQUE constraints at commit. Raise the mapped error first so the
+// client sees 1062 / 1451 / 1452 / 1213 as it would for the statement.
+int raise_commit_error(const char* msg) {
+    const StoolapErrorView v{msg ? msg : ""};
+    if (!*v.message) return HA_ERR_LOCK_DEADLOCK;
+    const int rc = report_stoolap_error(v);
+    switch (rc) {
+        case HA_ERR_FOUND_DUPP_KEY:
+            my_printf_error(ER_DUP_ENTRY, "stoolap: %s", MYF(0), v.message);
+            break;
+        case HA_ERR_NO_REFERENCED_ROW:
+            my_printf_error(ER_NO_REFERENCED_ROW_2, "stoolap: %s", MYF(0),
+                            v.message);
+            break;
+        case HA_ERR_ROW_IS_REFERENCED:
+            my_printf_error(ER_ROW_IS_REFERENCED_2, "stoolap: %s", MYF(0),
+                            v.message);
+            break;
+        case HA_ERR_LOCK_DEADLOCK:
+            my_error(ER_LOCK_DEADLOCK, MYF(0));
+            break;
+        default:
+            break;  // report_stoolap_error raised ER_GET_ERRMSG
     }
     return rc;
 }
@@ -1679,6 +1707,19 @@ done:
     return err;
 }
 
+int ha_stoolap::ensure_stmt_tx() {
+    THD* thd = ha_thd();
+    auto* ctx = get_thd_ctx(thd);
+    if (!ctx || ctx->has_tx()) return 0;
+    if (ctx->begin() != STOOLAP_OK) {
+        sql_print_error("stoolap: statement tx open failed: %s",
+                        stoolap_errmsg(ctx->db()));
+        return HA_ERR_GENERIC;
+    }
+    trans_register_ha(thd, /*all=*/false, stoolap_hton, /*flags=*/0);
+    return 0;
+}
+
 int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
 
@@ -1762,6 +1803,7 @@ int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
         }
     }
 
+    if ((err = ensure_stmt_tx())) goto done;
     {
         auto* ctx = get_thd_ctx(ha_thd());
         int64_t affected = 0;
@@ -1807,6 +1849,7 @@ int ha_stoolap::delete_row(const uchar* buf) {
         goto done;
     }
 
+    if ((err = ensure_stmt_tx())) goto done;
     {
         auto* ctx = get_thd_ctx(ha_thd());
         int64_t affected = 0;
