@@ -39,3 +39,11 @@ SELECT id FROM co FORCE INDEX (kacb) WHERE a BETWEEN 1 AND 2 AND c = _utf16le X'
 INSERT INTO cp VALUES (5, 'ab', _utf16le X'4100'), (6, 'b', _utf16le X'0001');
 SELECT a FROM cp FORCE INDEX (kac) WHERE a BETWEEN 'a' AND 'c' AND c = _utf16le X'4100' ORDER BY a;
 SELECT id FROM cp FORCE INDEX (kac) WHERE a BETWEEN 'a' AND 'c' AND c = _utf16le X'4100' ORDER BY a DESC LIMIT 2;
+-- A constant PAD SPACE part: 'a' and 'a ' are one value, so b orders them.
+CREATE TABLE cpb (id INT NOT NULL PRIMARY KEY, a VARCHAR(3) COLLATE utf8mb4_bin,
+                  c VARCHAR(2) CHARACTER SET utf16le COLLATE utf16le_bin, b INT NOT NULL,
+                  KEY kacb (a, c, b)) ENGINE={E};
+INSERT INTO cpb VALUES (1, 'a', _utf16le X'4100', 10), (2, 'a ', _utf16le X'4100', 1),
+                       (3, 'b', _utf16le X'4100', 5), (4, 'b ', _utf16le X'4100', 2);
+SELECT id, b FROM cpb FORCE INDEX (kacb) WHERE a IN ('a', 'b') AND c = _utf16le X'4100' ORDER BY a, b;
+SELECT id FROM cpb FORCE INDEX (kacb) WHERE a IN ('a', 'b') AND c = _utf16le X'4100' ORDER BY a, b LIMIT 1;
