@@ -887,8 +887,39 @@ std::string ci_string_unique_part(TABLE* form) {
     return std::string();
 }
 
+// "key 'K' column 'C'" for the first PRIMARY KEY / UNIQUE part that
+// covers only a prefix of its column (a(3)), else "". Stoolap enforces
+// uniqueness on whole column values, which is weaker than the declared
+// key: 'abc1' and 'abc2' collide on a(3) but not on a.
+std::string prefix_unique_part(TABLE* form) {
+    for (uint i = 0; i < form->s->keys; ++i) {
+        const KEY& k = form->key_info[i];
+        if (!(k.flags & HA_NOSAME)) continue;  // PRIMARY and UNIQUE only
+        for (uint j = 0; j < k.user_defined_key_parts; ++j) {
+            const KEY_PART_INFO& kp = k.key_part[j];
+            if (!(kp.key_part_flag & HA_PART_KEY_SEG) || !kp.field) continue;
+            std::string out = "key '";
+            out.append(k.name.str, k.name.length);
+            out += "' column '";
+            out.append(kp.field->field_name.str, kp.field->field_name.length);
+            out += "'";
+            return out;
+        }
+    }
+    return std::string();
+}
+
 std::string build_create_sql(const std::string& table_name, TABLE* form,
                              bool if_not_exists) {
+    if (std::string bad = prefix_unique_part(form); !bad.empty()) {
+        my_printf_error(ER_GET_ERRMSG,
+                        "stoolap: PRIMARY KEY / UNIQUE %s covers a column "
+                        "prefix, but stoolap enforces uniqueness on whole "
+                        "column values. Key the whole column, or drop the "
+                        "constraint.",
+                        MYF(0), bad.c_str());
+        return std::string();
+    }
     // Refuse ci PK/UNIQUE up front: silent acceptance of case-different
     // duplicates is worse than failing at CREATE.
     if (std::string bad = ci_string_unique_part(form); !bad.empty()) {

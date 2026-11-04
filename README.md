@@ -190,6 +190,7 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 | `UNIQUE` constraints (single-column)           | Yes |
 | `UNIQUE (a, b)` composite                      | Yes |
 | `PRIMARY KEY` / `UNIQUE` on ci-collated VARCHAR | Refused at CREATE (use `_bin` collation or drop the constraint) |
+| `PRIMARY KEY` / `UNIQUE` over a column prefix (`a(3)`) | Refused at CREATE (stoolap enforces whole-column uniqueness) |
 | `FOREIGN KEY` (single-column inline)           | Yes (RESTRICT, CASCADE) |
 | Multi-column FK / self-referencing FK          | Refused at CREATE with a client-visible error |
 | `AUTO_INCREMENT`                               | Yes (cross-connection cache invalidates on TRUNCATE/DROP/RENAME) |
