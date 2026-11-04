@@ -2707,7 +2707,7 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         return false;
     };
     if (contains_unsafe_part(start_key) || contains_unsafe_part(end_key)) {
-        return handler::read_range_first(start_key, end_key, eq_range, sorted);
+        return read_range_filtered(start_key, end_key, sorted);
     }
 
     // Lexicographic-tuple semantics: (a,b) >= (1,5) is NOT a >= 1 AND b >= 5
@@ -2946,9 +2946,124 @@ int ha_stoolap::read_range_first(const key_range* start_key,
 }
 
 int ha_stoolap::read_range_next() {
-    // Route through index_next so the ci-collation filter fires on punted
-    // ranges. Non-ci scans just hit rnd_next via index_next; no overhead.
+    if (range_filter_active_) {
+        while (true) {
+            const int r = rnd_next(table->record[0]);
+            if (r) return r;
+            if (range_in_bounds()) return 0;
+        }
+    }
     return index_next(table->record[0]);
+}
+
+// The row at record[0] lies inside the range by MariaDB's own key
+// comparison (collation, prefix and NULL aware).
+bool ha_stoolap::range_in_bounds() {
+    KEY& ki = table->key_info[active_index];
+    if (range_has_start_) {
+        const int c =
+            key_cmp(ki.key_part, range_start_buf_.data(), range_start_len_);
+        switch (range_start_flag_) {
+            case HA_READ_AFTER_KEY:
+                if (c <= 0) return false;
+                break;
+            case HA_READ_KEY_EXACT:
+            case HA_READ_PREFIX:
+                if (c != 0) return false;
+                break;
+            default:  // HA_READ_KEY_OR_NEXT
+                if (c < 0) return false;
+                break;
+        }
+    }
+    return !end_range || compare_key(end_range) <= 0;
+}
+
+// A range over a key part stoolap cannot compare as MariaDB does (a ci
+// collation, DECIMAL / ENUM / SET, a multi-byte hex charset): stoolap's
+// order is not the key's, so neither its WHERE nor the usual stop at the
+// first row past the end can be trusted. Stoolap returns candidates
+// bounded only by the leading key part when that part is safe, and
+// read_range_next keeps the rows inside both bounds by MariaDB's own
+// comparison, reading to the end. With `sorted`, rows come in the order
+// of the safe leading parts (MariaDB orders no further on such a key:
+// index_flags offers no order past them).
+int ha_stoolap::read_range_filtered(const key_range* start_key,
+                                    const key_range* end_key, bool sorted) {
+    KEY& ki = table->key_info[active_index];
+    auto part_safe = [&](uint i) {
+        Field* f = ki.key_part[i].field;
+        return index_flags(active_index, i, false) & HA_READ_ORDER &&
+               !(ki.key_part[i].key_part_flag & HA_PART_KEY_SEG) && f;
+    };
+    uint safe_lead = 0;
+    while (safe_lead < ki.user_defined_key_parts && part_safe(safe_lead))
+        ++safe_lead;
+
+    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
+    sql += quote_ident(stoolap_table_);
+    std::vector<StoolapValue> params;
+    std::deque<std::string> holders;
+    if (safe_lead > 0) {
+        // Every row of the range has its first part between the bounds'
+        // first parts (inclusive, whatever the flags).
+        Field* f = ki.key_part[0].field;
+        const std::string col = quote_ident(
+            std::string_view(f->field_name.str, f->field_name.length));
+        for (const key_range* r : {start_key, end_key}) {
+            if (!r || !(r->keypart_map & 1)) continue;
+            std::memset(table->record[1], 0, table->s->reclength);
+            key_restore(table->record[1], r->key, &ki,
+                        ki.key_part[0].store_length);
+            const my_ptrdiff_t d =
+                static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
+            move_fields(table, d);
+            StoolapValue v{};
+            holders.emplace_back();
+            const bool bind = !f->is_null() && !unsigned_beyond_i64(f) &&
+                              extract_field(f, v, holders.back());
+            move_fields(table, -d);
+            if (!bind) continue;
+            sql += params.empty() ? " WHERE " : " AND ";
+            sql += col;
+            sql += r == start_key ? " >= $" : " <= $";
+            params.push_back(v);
+            sql += std::to_string(params.size());
+        }
+    }
+    if (sorted && safe_lead > 0) {
+        sql += " ORDER BY ";
+        for (uint i = 0; i < safe_lead; ++i) {
+            Field* f = ki.key_part[i].field;
+            if (i) sql += ", ";
+            sql += quote_ident(
+                std::string_view(f->field_name.str, f->field_name.length));
+            sql += " NULLS FIRST";
+        }
+    }
+
+    auto* ctx = get_thd_ctx(ha_thd());
+    StoolapRows* rows = nullptr;
+    if (query_params_via(ctx, db_raw(), sql.c_str(), params.data(),
+                         static_cast<int32_t>(params.size()),
+                         &rows) != STOOLAP_OK) {
+        auto verr = fetch_error_via(ctx, db_raw());
+        sql_print_error("stoolap: read_range query failed: %s", verr.message);
+        return report_stoolap_error(verr);
+    }
+    scan_.reset(rows);
+
+    range_has_start_ = start_key != nullptr;
+    if (start_key) {
+        range_start_buf_.assign(start_key->key,
+                                start_key->key + start_key->length);
+        range_start_len_ = start_key->length;
+        range_start_flag_ = start_key->flag;
+    }
+    range_key_part = ki.key_part;
+    set_end_range(end_key);
+    range_filter_active_ = true;
+    return read_range_next();
 }
 
 void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,

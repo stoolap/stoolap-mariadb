@@ -160,6 +160,7 @@ private:
         scan_buf_rows_left_ = 0;
         scan_buf_cell_to_field_.clear();
         key_filter_active_ = false;
+        range_filter_active_ = false;
     }
 
     std::string stoolap_table_;
@@ -183,6 +184,18 @@ private:
     bool key_filter_active_ = false;
     KEY* key_filter_key_ = nullptr;
     std::vector<uchar> key_filter_buf_;
+
+    // read_range_filtered: a range over a key part stoolap cannot order
+    // as MariaDB does. read_range_next keeps the rows MariaDB's key
+    // comparison puts inside the start bound (this copy) and end_range.
+    int read_range_filtered(const key_range* start_key,
+                            const key_range* end_key, bool sorted);
+    bool range_in_bounds();
+    bool range_filter_active_ = false;
+    std::vector<uchar> range_start_buf_;
+    uint range_start_len_ = 0;
+    ha_rkey_function range_start_flag_ = HA_READ_KEY_EXACT;
+    bool range_has_start_ = false;
 
     // BLOB/TEXT present? rnd_pos refuses (BLOB in-record bytes are
     // (len, ptr); ptr references prior-rnd_next's value-store).
