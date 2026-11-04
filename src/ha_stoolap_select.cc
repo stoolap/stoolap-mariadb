@@ -376,7 +376,6 @@ bool collect_bound_params(THD* thd, std::vector<StoolapValue>& out,
                           std::vector<std::string>& storage);
 bool item_uses_ci_string(Item* item);
 bool item_uses_decimal_field(Item* item);
-bool item_contains_param(Item* item);
 
 // Forward decl: defined later. Walks every TABLE_LIST::on_expr (and
 // the prep / sj variants) in a FROM chain plus every nested-join
@@ -985,221 +984,6 @@ bool select_lex_uses_decimal_field(SELECT_LEX* sel,
     return false;
 }
 
-bool unit_uses_decimal_field(SELECT_LEX_UNIT* unit) {
-    if (!unit) return false;
-    for (SELECT_LEX* sel = unit->first_select(); sel;
-         sel = sel->next_select()) {
-        if (select_lex_uses_decimal_field(sel, /*include_projection=*/true))
-            return true;
-    }
-    return false;
-}
-
-// dynamic_cast required: at EXECUTE time Item_param::type() returns
-// CONST_ITEM (or NULL_ITEM), not PARAM_ITEM, so the tag check misses.
-bool item_contains_param(Item* item) {
-    if (!item) return false;
-    if (dynamic_cast<Item_param*>(item)) return true;
-    switch (item->type()) {
-        case Item::FUNC_ITEM:
-        case Item::SUM_FUNC_ITEM: {
-            auto* fs = static_cast<Item_func_or_sum*>(item);
-            const uint n = fs->argument_count();
-            for (uint i = 0; i < n; ++i) {
-                if (item_contains_param(fs->arguments()[i])) return true;
-            }
-            return false;
-        }
-        case Item::COND_ITEM: {
-            auto* cond = static_cast<Item_cond*>(item);
-            List_iterator<Item> it(*cond->argument_list());
-            Item* sub;
-            while ((sub = it++)) {
-                if (item_contains_param(sub)) return true;
-            }
-            return false;
-        }
-        case Item::REF_ITEM: {
-            auto* ref = static_cast<Item_ref*>(item);
-            if (ref->ref && *ref->ref) return item_contains_param(*ref->ref);
-            return false;
-        }
-        case Item::SUBSELECT_ITEM: {
-            auto* ss = static_cast<Item_subselect*>(item);
-            SELECT_LEX_UNIT* u = ss->unit;
-            if (!u) return false;
-            for (SELECT_LEX* sel = u->first_select(); sel;
-                 sel = sel->next_select()) {
-                if (sel->where && item_contains_param(sel->where)) return true;
-                if (sel->having && item_contains_param(sel->having))
-                    return true;
-                List_iterator<Item> it(sel->item_list);
-                Item* pi;
-                while ((pi = it++)) {
-                    if (item_contains_param(pi)) return true;
-                }
-            }
-            return false;
-        }
-        default:
-            return false;
-    }
-}
-
-// Counts Item_param nodes; mirrors item_contains_param's recursion.
-size_t item_count_params(Item* item) {
-    if (!item) return 0;
-    if (dynamic_cast<Item_param*>(item)) return 1;
-    switch (item->type()) {
-        case Item::FUNC_ITEM:
-        case Item::SUM_FUNC_ITEM: {
-            auto* fs = static_cast<Item_func_or_sum*>(item);
-            const uint n = fs->argument_count();
-            size_t total = 0;
-            for (uint i = 0; i < n; ++i) {
-                total += item_count_params(fs->arguments()[i]);
-            }
-            return total;
-        }
-        case Item::COND_ITEM: {
-            auto* cond = static_cast<Item_cond*>(item);
-            List_iterator<Item> it(*cond->argument_list());
-            Item* sub;
-            size_t total = 0;
-            while ((sub = it++))
-                total += item_count_params(sub);
-            return total;
-        }
-        case Item::REF_ITEM: {
-            auto* ref = static_cast<Item_ref*>(item);
-            if (ref->ref && *ref->ref) return item_count_params(*ref->ref);
-            return 0;
-        }
-        case Item::SUBSELECT_ITEM: {
-            auto* ss = static_cast<Item_subselect*>(item);
-            SELECT_LEX_UNIT* u = ss->unit;
-            if (!u) return 0;
-            size_t total = 0;
-            for (SELECT_LEX* sel = u->first_select(); sel;
-                 sel = sel->next_select()) {
-                if (sel->where) total += item_count_params(sel->where);
-                if (sel->having) total += item_count_params(sel->having);
-                List_iterator<Item> it(sel->item_list);
-                Item* pi;
-                while ((pi = it++))
-                    total += item_count_params(pi);
-            }
-            return total;
-        }
-        default:
-            return 0;
-    }
-}
-
-// Count `?` in WHERE/HAVING (stoolap binds these). Recurses into
-// derived tables and inner units.
-size_t select_count_predicate_params(SELECT_LEX* sel) {
-    if (!sel) return 0;
-    size_t total = 0;
-    if (sel->where) total += item_count_params(sel->where);
-    if (sel->having) total += item_count_params(sel->having);
-    for (TABLE_LIST* tl = sel->get_table_list(); tl; tl = tl->next_local) {
-        if (!tl->derived) continue;
-        for (SELECT_LEX* inner = tl->derived->first_select(); inner;
-             inner = inner->next_select()) {
-            total += select_count_predicate_params(inner);
-        }
-    }
-    for (SELECT_LEX_UNIT* u = sel->first_inner_unit(); u; u = u->next_unit()) {
-        for (SELECT_LEX* sub = u->first_select(); sub;
-             sub = sub->next_select()) {
-            total += select_count_predicate_params(sub);
-        }
-    }
-    return total;
-}
-
-// True if this SELECT (or any nested derived/subquery) has `?` in a
-// projection / ORDER BY / GROUP BY surface (stoolap returns NULL there
-// instead of the bound value). WHERE/HAVING are NOT checked: stoolap
-// binds those, and we depend on it.
-//
-// Per-leg only. The statement-wide count backstop is applied by the
-// factory wrappers at the top scope; doing it per-leg would falsely
-// bail on a prepared UNION whose params split across legs.
-bool select_param_in_unsafe_surface(SELECT_LEX* sel) {
-    if (!sel) return false;
-    {
-        List_iterator<Item> it(sel->item_list);
-        Item* pi;
-        while ((pi = it++)) {
-            if (pi && item_contains_param(pi)) return true;
-        }
-    }
-    for (ORDER* o = sel->order_list.first; o; o = o->next) {
-        if (o->item && *o->item && item_contains_param(*o->item)) return true;
-    }
-    for (ORDER* o = sel->group_list.first; o; o = o->next) {
-        if (o->item && *o->item && item_contains_param(*o->item)) return true;
-    }
-    // Derived projections become values in the outer plan; subqueries
-    // live in inner units.
-    for (TABLE_LIST* tl = sel->get_table_list(); tl; tl = tl->next_local) {
-        if (!tl->derived) continue;
-        for (SELECT_LEX* inner = tl->derived->first_select(); inner;
-             inner = inner->next_select()) {
-            if (select_param_in_unsafe_surface(inner)) return true;
-        }
-    }
-    for (SELECT_LEX_UNIT* u = sel->first_inner_unit(); u; u = u->next_unit()) {
-        for (SELECT_LEX* sub = u->first_select(); sub;
-             sub = sub->next_select()) {
-            if (select_param_in_unsafe_surface(sub)) return true;
-        }
-    }
-    return false;
-}
-
-// Backstop: bail when accounted predicate `?` count < lex param_list
-// total. The gap means a placeholder lives in an Item subclass our
-// walker doesn't reach.
-bool statement_param_backstop_unsafe(THD* thd, size_t predicate_param_count) {
-    if (!thd || !thd->lex) return false;
-    return thd->lex->param_list.elements > predicate_param_count;
-}
-
-bool unit_param_in_unsafe_surface(SELECT_LEX_UNIT* unit) {
-    if (!unit) return false;
-    for (SELECT_LEX* sel = unit->first_select(); sel;
-         sel = sel->next_select()) {
-        if (select_param_in_unsafe_surface(sel)) return true;
-    }
-    // global_parameters() carries unit-level ORDER/GROUP/LIMIT.
-    SELECT_LEX* gp = unit->global_parameters();
-    if (gp) {
-        for (ORDER* o = gp->order_list.first; o; o = o->next) {
-            if (o->item && *o->item && item_contains_param(*o->item))
-                return true;
-        }
-        for (ORDER* o = gp->group_list.first; o; o = o->next) {
-            if (o->item && *o->item && item_contains_param(*o->item))
-                return true;
-        }
-    }
-    return false;
-}
-
-// Predicate `?` total across every leg; pairs with the backstop.
-size_t unit_count_predicate_params(SELECT_LEX_UNIT* unit) {
-    if (!unit) return 0;
-    size_t total = 0;
-    for (SELECT_LEX* sel = unit->first_select(); sel;
-         sel = sel->next_select()) {
-        total += select_count_predicate_params(sel);
-    }
-    return total;
-}
-
 bool order_list_uses_ci_string(SQL_I_List<ORDER>& lst) {
     for (ORDER* o = lst.first; o; o = o->next) {
         if (o->item && *o->item && item_uses_ci_string(*o->item)) return true;
@@ -1277,9 +1061,11 @@ bool collect_bound_params(THD* thd, std::vector<StoolapValue>& out,
 // semantic_guards: the ci / DECIMAL / placeholder checks the text-based
 // unit and derived paths rely on. The single-SELECT path passes false:
 // stoolap_sqlgen makes those decisions per expression.
+// Statement-level conditions for running a SELECT (or a set-operation
+// leg, or a derived table's SELECT) in stoolap. Whether its expressions
+// mean the same there is stoolap_sqlgen's call.
 bool can_pushdown_select(THD* thd, SELECT_LEX* sel_lex,
-                         SELECT_LEX_UNIT* sel_unit,
-                         bool semantic_guards = true) {
+                         SELECT_LEX_UNIT* sel_unit) {
     if (!thd || !sel_lex) return false;
     // Single-SELECT only. Unit / partial pushdown handled elsewhere.
     if (sel_unit) return false;
@@ -1307,15 +1093,6 @@ bool can_pushdown_select(THD* thd, SELECT_LEX* sel_lex,
     bool any = false;
     if (!every_table_is_stoolap(sel_lex, any) || !any) return false;
 
-    // Shadow-column hazard: rewrite_table_names is text-based, so any
-    // leaf table whose schema has a column with the same name as the
-    // table itself ends up with `SELECT u FROM u` becoming
-    // `SELECT db__u FROM db__u` -- a column rename that stoolap may
-    // accept silently with wrong rows. Direct DML already gates on
-    // this; SELECT / unit / derived pushdown share the same rewriter
-    // and need the same gate.
-    if (stoolap_pushdown::any_leaf_has_shadow_column(sel_lex)) return false;
-
     // Bare COUNT(*) over a single base table: punt to row-pump aggregate.
     // Stoolap's bare COUNT can use non-MVCC-safe table-count metadata.
     // Derived FROMs still push (no records() shortcut applies).
@@ -1340,25 +1117,6 @@ bool can_pushdown_select(THD* thd, SELECT_LEX* sel_lex,
                 }
             }
         }
-    }
-
-    if (!semantic_guards) return true;
-
-    // ci guard: bail when ci columns appear in WHERE/HAVING/ORDER/GROUP
-    // or in non-bare projections (LOWER(s), scalar subqueries, ...).
-    // trust_binary_strings opts out.
-    if (!stoolap_thd_trust_binary_strings(thd)) {
-        if (select_lex_pushdown_uses_ci(sel_lex)) return false;
-    }
-    // DECIMAL is unconditional (type mismatch, not collation): stored as
-    // TEXT, pushed numeric predicates miss.
-    if (select_lex_uses_decimal_field(sel_lex)) return false;
-    // Stoolap binds `?` only in WHERE/HAVING; placeholders elsewhere
-    // come back as NULL. Statement-wide count backstop runs at factory
-    // level, not here, to handle prepared UNIONs.
-    if (thd->lex && thd->lex->param_list.elements > 0 &&
-        select_param_in_unsafe_surface(sel_lex)) {
-        return false;
     }
 
     return true;
@@ -1510,33 +1268,20 @@ private:
 
 }  // namespace
 
-namespace stoolap_pushdown {
+namespace {
 
-select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
-                                              SELECT_LEX_UNIT* sel_unit) {
-    const bool trace = perf_trace_on();
-    const uint64_t t_factory_start = trace ? now_ns() : 0;
-    if (!can_pushdown_select(thd, sel_lex, sel_unit,
-                             /*semantic_guards=*/false)) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
+void count_miss() {
+    stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
+        1, std::memory_order_relaxed);
+}
 
-    // SQL from the prepared Item tree. Placeholders of an EXECUTE are
-    // bound Item_params there and become literals, so no parameters are
-    // passed below.
-    std::string sql, why;
-    if (!stoolap_sqlgen::gen_select(thd, sel_lex, &sql, &why)) {
-        if (stoolap_thd_explain_pushdown(thd)) {
-            sql_print_information("stoolap[explain]: not pushed: %s",
-                                  why.c_str());
-        }
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
+// Runs generated pushdown SQL eagerly and packs its rows. Eager, so any
+// stoolap-side error (unknown function, type mismatch, ...) still falls
+// back to MariaDB: once a factory returns a handler, MariaDB is committed
+// to it. stoolap_prepare catches only syntax; semantic errors surface at
+// execute time only.
+bool run_pushdown(THD* thd, const std::string& sql, PushdownPacked* packed,
+                  uint64_t* eager_ns) {
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
         thd_get_ha_data(thd, stoolap_hton));
     if (!ctx) {
@@ -1544,33 +1289,24 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
         thd_set_ha_data(thd, stoolap_hton, ctx);
     }
     StoolapDB* db = ctx->db();
-    if (!db) return nullptr;
+    if (!db) return false;
 
-    // Make sure the stoolap tx is open if the THD is inside an explicit
-    // BEGIN. external_lock on a per-table handler normally does this,
-    // but create_select can fire first when we install the pushed plan
-    // as the whole-statement executor; without this call the eager
-    // query below would route through the autocommit handle and ignore
-    // the session's snapshot. No-op outside an explicit transaction.
-    if (register_trx(thd) != 0) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
+    // Open the stoolap tx if the THD is inside an explicit BEGIN: the
+    // factories run before external_lock would, and the query below must
+    // see the session's snapshot. No-op outside an explicit transaction.
+    if (register_trx(thd) != 0) return false;
 
-    // Diagnostic: dump stoolap's own EXPLAIN of the pushed SQL to the
-    // server error log when the session has opted in. Runs an extra
-    // stoolap_query per pushed SELECT, so it's off by default. Surfaces
-    // the plan stoolap actually picked, which MariaDB's EXPLAIN hides
-    // (it just says "PUSHED SELECT" with everything else NULL).
-    if (stoolap_thd_explain_pushdown(thd)) {
+    // Diagnostic: stoolap's own EXPLAIN of the pushed SQL (MariaDB's
+    // EXPLAIN only says "PUSHED ..."). Costs an extra query, so opt-in.
+    const bool explain = stoolap_thd_explain_pushdown(thd);
+    if (explain) {
+        sql_print_information("stoolap[explain]: %s", sql.c_str());
         std::string esql = "EXPLAIN " + sql;
         StoolapRows* erows = nullptr;
         const int erc = ctx->has_tx()
                             ? stoolap_tx_query(ctx->tx(), esql.c_str(), &erows)
                             : stoolap_query(db, esql.c_str(), &erows);
         if (erc == STOOLAP_OK && erows) {
-            sql_print_information("stoolap[explain]: %s", sql.c_str());
             while (stoolap_rows_next(erows) == STOOLAP_ROW) {
                 int64_t len = 0;
                 const char* line = stoolap_rows_column_text(erows, 0, &len);
@@ -1583,40 +1319,55 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
         }
     }
 
-    // Eagerly run so we can fall back to row-pump on any stoolap-side
-    // error (unknown function, type mismatch, ...). Once we return
-    // non-NULL, MariaDB has committed and a later init_scan/next_row
-    // failure surfaces to the user instead of a clean fallback.
-    // stoolap_prepare catches only syntax; semantic errors like
-    // "Function not found: MICROSECOND" surface at execute time only.
     StoolapRows* raw = nullptr;
-    int rc;
-    const uint64_t t_eager_start = trace ? now_ns() : 0;
-    rc = ctx->has_tx() ? stoolap_tx_query(ctx->tx(), sql.c_str(), &raw)
+    const uint64_t t0 = eager_ns ? now_ns() : 0;
+    const int rc = ctx->has_tx()
+                       ? stoolap_tx_query(ctx->tx(), sql.c_str(), &raw)
                        : stoolap_query(db, sql.c_str(), &raw);
-    const uint64_t eager_ns = trace ? (now_ns() - t_eager_start) : 0;
-    if (trace) {
-        stoolap_mariadb::g_stats.perf_eager_query_ns.fetch_add(
-            eager_ns, std::memory_order_relaxed);
-    }
+    if (eager_ns) *eager_ns = now_ns() - t0;
     if (rc != STOOLAP_OK) {
-        // No error surfacing: row-pump fallback may still complete.
-        if (stoolap_thd_explain_pushdown(thd)) {
+        if (explain) {
             const char* msg = ctx->has_tx() ? stoolap_tx_errmsg(ctx->tx())
                                             : stoolap_errmsg(db);
             sql_print_information("stoolap[explain]: not pushed: %s: %s",
                                   msg ? msg : "", sql.c_str());
         }
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
+        return false;
+    }
+    packed->take(stoolap_mariadb::RowsPtr(raw));
+    return packed->ok;
+}
+
+void explain_refusal(THD* thd, const std::string& why) {
+    if (stoolap_thd_explain_pushdown(thd))
+        sql_print_information("stoolap[explain]: not pushed: %s", why.c_str());
+}
+
+}  // namespace
+
+namespace stoolap_pushdown {
+
+// SQL comes from the prepared Item tree (stoolap_sqlgen). Placeholders of
+// an EXECUTE are bound Item_params there and become literals, so no
+// parameters are passed.
+select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
+                                              SELECT_LEX_UNIT* sel_unit) {
+    const bool trace = perf_trace_on();
+    const uint64_t t_factory_start = trace ? now_ns() : 0;
+    std::string sql, why;
+    if (!can_pushdown_select(thd, sel_lex, sel_unit)) {
+        count_miss();
         return nullptr;
     }
-
+    if (!stoolap_sqlgen::gen_select(thd, sel_lex, &sql, &why)) {
+        explain_refusal(thd, why);
+        count_miss();
+        return nullptr;
+    }
     PushdownPacked packed;
-    packed.take(stoolap_mariadb::RowsPtr(raw));
-    if (!packed.ok) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
+    uint64_t eager_ns = 0;
+    if (!run_pushdown(thd, sql, &packed, trace ? &eager_ns : nullptr)) {
+        count_miss();
         return nullptr;
     }
     stoolap_mariadb::g_stats.pushdown_hits.fetch_add(1,
@@ -1624,6 +1375,8 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
     auto* h = new ha_stoolap_select_handler(thd, sel_lex, std::move(sql),
                                             std::move(packed));
     if (trace) {
+        stoolap_mariadb::g_stats.perf_eager_query_ns.fetch_add(
+            eager_ns, std::memory_order_relaxed);
         const uint64_t total = now_ns() - t_factory_start;
         stoolap_mariadb::g_stats.perf_factory_setup_ns.fetch_add(
             total > eager_ns ? total - eager_ns : 0, std::memory_order_relaxed);
@@ -1633,133 +1386,27 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
     return h;
 }
 
+// A whole UNION / INTERSECT / EXCEPT statement.
 select_handler* create_stoolap_unit_handler(THD* thd, SELECT_LEX_UNIT* unit) {
     if (!thd || !unit) return nullptr;
     SELECT_LEX* first = unit->first_select();
-    if (!first) return nullptr;
-
-    // Single-leg "unit" is handled by the SELECT factory; avoid claiming twice.
-    if (!first->next_select()) return nullptr;
-
-    // Each leg must push on its own. The bare-COUNT carve-out fires
-    // per leg too -- rare in practice for UNIONs.
+    // A single SELECT is the SELECT factory's.
+    if (!first || !first->next_select()) return nullptr;
     for (SELECT_LEX* sel = first; sel; sel = sel->next_select()) {
         if (!can_pushdown_select(thd, sel, /*sel_unit=*/nullptr)) {
-            stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-                1, std::memory_order_relaxed);
+            count_miss();
             return nullptr;
         }
     }
-
-    // Set-op-level ci guard: per-leg lets bare ci projections through
-    // (byte-safe in single SELECT) but UNION DISTINCT / INTERSECT /
-    // EXCEPT dedup compares projection bytes; a ci VARCHAR diverges.
-    if (!stoolap_thd_trust_binary_strings(thd) && unit_pushdown_uses_ci(unit)) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
+    std::string sql, why;
+    if (!stoolap_sqlgen::gen_unit(thd, unit, &sql, &why)) {
+        explain_refusal(thd, why);
+        count_miss();
         return nullptr;
     }
-    // DECIMAL bail is unconditional (type mismatch, not collation).
-    if (unit_uses_decimal_field(unit)) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-    // Unit-wide param backstop (per-leg comparison would mis-bail on
-    // UNIONs whose placeholders split across legs).
-    if (thd->lex && thd->lex->param_list.elements > 0) {
-        if (unit_param_in_unsafe_surface(unit)) {
-            stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-                1, std::memory_order_relaxed);
-            return nullptr;
-        }
-        if (statement_param_backstop_unsafe(
-                thd, unit_count_predicate_params(unit))) {
-            stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-                1, std::memory_order_relaxed);
-            return nullptr;
-        }
-    }
-
-    // SELECT_LEX_UNIT::print() emits canonical UNION form with all legs
-    // + tail clauses; QT_PARSABLE keeps it round-trippable.
-    String tmp;
-    unit->print(
-        &tmp, static_cast<enum_query_type>(QT_PARSABLE | QT_TO_SYSTEM_CHARSET));
-    if (!tmp.length()) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    // Leaves from every leg -- rewriter normalises across the union.
-    std::vector<LeafName> leaves;
-    for (SELECT_LEX* sel = first; sel; sel = sel->next_select()) {
-        collect_leaf_names(sel, leaves);
-    }
-    if (leaves.empty()) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    std::string raw(tmp.ptr(), tmp.length());
-    std::string sql = rewrite_table_names(raw, leaves, thd->db.str);
-    if (sql.empty()) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
-        thd_get_ha_data(thd, stoolap_hton));
-    if (!ctx) {
-        ctx = new stoolap_mariadb::ThdContext(&g_engine);
-        thd_set_ha_data(thd, stoolap_hton, ctx);
-    }
-    StoolapDB* db = ctx->db();
-    if (!db) return nullptr;
-
-    // create_unit can fire before external_lock; open the tx now so a
-    // pushed UNION inside START TRANSACTION sees the session's snapshot.
-    if (register_trx(thd) != 0) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    std::vector<StoolapValue> params;
-    std::vector<std::string> param_storage;
-    if (!collect_bound_params(thd, params, param_storage)) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    StoolapRows* raw_rows = nullptr;
-    int rc;
-    if (params.empty()) {
-        rc = ctx->has_tx() ? stoolap_tx_query(ctx->tx(), sql.c_str(), &raw_rows)
-                           : stoolap_query(db, sql.c_str(), &raw_rows);
-    } else {
-        const StoolapValue* pv = params.data();
-        const int32_t pn = static_cast<int32_t>(params.size());
-        rc = ctx->has_tx()
-                 ? stoolap_tx_query_params(ctx->tx(), sql.c_str(), pv, pn,
-                                           &raw_rows)
-                 : stoolap_query_params(db, sql.c_str(), pv, pn, &raw_rows);
-    }
-    if (rc != STOOLAP_OK) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
     PushdownPacked packed;
-    packed.take(stoolap_mariadb::RowsPtr(raw_rows));
-    if (!packed.ok) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
+    if (!run_pushdown(thd, sql, &packed, nullptr)) {
+        count_miss();
         return nullptr;
     }
     stoolap_mariadb::g_stats.pushdown_hits.fetch_add(1,
@@ -1829,120 +1476,51 @@ private:
     PushdownPacked packed_;
 };
 
-// SELECT_LEX::print(QT_PARSABLE) emits the inner SELECT in spec-canonical
-// form so stoolap's parser accepts it; thd->query() would carry the outer
-// statement text, not what we need to push.
-bool build_derived_sql(THD* thd, SELECT_LEX* sel_lex, std::string& out_sql) {
-    if (!thd || !sel_lex) return false;
-    String tmp;
-    sel_lex->print(
-        thd, &tmp,
-        static_cast<enum_query_type>(QT_PARSABLE | QT_TO_SYSTEM_CHARSET));
-    if (!tmp.length()) return false;
-
-    std::string raw(tmp.ptr(), tmp.length());
-    std::vector<LeafName> leaves;
-    collect_leaf_names(sel_lex, leaves);
-    if (leaves.empty()) return false;
-
-    out_sql = rewrite_table_names(raw, leaves, thd->db.str);
-    return !out_sql.empty();
-}
-
 }  // namespace
 
 namespace stoolap_pushdown {
 
+// A derived table (or its UNION) in a statement that also reads other
+// engines' tables: stoolap computes it, MariaDB joins the rest.
 derived_handler* create_stoolap_derived_handler(THD* thd, TABLE_LIST* derived) {
     if (!thd || !derived || !derived->derived) return nullptr;
-
     SELECT_LEX_UNIT* unit = derived->derived;
-    SELECT_LEX* sel = unit->first_select();
-    if (!sel) return nullptr;
+    if (!unit->first_select()) return nullptr;
 
-    // Phase 3: single-SELECT derived only. UNIONed derived tables would
-    // need the unit-shape SQL, deferred for now.
-    if (sel->next_select()) return nullptr;
-
-    // Reuse the SELECT pushdown predicate. Pass sel_unit=NULL because the
-    // derived's inner SELECT is, from the predicate's POV, a single SELECT
-    // to push -- not part of an outer UNION.
-    if (!can_pushdown_select(thd, sel, /*sel_unit=*/nullptr)) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
+    // This factory runs its query at once, during prepare. In a SELECT
+    // over stoolap tables only, the select or unit handler takes the
+    // whole statement, derived table included, and this result would be
+    // thrown away; if they cannot, MariaDB materializes the derived table.
+    if (thd->lex->sql_command == SQLCOM_SELECT) {
+        SELECT_LEX* top = derived->select_lex;
+        while (top && top->outer_select())
+            top = top->outer_select();
+        bool all_stoolap = top != nullptr, any = false;
+        for (SELECT_LEX* sl = top ? top->master_unit()->first_select()
+                                  : nullptr;
+             sl && all_stoolap; sl = sl->next_select()) {
+            bool leg_any = false;
+            all_stoolap = every_table_is_stoolap(sl, leg_any);
+            any |= leg_any;
+        }
+        if (all_stoolap && any) return nullptr;
+    }
+    for (SELECT_LEX* sel = unit->first_select(); sel;
+         sel = sel->next_select()) {
+        if (!can_pushdown_select(thd, sel, /*sel_unit=*/nullptr)) {
+            count_miss();
+            return nullptr;
+        }
+    }
+    std::string sql, why;
+    if (!stoolap_sqlgen::gen_unit(thd, unit, &sql, &why)) {
+        explain_refusal(thd, why);
+        count_miss();
         return nullptr;
     }
-
-    std::string sql;
-    if (!build_derived_sql(thd, sel, sql)) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    // Refuse prepared statements: LEX::param_list is statement-wide, but
-    // we build SQL from only the inner SELECT. Stoolap re-numbers `?`
-    // from 1 when reparsing isolated inner SQL, so outer placeholders
-    // ahead of ours would silently mis-bind the derived's params.
-    // print(QT_PARSABLE) currently substitutes bound literals; we don't
-    // rely on that.
-    if (thd->lex && thd->lex->param_list.elements > 0) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
-        thd_get_ha_data(thd, stoolap_hton));
-    if (!ctx) {
-        ctx = new stoolap_mariadb::ThdContext(&g_engine);
-        thd_set_ha_data(thd, stoolap_hton, ctx);
-    }
-    StoolapDB* db = ctx->db();
-    if (!db) return nullptr;
-
-    // create_derived can run before external_lock; open the tx now.
-    if (register_trx(thd) != 0) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    // No prepared-statement parameters here (we bailed above when
-    // present). collect_bound_params is left in place because plain
-    // SELECT pushdown still needs it; calling it for derived now is a
-    // pure no-op that returns an empty vector.
-    std::vector<StoolapValue> params;
-    std::vector<std::string> param_storage;
-    if (!collect_bound_params(thd, params, param_storage)) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    StoolapRows* raw = nullptr;
-    int rc;
-    if (params.empty()) {
-        rc = ctx->has_tx() ? stoolap_tx_query(ctx->tx(), sql.c_str(), &raw)
-                           : stoolap_query(db, sql.c_str(), &raw);
-    } else {
-        const StoolapValue* pv = params.data();
-        const int32_t pn = static_cast<int32_t>(params.size());
-        rc = ctx->has_tx()
-                 ? stoolap_tx_query_params(ctx->tx(), sql.c_str(), pv, pn, &raw)
-                 : stoolap_query_params(db, sql.c_str(), pv, pn, &raw);
-    }
-    if (rc != STOOLAP_OK) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
     PushdownPacked packed;
-    packed.take(stoolap_mariadb::RowsPtr(raw));
-    if (!packed.ok) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
+    if (!run_pushdown(thd, sql, &packed, nullptr)) {
+        count_miss();
         return nullptr;
     }
     stoolap_mariadb::g_stats.pushdown_hits.fetch_add(1,

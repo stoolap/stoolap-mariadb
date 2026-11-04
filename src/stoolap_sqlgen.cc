@@ -29,6 +29,7 @@
 #include "sql_class.h"
 #include "sql_lex.h"
 #include "sql_schema.h"
+#include "sql_cte.h"
 #include "item_sum.h"
 #include "item_subselect.h"
 #include "item_windowfunc.h"
@@ -71,11 +72,16 @@ bool numeric(Cls c) {
 class Gen {
 public:
     explicit Gen(THD* thd)
-        : trust_bin_(stoolap_thd_trust_binary_strings(thd) != 0) {}
+        : trust_bin_(stoolap_thd_trust_binary_strings(thd) != 0) {
+        out.reserve(1024);
+    }
 
     // names: output column names, one per visible item; null for
     // positional names (c0, c1, ...).
-    bool select(SELECT_LEX* sel, const std::vector<std::string>* names);
+    bool select(SELECT_LEX* sel, const std::vector<std::string>* names,
+                const std::vector<Cls>* cols = nullptr);
+    // A query expression: one SELECT, or set-operation legs.
+    bool unit(SELECT_LEX_UNIT* u, const std::vector<std::string>* names);
 
     std::string out;
     const char* why = nullptr;
@@ -85,6 +91,25 @@ public:
     bool exists_list_ = false;
 
 private:
+    // Appends a quoted identifier / a positional column name to out.
+    void ident(std::string_view s) {
+        out.push_back('"');
+        if (s.find('"') == std::string_view::npos) {
+            out.append(s);
+        } else {
+            for (char c : s) {
+                if (c == '"') out.push_back('"');
+                out.push_back(c);
+            }
+        }
+        out.push_back('"');
+    }
+    void pos_name(uint n) {
+        char buf[16];
+        const int len = std::snprintf(buf, sizeof(buf), "\"c%u\"", n);
+        out.append(buf, static_cast<size_t>(len));
+    }
+
     bool fail(const char* w) {
         if (!why) why = w;
         return false;
@@ -93,6 +118,7 @@ private:
     bool from(SELECT_LEX* sel);
     bool join_list(List<TABLE_LIST>* jl);
     bool table_ref(TABLE_LIST* t);
+    TABLE_LIST* mergeable_base(TABLE_LIST* t);
     bool condition(Item* it);
     bool expr(Item* it);
     bool literal(Item* it);
@@ -107,6 +133,7 @@ private:
     bool in_subquery(Item* left, Item_subselect* s);
     bool in_optimizer(Item_in_optimizer* o);
     bool order_list(SQL_I_List<ORDER>* lst, bool directions);
+    bool limit(SELECT_LEX* sel);
     bool branch(Item* it, Cls result);
     bool branches(Item_func* f, Item** args, uint n);
     bool frame_bound(Window_frame_bound* b);
@@ -125,6 +152,12 @@ private:
     // Columns of a derived table emitted as a subquery: the items a view
     // reference points at (field_translation) -> "alias"."column".
     std::unordered_map<const Item*, std::string> view_cols_;
+    // WHERE conditions of derived tables merged into the current SELECT's
+    // FROM without an ON to carry them (see table_ref).
+    std::vector<Item*> merged_where_;
+    // Set by table_ref for a merged derived table: its WHERE, for the
+    // caller's ON.
+    Item* merged_on_ = nullptr;
     int next_alias_ = 0;
 };
 
@@ -270,9 +303,11 @@ bool Gen::branches(Item_func* f, Item** args, uint n) {
 // SELECT
 // ---------------------------------------------------------------------------
 
-bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names) {
+// `cols`: a set-operation leg's result column types (see unit()).
+bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
+                 const std::vector<Cls>* cols) {
     if (sel->olap != UNSPECIFIED_OLAP_TYPE) return fail("WITH ROLLUP");
-    if (sel->next_select()) return fail("set operation");
+    if (sel->tvc) return fail("VALUES");
     const bool any_row = exists_list_;
     exists_list_ = false;
     if (sel->limit_params.with_ties) return fail("WITH TIES");
@@ -282,8 +317,15 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names) {
     // (including correlated subqueries below) refers to it.
     std::string head;
     head.swap(out);
+    out.reserve(512);
     if (sel->table_list.elements == 0) return fail("no table");
-    if (!from(sel)) return false;
+    std::vector<Item*> outer_merged;
+    outer_merged.swap(merged_where_);
+    const bool from_ok = from(sel);
+    std::vector<Item*> where_parts;
+    where_parts.swap(merged_where_);
+    merged_where_.swap(outer_merged);
+    if (!from_ok) return false;
     std::string from_sql;
     from_sql.swap(out);
     out.swap(head);
@@ -291,7 +333,8 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names) {
     // Without aggregates, an EXISTS sees rows whatever the list holds,
     // so it need not be translatable.
     if (any_row && !sel->with_sum_func) {
-        out += "SELECT 1 AS " + quote_ident("c0") + from_sql;
+        out += "SELECT 1";
+        out += from_sql;
     } else {
         const bool distinct = sel->options & SELECT_DISTINCT;
         out += distinct ? "SELECT DISTINCT " : "SELECT ";
@@ -300,21 +343,42 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names) {
         for (Item* item; (item = it++); ++n) {
             if (distinct && !orderable(item)) return fail("DISTINCT type");
             if (n) out += ", ";
-            if (!expr(item)) return false;
-            out += " AS ";
+            if (cols) {
+                // A leg's value must already have the result's type, or
+                // be an integer that a DOUBLE result widens.
+                if (n >= cols->size()) return fail("set operation columns");
+                const Cls want = (*cols)[n], have = cls(item);
+                if (item->type() != Item::NULL_ITEM && have != want &&
+                    !(want == Cls::REAL && have == Cls::INT))
+                    return fail("set operation column types");
+                // MariaDB dedups a DISTINCT leg's own values, then
+                // converts: 2^53 and 2^53 + 1 stay two rows, which a cast
+                // inside the DISTINCT would merge.
+                if (distinct && want == Cls::REAL && have == Cls::INT)
+                    return fail("DISTINCT leg widened to DOUBLE");
+                if (!branch(item, want)) return false;
+            } else if (!expr(item)) {
+                return false;
+            }
+            // Rows are read by position; names matter only to a derived
+            // table's outer query and to a set operation's ORDER BY.
             if (names) {
                 if (n >= names->size()) return fail("derived column names");
-                out += quote_ident((*names)[n]);
-            } else {
-                out += quote_ident("c" + std::to_string(n));
+                out += " AS ";
+                ident((*names)[n]);
+            } else if (cols) {
+                out += " AS ";
+                pos_name(n);
             }
         }
         out += from_sql;
     }
 
-    if (sel->where) {
-        out += " WHERE ";
-        if (!condition(sel->where)) return false;
+    if (sel->where) where_parts.insert(where_parts.begin(), sel->where);
+    for (size_t i = 0; i < where_parts.size(); ++i) {
+        out += i ? " AND (" : " WHERE (";
+        if (!condition(where_parts[i])) return false;
+        out.push_back(')');
     }
     if (sel->group_list.elements) {
         out += " GROUP BY ";
@@ -340,19 +404,102 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names) {
         out += " ORDER BY ";
         if (!order_list(&sel->group_list, true)) return false;
     }
-    if (sel->limit_params.explicit_limit) {
-        Item* lim = sel->limit_params.select_limit;
-        Item* off = sel->limit_params.offset_limit;
-        if (!lim || !lim->const_item() || lim->is_null())
-            return fail("LIMIT value");
-        out += " LIMIT " + std::to_string(lim->val_uint());
-        if (off) {
-            if (!off->const_item() || off->is_null())
-                return fail("OFFSET value");
-            out += " OFFSET " + std::to_string(off->val_uint());
-        }
+    return limit(sel);
+}
+
+bool Gen::limit(SELECT_LEX* sel) {
+    if (!sel->limit_params.explicit_limit) return true;
+    Item* lim = sel->limit_params.select_limit;
+    Item* off = sel->limit_params.offset_limit;
+    if (!lim || !lim->const_item() || lim->is_null())
+        return fail("LIMIT value");
+    out += " LIMIT " + std::to_string(lim->val_uint());
+    if (off) {
+        if (!off->const_item() || off->is_null()) return fail("OFFSET value");
+        out += " OFFSET " + std::to_string(off->val_uint());
     }
     return true;
+}
+
+// UNION / INTERSECT / EXCEPT [ALL] legs in their written order: stoolap
+// applies them left to right with INTERSECT first, as MariaDB does.
+bool Gen::unit(SELECT_LEX_UNIT* u, const std::vector<std::string>* names) {
+    SELECT_LEX* first = u ? u->first_select() : nullptr;
+    if (!first) return fail("empty query expression");
+    if (!first->next_select()) return select(first, names);
+    if (u->with_element && u->with_element->is_recursive)
+        return fail("recursive CTE");
+    exists_list_ = false;  // a leg's list decides what the others dedup
+
+    // The result columns' types (MariaDB's aggregate over the legs); a
+    // DISTINCT, INTERSECT or EXCEPT compares rows by them.
+    bool dedup = false;
+    for (SELECT_LEX* sl = first->next_select(); sl; sl = sl->next_select())
+        if (sl->distinct || sl->get_linkage() != UNION_TYPE) dedup = true;
+    std::vector<Cls> cols;
+    List_iterator_fast<Item> ti(u->types);
+    for (Item* t; (t = ti++);) {
+        const Cls c = cls(t);
+        if (c == Cls::UNSAFE) return fail("set operation column type");
+        if (dedup && !orderable(t)) return fail("set operation compare type");
+        cols.push_back(c);
+    }
+
+    for (SELECT_LEX* sl = first; sl; sl = sl->next_select()) {
+        if (sl != first) {
+            switch (sl->get_linkage()) {
+                case UNION_TYPE:
+                    out += " UNION ";
+                    break;
+                case INTERSECT_TYPE:
+                    out += " INTERSECT ";
+                    break;
+                case EXCEPT_TYPE:
+                    out += " EXCEPT ";
+                    break;
+                default:
+                    return fail("set operation");
+            }
+            if (!sl->distinct) out += "ALL ";
+        }
+        // A leg's own ORDER BY / LIMIT needs parentheses stoolap lacks.
+        if (sl->order_list.elements || sl->limit_params.explicit_limit)
+            return fail("set operation leg ORDER BY / LIMIT");
+        if (sl->item_list.elements != cols.size())
+            return fail("set operation columns");
+        if (!select(sl, sl == first ? names : nullptr, &cols)) return false;
+    }
+
+    // ORDER BY / LIMIT of the whole expression: its items are columns of
+    // the result table, written by position.
+    SELECT_LEX* g = u->global_parameters();
+    if (!g) return true;
+    if (g->limit_params.with_ties) return fail("WITH TIES");
+    bool first_key = true;
+    for (ORDER* o = g->order_list.first; o; o = o->next) {
+        Item* it = (o->item && *o->item) ? (*o->item)->real_item() : nullptr;
+        if (!it || it->type() != Item::FIELD_ITEM) return fail("order item");
+        const Field* f = static_cast<Item_field*>(it)->field;
+        if (!f || !u->table || f->table != u->table ||
+            u->table->s->fields < cols.size())
+            return fail("set operation ORDER BY");
+        // INTERSECT / EXCEPT keep hidden counter columns in front.
+        const uint hidden = u->table->s->fields - cols.size();
+        if (f->field_index < hidden || f->field_index - hidden >= cols.size())
+            return fail("set operation ORDER BY");
+        if (!orderable(it)) return fail("ORDER / GROUP type");
+        out += first_key ? " ORDER BY " : ", ";
+        first_key = false;
+        const uint i = f->field_index - hidden;
+        if (names && i >= names->size()) return fail("derived column names");
+        if (names)
+            ident((*names)[i]);
+        else
+            pos_name(i);
+        out += o->direction == ORDER::ORDER_DESC ? " DESC NULLS LAST"
+                                                 : " ASC NULLS FIRST";
+    }
+    return limit(g);
 }
 
 bool Gen::from(SELECT_LEX* sel) {
@@ -391,28 +538,79 @@ bool Gen::join_list(List<TABLE_LIST>* jl) {
             if (!join_list(&t->nested_join->join_list)) return false;
             continue;
         }
+        merged_on_ = nullptr;
         if (!table_ref(t)) return false;
+        Item* merged = merged_on_;
+        merged_on_ = nullptr;
         if (t->on_expr) {
             if (first) return fail("ON on first table");
-            out += " ON ";
+            out += " ON (";
             if (!condition(t->on_expr)) return false;
+            out.push_back(')');
+            // A merged derived table's WHERE filters its rows before the
+            // join, which in an ON (outer joins included) means the same.
+            if (merged) {
+                out += " AND (";
+                if (!condition(merged)) return false;
+                out.push_back(')');
+            }
         } else if (outer) {
             return fail("outer join without ON");
+        } else if (merged) {
+            merged_where_.push_back(merged);
         }
     }
     return true;
 }
 
+// A derived table (CTE, view) MariaDB would merge, over one base table:
+// that table, else nullptr. Written as the table itself, its WHERE moved
+// to the ON or the outer WHERE, and its columns as their expressions, it
+// lets stoolap join and stop at a LIMIT instead of materializing.
+TABLE_LIST* Gen::mergeable_base(TABLE_LIST* t) {
+    SELECT_LEX_UNIT* u = t->derived;
+    SELECT_LEX* d = u ? u->first_select() : nullptr;
+    if (!d || !d->is_mergeable() || d->have_window_funcs() || d->tvc ||
+        d->olap != UNSPECIFIED_OLAP_TYPE ||
+        (d->uncacheable & UNCACHEABLE_RAND) ||
+        (u->with_element && u->with_element->is_recursive))
+        return nullptr;
+    if (d->top_join_list.elements != 1) return nullptr;
+    TABLE_LIST* b = d->top_join_list.head();
+    if (!b || b->derived || b->nested_join || b->on_expr ||
+        (b->outer_join & (JOIN_TYPE_LEFT | JOIN_TYPE_RIGHT)) || !b->table ||
+        !b->table->s)
+        return nullptr;
+    // On the inner side of an outer join a NULL-complemented row must
+    // read NULL in every column: true of b's own columns, not of a
+    // constant or an expression like COALESCE(x, 0).
+    const bool outer_inner =
+        (t->outer_join & (JOIN_TYPE_LEFT | JOIN_TYPE_RIGHT)) ||
+        (t->embedding && t->embedding->outer_join);
+    if (outer_inner) {
+        List_iterator_fast<Item> it(d->item_list);
+        for (Item* item; (item = it++);)
+            if (item->real_item()->type() != Item::FIELD_ITEM) return nullptr;
+    }
+    // The same unit reached twice (a CTE used twice shares it) would give
+    // one table two aliases.
+    if (alias_.count(b)) return nullptr;
+    return b;
+}
+
 bool Gen::table_ref(TABLE_LIST* t) {
     if (t->derived) {
+        if (TABLE_LIST* b = mergeable_base(t)) {
+            if (!table_ref(b)) return false;
+            merged_on_ = t->derived->first_select()->where;
+            return true;
+        }
         // A derived table (or CTE / view) is written as a subquery from
         // its unit. A mergeable one is only merged into this select by
         // JOIN::optimize(), which a pushed select skips, so its unit
         // still holds its own WHERE here, and outer references to its
         // columns are view references into field_translation.
         SELECT_LEX_UNIT* u = t->derived;
-        if (!u->first_select() || u->first_select()->next_select())
-            return fail("derived set operation");
         const std::string alias = "d" + std::to_string(next_alias_++);
         alias_[t] = alias;
         std::vector<std::string> names;
@@ -431,7 +629,7 @@ bool Gen::table_ref(TABLE_LIST* t) {
             return fail("derived without columns");
         }
         out.push_back('(');
-        if (!select(u->first_select(), &names)) return false;
+        if (!unit(u, &names)) return false;
         out += ") AS " + alias;
         return true;
     }
@@ -439,7 +637,7 @@ bool Gen::table_ref(TABLE_LIST* t) {
     if (!t->table || !t->table->s) return fail("table without share");
     const std::string alias = "t" + std::to_string(next_alias_++);
     alias_[t] = alias;
-    out += quote_ident(stoolap_table_name(t->table->s));
+    ident(stoolap_table_name(t->table->s));
     out += " AS " + alias;
     return true;
 }
@@ -563,8 +761,8 @@ bool Gen::field(Item_field* f) {
     if (a == alias_.end()) return fail("field of unknown table");
     out += a->second;
     out.push_back('.');
-    out += quote_ident(std::string_view(f->field->field_name.str,
-                                        f->field->field_name.length));
+    ident(std::string_view(f->field->field_name.str,
+                           f->field->field_name.length));
     return true;
 }
 
@@ -899,10 +1097,12 @@ bool Gen::subselect(Item_subselect* s) {
 bool Gen::in_subquery(Item* left, Item_subselect* s) {
     if (!left || left->cols() != 1) return fail("IN subquery left");
     SELECT_LEX* inner = s->unit ? s->unit->first_select() : nullptr;
-    if (!inner || inner->item_list.elements != 1)
-        return fail("IN subquery columns");
-    if (!comparable(left, inner->item_list.head()))
-        return fail("IN subquery types");
+    if (!inner) return fail("IN subquery columns");
+    for (SELECT_LEX* sl = inner; sl; sl = sl->next_select()) {
+        if (sl->item_list.elements != 1) return fail("IN subquery columns");
+        if (!comparable(left, sl->item_list.head()))
+            return fail("IN subquery types");
+    }
     out.push_back('(');
     if (!expr(left)) return false;
     out += " IN (";
@@ -912,11 +1112,9 @@ bool Gen::in_subquery(Item* left, Item_subselect* s) {
 }
 
 bool Gen::subquery(SELECT_LEX_UNIT* u) {
-    if (!u || !u->first_select() || u->first_select()->next_select())
-        return fail("subquery set operation");
     std::string saved;
     saved.swap(out);
-    if (!select(u->first_select(), nullptr)) return false;
+    if (!unit(u, nullptr)) return false;
     saved += out;
     out.swap(saved);
     return true;
@@ -1079,7 +1277,18 @@ bool gen_select(THD* thd, st_select_lex* sel, std::string* out,
                 std::string* why) {
     Gen g(thd);
     g.top = sel;
-    if (!g.select(sel, nullptr)) {
+    if (sel->next_select() || !g.select(sel, nullptr)) {
+        if (why) *why = g.why ? g.why : "set operation leg";
+        return false;
+    }
+    *out = std::move(g.out);
+    return true;
+}
+
+bool gen_unit(THD* thd, st_select_lex_unit* unit, std::string* out,
+              std::string* why) {
+    Gen g(thd);
+    if (!g.unit(unit, nullptr)) {
         if (why) *why = g.why ? g.why : "unknown";
         return false;
     }
