@@ -51,16 +51,14 @@ enum class Enc : uint8_t {
 };
 
 // Text whose bytes are already valid UTF-8 in the same order.
+// Called per cell: a flag test for the usual utf8mb3 / utf8mb4.
 inline bool text_is_utf8(const CHARSET_INFO* cs) {
-    if (!cs || !cs->cs_name.str) return false;
-    return std::strncmp(cs->cs_name.str, "utf8", 4) == 0 ||
-           std::strcmp(cs->cs_name.str, "ascii") == 0;
+    if (!cs) return false;
+    if (cs->state & MY_CS_UNICODE) return cs->mbminlen == 1;
+    return cs->cs_name.str && std::strcmp(cs->cs_name.str, "ascii") == 0;
 }
 
 inline Enc field_enc(const Field* f) {
-    // Plugin data types (INET6, UUID, ...) report a binary STRING but
-    // read and write their text form, which is stored as is.
-    if (!f->type_handler()->is_traditional_scalar_type()) return Enc::PLAIN;
     switch (f->real_type()) {
         case MYSQL_TYPE_DATE:
         case MYSQL_TYPE_NEWDATE:
@@ -82,9 +80,14 @@ inline Enc field_enc(const Field* f) {
         case MYSQL_TYPE_BLOB:
         case MYSQL_TYPE_MEDIUM_BLOB:
         case MYSQL_TYPE_LONG_BLOB:
+            if (text_is_utf8(f->charset())) return Enc::PLAIN;
+            // Plugin data types (INET6, UUID, ...) report a binary STRING
+            // but read and write their text form, stored as is.
+            if (!f->type_handler()->is_traditional_scalar_type())
+                return Enc::PLAIN;
             if (!f->has_charset() || f->charset() == &my_charset_bin)
                 return Enc::HEX;
-            return text_is_utf8(f->charset()) ? Enc::PLAIN : Enc::TO_UTF8;
+            return Enc::TO_UTF8;
         default:
             return Enc::PLAIN;
     }
@@ -201,7 +204,13 @@ inline int hex_nibble(char c) {
 // Reader side: a TEXT cell into `f`. Stoolap text is UTF-8; a binary
 // field's text is the hex of its bytes.
 inline void store_text(Field* f, const char* s, size_t n) {
-    if (field_enc(f) == Enc::HEX && n % 2 == 0) {
+    const CHARSET_INFO* cs = f->charset();
+    if (text_is_utf8(cs)) {  // the usual case, one flag test
+        f->store(s, n, cs);
+        return;
+    }
+    const Enc enc = field_enc(f);
+    if (enc == Enc::HEX && n % 2 == 0) {
         std::string bytes(n / 2, '\0');
         bool ok = true;
         for (size_t i = 0; i < n / 2 && ok; ++i) {
@@ -214,7 +223,9 @@ inline void store_text(Field* f, const char* s, size_t n) {
             return;
         }
     }
-    f->store(s, n, &my_charset_utf8mb4_bin);
+    // TO_UTF8 text converts back; anything else (a DECIMAL's string)
+    // reads in the field's own character set, as before.
+    f->store(s, n, enc == Enc::TO_UTF8 ? &my_charset_utf8mb4_bin : cs);
 }
 
 }  // namespace stoolap_mariadb
