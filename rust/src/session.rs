@@ -17,18 +17,32 @@
 //! in the table handles, so nothing is lost moving it in and out.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use rustc_hash::FxHashMap;
 
 use stoolap::api::{Database, ParamVec};
 use stoolap::core::{Error, IsolationLevel, Result, Row};
 use stoolap::executor::{CachedPlanRef, ExecutionContext, Executor};
+use stoolap::storage::mvcc::registry::StatementView;
 use stoolap::parser::ast::{RollbackStatement, Statement};
-use stoolap::storage::traits::{QueryResult, Transaction};
+use stoolap::storage::traits::{QueryResult, Table, Transaction};
 
 pub struct Session {
     exec: Executor,
     /// Whether a transaction is installed in `exec`
     open: AtomicBool,
+    /// Direct access outside an open transaction: a transaction of its own
+    /// for the rest of the MariaDB statement, so SQL writes stay autocommit
+    read_tx: Mutex<Option<Box<dyn Transaction>>>,
+    /// The isolation level of the open transaction
+    level: Mutex<IsolationLevel>,
+    /// The table handles direct access goes through in this statement, of
+    /// the open transaction or else of `read_tx`, taken once per table;
+    /// under read committed they read through one view of the statement,
+    /// which also lets a scan stream instead of collecting every row
+    tables: Mutex<FxHashMap<String, Box<dyn Table>>>,
+    view: Mutex<Option<StatementView>>,
     /// Keeps the engine open while the session lives
     _db: Database,
 }
@@ -42,6 +56,10 @@ impl Session {
         Arc::new(Session {
             exec: Executor::new(Arc::clone(db.engine())),
             open: AtomicBool::new(false),
+            read_tx: Mutex::new(None),
+            level: Mutex::new(IsolationLevel::ReadCommitted),
+            tables: Mutex::new(FxHashMap::default()),
+            view: Mutex::new(None),
             _db: db.clone(),
         })
     }
@@ -91,8 +109,10 @@ impl Session {
         if self.in_transaction() {
             return Err(Error::internal("a transaction is already open"));
         }
+        self.end_statement();
         let tx = self.exec.begin_transaction_with_isolation(level)?;
         self.exec.install_transaction(tx);
+        *lock(&self.level) = level;
         self.open.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -111,18 +131,72 @@ impl Session {
         self.take()?.rollback()
     }
 
+    /// Runs `f` on the handle on `table` of the open transaction, or
+    /// else of the statement's own read transaction
+    pub fn with_table<R>(&self, table: &str, f: impl FnOnce(&mut dyn Table) -> Result<R>) -> Result<R> {
+        let mut tables = lock(&self.tables);
+        if !tables.contains_key(table) {
+            let handle = if self.in_transaction() {
+                // The executor holds the transaction between statements
+                let tx = self.exec.take_transaction().ok_or(Error::TransactionEnded)?;
+                let handle = self.open_table(tx.as_ref(), *lock(&self.level), table);
+                self.exec.install_transaction(tx);
+                handle?
+            } else {
+                let mut read_tx = lock(&self.read_tx);
+                if read_tx.is_none() {
+                    *read_tx = Some(self.exec.begin_transaction()?);
+                }
+                let level = self.exec.isolation_level();
+                self.open_table(read_tx.as_deref().expect("begun above"), level, table)?
+            };
+            tables.insert(table.to_string(), handle);
+        }
+        f(tables.get_mut(table).expect("inserted above").as_mut())
+    }
+
+    /// `tx`'s handle on `table`, through the statement's view under read
+    /// committed
+    fn open_table(&self, tx: &dyn Transaction, level: IsolationLevel, table: &str) -> Result<Box<dyn Table>> {
+        if level != IsolationLevel::ReadCommitted {
+            return tx.get_table(table);
+        }
+        let mut view = lock(&self.view);
+        if view.is_none() {
+            *view = Some(self.exec.engine().registry().capture_view());
+        }
+        tx.get_table_with_view(table, view.as_ref().expect("captured above").clone())
+    }
+
+    /// Ends the statement's direct access: its table handles and view, and
+    /// the read transaction if it opened one
+    pub fn end_statement(&self) {
+        lock(&self.tables).clear();
+        *lock(&self.view) = None;
+        if let Some(mut tx) = lock(&self.read_tx).take() {
+            let _ = tx.rollback(); // it wrote nothing
+        }
+    }
+
     fn take(&self) -> Result<Box<dyn Transaction>> {
         self.open.store(false, Ordering::Relaxed);
+        // The handles go before the transaction ends
+        lock(&self.tables).clear();
         self.exec.take_transaction().ok_or(Error::TransactionEnded)
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.end_statement();
         if let Some(mut tx) = self.exec.take_transaction() {
             let _ = tx.rollback();
         }
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// What may run inside an open transaction: DML and savepoints, as

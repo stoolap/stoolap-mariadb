@@ -44,10 +44,17 @@ struct StmtDeleter {
     }
 };
 
+struct CursorDeleter {
+    void operator()(StoolapCursor* p) const noexcept {
+        if (p) stoolap_cursor_close(p);
+    }
+};
+
 using DbPtr = std::unique_ptr<StoolapDB, DbDeleter>;
 using TxPtr = std::unique_ptr<StoolapTx, TxDeleter>;
 using RowsPtr = std::unique_ptr<StoolapRows, RowsDeleter>;
 using StmtPtr = std::unique_ptr<StoolapStmt, StmtDeleter>;
+using CursorPtr = std::unique_ptr<StoolapCursor, CursorDeleter>;
 
 // Owns the packed buffer from stoolap_rows_fetch_all(); destructor calls
 // stoolap_buffer_free. Avoids the std::vector::assign memcpy on the very

@@ -20,6 +20,7 @@
 //! Build: `cargo build --release --features ffi` produces `libstoolap.{so,dylib,dll}`
 
 mod database;
+mod read;
 mod error;
 mod rows;
 mod statement;
@@ -29,6 +30,7 @@ mod value;
 
 // Re-export all extern "C" functions
 pub use database::*;
+pub use read::*;
 pub use rows::*;
 pub use statement::*;
 pub use transaction::*;

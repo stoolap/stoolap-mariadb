@@ -36,6 +36,12 @@ public:
     bool has_tx() const { return static_cast<bool>(tx_); }
 
     int begin(int32_t isolation = STOOLAP_ISOLATION_READ_COMMITTED);
+
+    // Ends the read transaction direct reads opened outside a transaction
+    // (stoolap_read); called at the end of every statement.
+    void end_statement() {
+        if (db_) stoolap_end_statement(db_.get());
+    }
     int commit();
     int rollback();
 

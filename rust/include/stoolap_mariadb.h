@@ -357,6 +357,73 @@ int32_t stoolap_tx_rollback(StoolapTx* tx);
 const char* stoolap_tx_errmsg(const StoolapTx* tx);
 
 /* =========================================================================
+ * Direct reads
+ *
+ * A read goes straight to a table: no SQL text, parse or plan. It reads in
+ * the handle's open transaction, or else in a read transaction of its own
+ * that lasts until stoolap_end_statement(). Columns are named by position, which is MariaDB's field
+ * order (the plugin creates every table that way).
+ * ========================================================================= */
+
+#define STOOLAP_OP_EQ           0
+#define STOOLAP_OP_GT           1
+#define STOOLAP_OP_GE           2
+#define STOOLAP_OP_LT           3
+#define STOOLAP_OP_LE           4
+#define STOOLAP_OP_IS_NULL      5  /**< value unused */
+#define STOOLAP_OP_IS_NOT_NULL  6  /**< value unused */
+
+/** `column op value`. */
+typedef struct StoolapCond {
+    int32_t column;
+    int32_t op;
+    StoolapValue value;
+} StoolapCond;
+
+typedef struct StoolapCursor StoolapCursor;
+
+/**
+ * Open a read of `table`: the rows meeting every condition, each carrying
+ * `columns`, ordered by `order` (NULL first, all descending when `desc`),
+ * or in no set order when `norder` is 0. `table_columns` is the column
+ * count MariaDB knows; a table that differs is refused. Errors go to
+ * stoolap_errmsg(db).
+ */
+int32_t stoolap_read(
+    StoolapDB* db,
+    const char* table,
+    int32_t table_columns,
+    const int32_t* columns, int32_t ncolumns,
+    const StoolapCond* conds, int32_t nconds,
+    const int32_t* order, int32_t norder,
+    int32_t desc,
+    StoolapCursor** out_cursor
+);
+
+/**
+ * Pack the cursor's next rows, at most `max_rows`, in the
+ * stoolap_rows_fetch_all() format with empty column names. The buffer is
+ * the cursor's, valid until the next fetch or close. Returns STOOLAP_ROW
+ * with at least one row, STOOLAP_DONE at the end, STOOLAP_ERROR.
+ */
+int32_t stoolap_cursor_fetch(
+    StoolapCursor* cursor,
+    int32_t max_rows,
+    const uint8_t** out_buf,
+    int64_t* out_len
+);
+
+const char* stoolap_cursor_errmsg(const StoolapCursor* cursor);
+
+/**
+ * End the read transaction stoolap_read() opened outside a transaction.
+ * Call at the end of every statement, with the statement's cursors closed.
+ */
+void stoolap_end_statement(StoolapDB* db);
+
+void stoolap_cursor_close(StoolapCursor* cursor);
+
+/* =========================================================================
  * Result set iteration
  * ========================================================================= */
 

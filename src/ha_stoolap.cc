@@ -111,15 +111,16 @@ handler* stoolap_create_handler(handlerton* hton, TABLE_SHARE* table,
 /* ---------- Handlerton callbacks ---------- */
 
 int stoolap_commit_cb(handlerton* /*hton*/, THD* thd, bool all) {
+    auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
+        thd_get_ha_data(thd, stoolap_hton));
+    if (!ctx) return 0;
+    ctx->end_statement();
+
     // Real COMMIT is signalled either by `all=true` (explicit COMMIT) or by
     // the end-of-statement marker for an autocommit session.
     const bool real_commit =
         all || !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
-    if (!real_commit) return 0;
-
-    auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
-        thd_get_ha_data(thd, stoolap_hton));
-    if (!ctx || !ctx->has_tx()) return 0;
+    if (!real_commit || !ctx->has_tx()) return 0;
 
     int rc = ctx->commit();
     if (rc != STOOLAP_OK) {
@@ -134,13 +135,14 @@ int stoolap_commit_cb(handlerton* /*hton*/, THD* thd, bool all) {
 }
 
 int stoolap_rollback_cb(handlerton* /*hton*/, THD* thd, bool all) {
-    const bool real_rollback =
-        all || !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
-    if (!real_rollback) return 0;
-
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
         thd_get_ha_data(thd, stoolap_hton));
-    if (!ctx || !ctx->has_tx()) return 0;
+    if (!ctx) return 0;
+    ctx->end_statement();
+
+    const bool real_rollback =
+        all || !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
+    if (!real_rollback || !ctx->has_tx()) return 0;
 
     int rc = ctx->rollback();
     if (rc != STOOLAP_OK) {
@@ -2092,61 +2094,102 @@ std::string ha_stoolap::build_scan_columns() {
 int ha_stoolap::rnd_init(bool /*scan*/) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     reset_scan_state();
+    return open_read(nullptr, 0, nullptr, 0, false);
+}
 
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
+void ha_stoolap::refresh_projection() {
+    // build_scan_columns' projection without the SQL text: read_set |
+    // write_set, or every field when there are no bitmaps or no bits.
+    const uint fields = table->s->fields;
+    std::vector<uint32_t>& w = proj_words_scratch_;
+    w.assign((fields + 31) / 32, 0);
+    bool any = false;
+    if (table->read_set && table->write_set) {
+        for (uint i = 0; i < fields; ++i) {
+            if (bitmap_is_set(table->read_set, i) ||
+                bitmap_is_set(table->write_set, i)) {
+                w[i / 32] |= uint32_t(1) << (i % 32);
+                any = true;
+            }
+        }
+    } else {
+        w.clear();
+    }
+    if (w == read_cols_words_ && w == scan_proj_cols_ && !read_cols_.empty())
+        return;
+    scan_proj_.assign(fields, -1);
+    read_cols_.clear();
+    scan_buf_cell_to_field_.clear();
+    for (uint i = 0; i < fields; ++i) {
+        if (any && !(w[i / 32] & (uint32_t(1) << (i % 32)))) continue;
+        scan_proj_[i] = static_cast<int>(read_cols_.size());
+        read_cols_.push_back(static_cast<int32_t>(i));
+        scan_buf_cell_to_field_.push_back(static_cast<int>(i));
+    }
+    read_cols_words_ = w;
+    scan_proj_cols_ = w;
+}
+
+// Opens a direct read of the projected columns and loads its first chunk.
+int ha_stoolap::open_read(const StoolapCond* conds, int32_t nconds,
+                          const int32_t* order, int32_t norder, bool desc) {
+    refresh_projection();
+    const uint fields = table->s->fields;
 
     auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: SELECT failed: %s", verr.message);
+    StoolapDB* db = ctx->db();
+    if (!db) return HA_ERR_INTERNAL_ERROR;
+    StoolapCursor* cur = nullptr;
+    if (stoolap_read(db, stoolap_table_.c_str(), static_cast<int32_t>(fields),
+                     read_cols_.data(), static_cast<int32_t>(read_cols_.size()),
+                     conds, nconds, order, norder, desc ? 1 : 0,
+                     &cur) != STOOLAP_OK) {
+        auto verr = fetch_db_error(db);
+        sql_print_error("stoolap: read failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
-
-    // Buffered (fetch_all) wins on full scans (~5x less FFI traffic) but
-    // loses on early-exit plans. Stay streaming when LIMIT is explicit.
-    if (stoolap_thd_has_explicit_limit(ha_thd())) {
-        scan_.reset(rows);
-        return 0;
-    }
-
-    uint8_t* buf = nullptr;
-    int64_t blen = 0;
-    int frc = stoolap_rows_fetch_all(rows, &buf, &blen);
-    stoolap_rows_close(rows);
-    if (frc != STOOLAP_OK) {
-        if (buf) stoolap_buffer_free(buf, blen);
-        sql_print_error("stoolap: rows_fetch_all failed");
-        return HA_ERR_GENERIC;
-    }
-    // Take ownership of stoolap's allocation; std::vector::assign would memcpy.
-    scan_buf_.take(buf, blen);
-
-    if (!pkt_parse_header(scan_buf_.data(), scan_buf_.size(), &scan_buf_pos_,
-                          &scan_buf_cols_)) {
-        scan_buf_.reset();
-        sql_print_error("stoolap: malformed fetch_all header");
-        return HA_ERR_GENERIC;
-    }
-    if (scan_buf_pos_ + 4 > scan_buf_.size()) {
-        scan_buf_.reset();
-        return HA_ERR_GENERIC;
-    }
-    scan_buf_rows_left_ = pkt_le32(scan_buf_.data() + scan_buf_pos_);
-    scan_buf_pos_ += 4;
-    // Inverse of scan_proj_: cell index -> field index, for O(1) lookup
-    // per cell in rnd_next.
-    scan_buf_cell_to_field_.assign(scan_buf_cols_, -1);
-    for (size_t i = 0; i < scan_proj_.size(); ++i) {
-        const int c = scan_proj_[i];
-        if (c >= 0 && static_cast<uint32_t>(c) < scan_buf_cols_) {
-            scan_buf_cell_to_field_[c] = static_cast<int>(i);
-        }
-    }
+    cursor_.reset(cur);
+    cursor_chunk_ = stoolap_thd_has_explicit_limit(ha_thd()) ? 64 : 1024;
     stoolap_mariadb::g_stats.buffered_scans.fetch_add(
         1, std::memory_order_relaxed);
+    return next_chunk();
+}
+
+// Loads the cursor's next chunk; at the end, drops the cursor and leaves
+// no rows.
+int ha_stoolap::next_chunk() {
+    pkt_ = nullptr;
+    pkt_len_ = 0;
+    scan_buf_rows_left_ = 0;
+    const uint8_t* buf = nullptr;
+    int64_t len = 0;
+    const int rc = stoolap_cursor_fetch(
+        cursor_.get(), static_cast<int32_t>(cursor_chunk_), &buf, &len);
+    if (cursor_chunk_ < 65536) cursor_chunk_ *= 4;
+    if (rc == STOOLAP_DONE) {
+        cursor_.reset();
+        return 0;
+    }
+    if (rc != STOOLAP_ROW) {
+        StoolapErrorView verr{stoolap_cursor_errmsg(cursor_.get())};
+        sql_print_error("stoolap: read failed: %s", verr.message);
+        const int err = report_stoolap_error(verr);
+        cursor_.reset();
+        return err;
+    }
+    size_t pos = 0;
+    uint32_t cols = 0;
+    if (!pkt_parse_header(buf, static_cast<size_t>(len), &pos, &cols) ||
+        pos + 4 > static_cast<size_t>(len)) {
+        cursor_.reset();
+        sql_print_error("stoolap: malformed read chunk");
+        return HA_ERR_GENERIC;
+    }
+    pkt_ = buf;
+    pkt_len_ = static_cast<size_t>(len);
+    scan_buf_cols_ = cols;
+    scan_buf_rows_left_ = pkt_le32(buf + pos);
+    scan_buf_pos_ = pos + 4;
     stoolap_mariadb::g_stats.buffered_rows.fetch_add(scan_buf_rows_left_,
                                                      std::memory_order_relaxed);
     return 0;
@@ -2158,9 +2201,13 @@ int ha_stoolap::rnd_end() {
 }
 
 int ha_stoolap::rnd_next(uchar* buf) {
-    // Buffered path: parse next row from the packed fetch_all buffer.
-    if (!scan_buf_.empty()) {
-        if (scan_buf_rows_left_ == 0) return HA_ERR_END_OF_FILE;
+    // Direct read: parse the next row of the cursor's chunk.
+    if (cursor_ || pkt_) {
+        if (scan_buf_rows_left_ == 0) {
+            if (!cursor_) return HA_ERR_END_OF_FILE;
+            if (int err = next_chunk()) return err;
+            if (scan_buf_rows_left_ == 0) return HA_ERR_END_OF_FILE;
+        }
 
         const my_ptrdiff_t row_diff =
             static_cast<my_ptrdiff_t>(buf - table->record[0]);
@@ -2169,8 +2216,8 @@ int ha_stoolap::rnd_next(uchar* buf) {
             std::memset(buf, 0, table->s->null_bytes);
         }
 
-        const uint8_t* p = scan_buf_.data();
-        const size_t len = scan_buf_.size();
+        const uint8_t* p = pkt_;
+        const size_t len = pkt_len_;
         int err = 0;
         for (uint32_t c = 0; c < scan_buf_cols_ && !err; ++c) {
             const int field_i = (c < scan_buf_cell_to_field_.size())
@@ -2184,18 +2231,19 @@ int ha_stoolap::rnd_next(uchar* buf) {
                                       table->field[field_i]);
             }
         }
-        // On parse error, clamp rows_left to 0 so subsequent rnd_next
-        // returns EOF (the buffer offset is unrecoverable).
-        if (err)
+        // On parse error, end the read so subsequent rnd_next returns EOF
+        // (the buffer offset is unrecoverable).
+        if (err) {
             scan_buf_rows_left_ = 0;
-        else
+            cursor_.reset();
+        } else
             scan_buf_rows_left_--;
 
         move_fields(table, -row_diff);
         return err;
     }
 
-    // Streaming fallback: index_* paths set up scan_ instead of scan_buf_.
+    // Streaming SQL result: filtered range reads set up scan_.
     if (!scan_) return HA_ERR_END_OF_FILE;
 
     int rc = stoolap_rows_next(scan_.get());
@@ -2385,6 +2433,13 @@ Beyond bound_beyond(const char* op, bool is_null) {
     return upper ? Beyond::ALL : Beyond::NONE;
 }
 
+// A comparison's STOOLAP_OP_*.
+int32_t cond_op(const char* op) {
+    if (op[0] == '=') return STOOLAP_OP_EQ;
+    if (op[0] == '>') return op[1] == '=' ? STOOLAP_OP_GE : STOOLAP_OP_GT;
+    return op[1] == '=' ? STOOLAP_OP_LE : STOOLAP_OP_LT;
+}
+
 }  // namespace
 
 int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
@@ -2441,11 +2496,12 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
     move_fields(table, d);
 
-    ir_params_.clear();
+    ir_conds_.clear();
     ir_text_.resize(nparts);
 
     // Exact-lookup parts stoolap cannot test as MariaDB does stay out of
-    // the engine WHERE; index_next filters them (see key_part_needs_filter).
+    // the engine conditions; index_next filters them (see
+    // key_part_needs_filter).
     const bool trust_bin = stoolap_thd_trust_binary_strings(ha_thd());
     uint32_t filter_mask = 0;
     if (find_flag == HA_READ_KEY_EXACT) {
@@ -2455,126 +2511,65 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         }
     }
 
-    // Bind the key values; the SQL text depends only on the shape below.
-    uint32_t null_mask = 0, notnull_mask = 0, skip_mask = 0;
-    {
-        for (uint i = 0; i < nparts; ++i) {
-            if (filter_mask & (uint32_t(1) << i)) continue;
-            Field* f = key_info.key_part[i].field;
-            const char* op = (i == nparts - 1) ? last_op : "=";
-            const uint32_t bit = uint32_t(1) << i;
-            if (f->is_null() || unsigned_beyond_i64(f)) {
-                switch (bound_beyond(op, f->is_null())) {
-                    case Beyond::NONE:
-                        move_fields(table, -d);
-                        return HA_ERR_KEY_NOT_FOUND;
-                    case Beyond::IS_NULL:
-                        null_mask |= bit;
-                        break;
-                    case Beyond::NOT_NULL:
-                        notnull_mask |= bit;
-                        break;
-                    case Beyond::ALL:
-                        skip_mask |= bit;
-                        break;
-                }
-                continue;
+    // One condition per bound part: '=' on all but the last.
+    for (uint i = 0; i < nparts; ++i) {
+        if (filter_mask & (uint32_t(1) << i)) continue;
+        Field* f = key_info.key_part[i].field;
+        const char* op = (i == nparts - 1) ? last_op : "=";
+        StoolapCond c{};
+        c.column = static_cast<int32_t>(f->field_index);
+        c.op = cond_op(op);
+        if (f->is_null() || unsigned_beyond_i64(f)) {
+            switch (bound_beyond(op, f->is_null())) {
+                case Beyond::NONE:
+                    move_fields(table, -d);
+                    return HA_ERR_KEY_NOT_FOUND;
+                case Beyond::IS_NULL:
+                    c.op = STOOLAP_OP_IS_NULL;
+                    break;
+                case Beyond::NOT_NULL:
+                    c.op = STOOLAP_OP_IS_NOT_NULL;
+                    break;
+                case Beyond::ALL:
+                    continue;  // no predicate on the part
             }
-            StoolapValue v{};
-            if (!extract_field(f, v, ir_text_[i])) {
-                move_fields(table, -d);
-                return HA_ERR_UNSUPPORTED;
-            }
-            ir_params_.push_back(v);
+            ir_conds_.push_back(c);
+            continue;
         }
+        if (!extract_field(f, c.value, ir_text_[i])) {
+            move_fields(table, -d);
+            return HA_ERR_UNSUPPORTED;
+        }
+        ir_conds_.push_back(c);
     }
     move_fields(table, -d);
 
-    // Skip ORDER BY when an exact lookup is bound by a unique key (one
-    // row max). For unsorted forward scans we also drop it; backward
-    // scans still need ORDER BY DESC so index_next can forward-iterate.
+    // Order when the caller wants sorted rows or reads backward, except
+    // for an exact lookup bound by a unique key (one row at most).
     const bool exact_unique_lookup =
         find_flag == HA_READ_KEY_EXACT &&
         nparts == key_info.user_defined_key_parts &&
         (key_info.flags & HA_NOSAME);
-    const bool need_order = !exact_unique_lookup && (index_sorted_ || desc);
-
-    IndexReadShape shape;
-    shape.index = active_index;
-    shape.find_flag = static_cast<int>(find_flag);
-    shape.nparts = nparts;
-    shape.null_mask = null_mask;
-    shape.notnull_mask = notnull_mask;
-    shape.skip_mask = skip_mask;
-    shape.filter_mask = filter_mask;
-    shape.order = need_order;
-    shape.cols = projection_words();
-
-    if (!(shape == ir_shape_)) {
-        std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-        sql += quote_ident(stoolap_table_);
-        {
-            // Filtered parts are left to index_next.
-            int next_param = 1;
-            bool first = true;
-            for (uint i = 0; i < nparts; ++i) {
-                const uint32_t bit = uint32_t(1) << i;
-                if ((filter_mask | skip_mask) & bit) continue;
-                Field* f = key_info.key_part[i].field;
-                sql += first ? " WHERE " : " AND ";
-                first = false;
-                sql += quote_ident(
-                    std::string_view(f->field_name.str, f->field_name.length));
-                if (null_mask & bit) {
-                    sql += " IS NULL";
-                    continue;
-                }
-                if (notnull_mask & bit) {
-                    sql += " IS NOT NULL";
-                    continue;
-                }
-                sql.push_back(' ');
-                sql += (i == nparts - 1) ? last_op : "=";
-                sql += " $";
-                sql += std::to_string(next_param++);
-            }
+    ir_order_.clear();
+    if (!exact_unique_lookup && (index_sorted_ || desc)) {
+        // A filtered part is an equality MariaDB's collation decides: its
+        // matches all sort as one key value, so ordering by their stoolap
+        // bytes would break the order of the parts after it. So is a part
+        // bound by '=' (or IS NULL): every row has the same value there,
+        // and sorting by it only costs a sort.
+        const bool last_eq = std::strcmp(last_op, "=") == 0;
+        for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
+            if (filter_mask & (uint32_t(1) << i)) continue;
+            if (i + 1 < nparts || (i + 1 == nparts && last_eq)) continue;
+            ir_order_.push_back(
+                static_cast<int32_t>(key_info.key_part[i].field->field_index));
         }
-        if (need_order) {
-            // A filtered part is an equality MariaDB's collation decides:
-            // its matches all sort as one key value, so ordering by their
-            // stoolap bytes would break the order of the parts after it.
-            // So is a part bound by '=' (or IS NULL): every row has the
-            // same value there, and sorting by it only costs a sort.
-            const bool last_eq = std::strcmp(last_op, "=") == 0;
-            bool first = true;
-            for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
-                if (filter_mask & (uint32_t(1) << i)) continue;
-                if (i + 1 < nparts || (i + 1 == nparts && last_eq)) continue;
-                sql += first ? " ORDER BY " : ", ";
-                first = false;
-                Field* f = key_info.key_part[i].field;
-                sql += quote_ident(
-                    std::string_view(f->field_name.str, f->field_name.length));
-                if (desc) sql += " DESC";
-            }
-        }
-        ir_sql_ = std::move(sql);
-        ir_shape_ = std::move(shape);
-    } else if (scan_proj_cols_ != ir_shape_.cols) {
-        // A scan with another projection rebuilt scan_proj_ since.
-        (void)build_scan_columns();
     }
 
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    int rc = query_params_via(ctx, db_raw(), ir_sql_.c_str(), ir_params_.data(),
-                              static_cast<int32_t>(ir_params_.size()), &rows);
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: index_read SELECT failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    scan_.reset(rows);
+    if (int err = open_read(
+            ir_conds_.data(), static_cast<int32_t>(ir_conds_.size()),
+            ir_order_.data(), static_cast<int32_t>(ir_order_.size()), desc))
+        return err;
 
     if (filter_mask) {
         key_filter_active_ = true;

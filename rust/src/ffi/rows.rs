@@ -239,7 +239,7 @@ pub(crate) fn reset_packed(buf: &mut Vec<u8>) {
 
 /// Writes the column names and a zero row count, returning where the
 /// row count sits so `write_rows` can patch it
-fn write_header<'a>(names: impl ExactSizeIterator<Item = &'a [u8]>, buf: &mut Vec<u8>) -> usize {
+pub(crate) fn write_header<'a>(names: impl ExactSizeIterator<Item = &'a [u8]>, buf: &mut Vec<u8>) -> usize {
     buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
     for name in names {
         buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -248,6 +248,76 @@ fn write_header<'a>(names: impl ExactSizeIterator<Item = &'a [u8]>, buf: &mut Ve
     let count_at = buf.len();
     buf.extend_from_slice(&0u32.to_le_bytes());
     count_at
+}
+
+/// Packs one cell: a type tag and its payload (see `stoolap_rows_fetch_all`)
+pub(crate) fn write_value(val: Option<&Value>, buf: &mut Vec<u8>) -> Result<()> {
+    match val {
+        None => {
+            buf.push(0); // TYPE_NULL
+        }
+        Some(val) if val.is_null() => {
+            buf.push(0); // TYPE_NULL
+        }
+        Some(val) => match val.data_type() {
+            DataType::Null => {
+                buf.push(0);
+            }
+            DataType::Integer => {
+                buf.push(1);
+                let v = val.as_int64().unwrap_or(0);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            DataType::Float => {
+                buf.push(2);
+                let v = val.as_float64().unwrap_or(0.0);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            DataType::Text => {
+                buf.push(3);
+                let s = val.as_str().unwrap_or("");
+                buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+            DataType::Boolean => {
+                buf.push(4);
+                buf.push(if val.as_boolean().unwrap_or(false) {
+                    1
+                } else {
+                    0
+                });
+            }
+            DataType::Timestamp => {
+                buf.push(5);
+                let nanos = match val.as_timestamp() {
+                    Some(ts) => stoolap::core::value::timestamp_nanos(&ts)?,
+                    None => 0,
+                };
+                buf.extend_from_slice(&nanos.to_le_bytes());
+            }
+            DataType::Json => {
+                buf.push(6);
+                let s = val.as_str().unwrap_or("");
+                buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+            DataType::Vector => {
+                buf.push(7);
+                if let Value::Extension(data) = val {
+                    if data.first() == Some(&(DataType::Vector as u8)) {
+                        let payload = &data[1..];
+                        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(payload);
+                    } else {
+                        buf.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                } else {
+                    buf.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+        },
+    }
+    Ok(())
 }
 
 /// Packs up to `max_rows` rows and patches the count at `count_at`. A
@@ -263,71 +333,7 @@ fn write_rows(
     while (row_count as usize) < max_rows && rows.advance() {
         let row = rows.current_row();
         for i in 0..col_count {
-            match row.get(i) {
-                None => {
-                    buf.push(0); // TYPE_NULL
-                }
-                Some(val) if val.is_null() => {
-                    buf.push(0); // TYPE_NULL
-                }
-                Some(val) => match val.data_type() {
-                    DataType::Null => {
-                        buf.push(0);
-                    }
-                    DataType::Integer => {
-                        buf.push(1);
-                        let v = val.as_int64().unwrap_or(0);
-                        buf.extend_from_slice(&v.to_le_bytes());
-                    }
-                    DataType::Float => {
-                        buf.push(2);
-                        let v = val.as_float64().unwrap_or(0.0);
-                        buf.extend_from_slice(&v.to_le_bytes());
-                    }
-                    DataType::Text => {
-                        buf.push(3);
-                        let s = val.as_str().unwrap_or("");
-                        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                        buf.extend_from_slice(s.as_bytes());
-                    }
-                    DataType::Boolean => {
-                        buf.push(4);
-                        buf.push(if val.as_boolean().unwrap_or(false) {
-                            1
-                        } else {
-                            0
-                        });
-                    }
-                    DataType::Timestamp => {
-                        buf.push(5);
-                        let nanos = match val.as_timestamp() {
-                            Some(ts) => stoolap::core::value::timestamp_nanos(&ts)?,
-                            None => 0,
-                        };
-                        buf.extend_from_slice(&nanos.to_le_bytes());
-                    }
-                    DataType::Json => {
-                        buf.push(6);
-                        let s = val.as_str().unwrap_or("");
-                        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                        buf.extend_from_slice(s.as_bytes());
-                    }
-                    DataType::Vector => {
-                        buf.push(7);
-                        if let Value::Extension(data) = val {
-                            if data.first() == Some(&(DataType::Vector as u8)) {
-                                let payload = &data[1..];
-                                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                                buf.extend_from_slice(payload);
-                            } else {
-                                buf.extend_from_slice(&0u32.to_le_bytes());
-                            }
-                        } else {
-                            buf.extend_from_slice(&0u32.to_le_bytes());
-                        }
-                    }
-                },
-            }
+            write_value(row.get(i), buf)?;
         }
         row_count += 1;
     }
