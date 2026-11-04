@@ -51,7 +51,7 @@ jobs:
       # pinned v0.5.0 row next to it.
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             lib: libstoolap.so
             stoolap_version: main
@@ -153,6 +153,13 @@ jobs:
           install -m 0755 stoolap-fake/target/release/libstoolap.dylib \
             $MARIADB_PREFIX/lib/plugin/
 
+      - name: Set up Python
+        # Pinned: mysql-connector-python fails to import on Python 3.15
+        # (ssl.PROTOCOL_TLSv1 removed), which macos-latest now ships.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
       - name: Install Python deps
         run: python3 -m pip install --break-system-packages --user mysql-connector-python
 
@@ -170,7 +177,10 @@ jobs:
   test-linux:
     name: Test on Ubuntu (${{ matrix.version_label }}, MariaDB 11.4)
     needs: build-lib
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, which MariaDB's repo has no
+    # 11.4 packages for. build-lib's Linux row uses the same image so
+    # libstoolap.so is linked against the glibc it runs with.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -221,8 +231,15 @@ jobs:
       - name: Install plugin
         run: sudo install -m 0755 build/ha_stoolap.so $MARIADB_PLUGIN_DIR/
 
+      - name: Set up Python
+        # Pinned: mysql-connector-python fails to import on Python 3.15
+        # (ssl.PROTOCOL_TLSv1 removed), which macos-latest now ships.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
       - name: Install Python deps
-        run: pip install --user mysql-connector-python
+        run: python3 -m pip install --user mysql-connector-python
 
       - name: Run tests
         run: python3 tests/runner.py

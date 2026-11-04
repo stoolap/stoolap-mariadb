@@ -28,6 +28,7 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import filecmp
 import importlib.util
 import os
 import shutil
@@ -155,18 +156,17 @@ class ServerCtx:
             return
 
         # Install the plugin into MariaDB's plugin dir. Skip if the
-        # destination is at least as new as our build artifact -- that's
-        # the CI flow, where the workflow has already done a `sudo
-        # install` before invoking the runner and the runner itself
-        # doesn't have sudo. mtime comparison catches "you forgot to
-        # re-copy after rebuilding" without needing a content hash;
-        # byte-size equality is not safe because two builds can produce
-        # identically-sized .so files (different inline expansion, same
-        # total bytes) and silently mask edits.
+        # destination already holds the same bytes -- that's the CI flow,
+        # where the workflow has already done a `sudo install` before
+        # invoking the runner and the runner itself doesn't have sudo.
+        # Compare contents: byte-size equality misses two builds of equal
+        # size, and an mtime gate keeps a copy installed from a different
+        # build (say an older checkout's) because the copy is newer than
+        # this artifact.
         dst = f"{self.plugin_dir}/ha_stoolap.so"
         try:
             if (os.path.exists(dst) and
-                    os.path.getmtime(dst) >= os.path.getmtime(self.plugin)):
+                    filecmp.cmp(dst, self.plugin, shallow=False)):
                 pass  # destination is up-to-date; CI flow
             else:
                 shutil.copyfile(self.plugin, dst)

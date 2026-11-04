@@ -96,6 +96,7 @@ StoolapErrorView fetch_db_error(StoolapDB* db);
 StoolapErrorView fetch_tx_error(StoolapTx* tx);
 StoolapErrorView fetch_stmt_error(StoolapStmt* stmt);
 int report_stoolap_error(const StoolapErrorView& v);
+int raise_commit_error(const char* msg);
 
 namespace {
 
@@ -122,14 +123,12 @@ int stoolap_commit_cb(handlerton* /*hton*/, THD* thd, bool all) {
 
     int rc = ctx->commit();
     if (rc != STOOLAP_OK) {
-        // stoolap_tx_commit consumes the tx handle; querying its error
-        // message after the call is impossible. Dominant failure mode
-        // is write conflict, so map to LOCK_DEADLOCK / 40001 for retry.
-        const char* msg = stoolap_errmsg(ctx->db());
-        sql_print_error(
-            "stoolap: COMMIT failed: %s",
-            (msg && *msg) ? msg : "(no detail; tx already consumed)");
-        return HA_ERR_LOCK_DEADLOCK;
+        // stoolap_tx_commit consumes the tx handle; its error is left in
+        // the thread-local slot stoolap_errmsg(NULL) reads.
+        const char* msg = stoolap_errmsg(nullptr);
+        sql_print_error("stoolap: COMMIT failed: %s",
+                        (msg && *msg) ? msg : "(no detail)");
+        return raise_commit_error(msg);
     }
     return 0;
 }
@@ -409,6 +408,10 @@ ErrcodeMap map_stoolap_error(const char* msg) {
     static constexpr Pattern kTable[] = {
         {"primary key constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
         {"unique constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
+        // Parent side (DELETE / UPDATE of a referenced row): "...
+        // still referenced by table 'C'". The child side ("referenced row
+        // ... does not exist") falls through to NO_REFERENCED_ROW.
+        {"still referenced by table", HA_ERR_ROW_IS_REFERENCED, CONTAINS},
         {"foreign key constraint violation", HA_ERR_NO_REFERENCED_ROW, PREFIX},
         // Anchored so future similar wordings don't match by accident.
         {"not null constraint failed", HA_ERR_GENERIC, PREFIX},
@@ -471,6 +474,35 @@ int report_stoolap_error(const StoolapErrorView& v) {
     const bool needs_text = (rc == HA_ERR_GENERIC || rc == HA_ERR_UNSUPPORTED);
     if (needs_text && have_text) {
         my_printf_error(ER_GET_ERRMSG, "stoolap: %s", MYF(0), msg);
+    }
+    return rc;
+}
+
+// MariaDB reports any commit-callback failure as ER_ERROR_DURING_COMMIT
+// (1180) unless an error is already raised, and stoolap checks UPDATE's
+// UNIQUE constraints at commit. Raise the mapped error first so the
+// client sees 1062 / 1451 / 1452 / 1213 as it would for the statement.
+int raise_commit_error(const char* msg) {
+    const StoolapErrorView v{msg ? msg : ""};
+    if (!*v.message) return HA_ERR_LOCK_DEADLOCK;
+    const int rc = report_stoolap_error(v);
+    switch (rc) {
+        case HA_ERR_FOUND_DUPP_KEY:
+            my_printf_error(ER_DUP_ENTRY, "stoolap: %s", MYF(0), v.message);
+            break;
+        case HA_ERR_NO_REFERENCED_ROW:
+            my_printf_error(ER_NO_REFERENCED_ROW_2, "stoolap: %s", MYF(0),
+                            v.message);
+            break;
+        case HA_ERR_ROW_IS_REFERENCED:
+            my_printf_error(ER_ROW_IS_REFERENCED_2, "stoolap: %s", MYF(0),
+                            v.message);
+            break;
+        case HA_ERR_LOCK_DEADLOCK:
+            my_error(ER_LOCK_DEADLOCK, MYF(0));
+            break;
+        default:
+            break;  // report_stoolap_error raised ER_GET_ERRMSG
     }
     return rc;
 }
@@ -1767,6 +1799,10 @@ int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
             auto verr = fetch_error_via(ctx, db_raw());
             sql_print_error("stoolap: UPDATE failed: %s", verr.message);
             err = report_stoolap_error(verr);
+            if (err == HA_ERR_FOUND_DUPP_KEY) {
+                last_dup_key_ = errkey_from_view(verr, table->s);
+                errkey = last_dup_key_;
+            }
         } else if (affected == 0) {
             err =
                 HA_ERR_RECORD_DELETED;  // row vanished between scan and update
@@ -2549,9 +2585,10 @@ int ha_stoolap::index_first(uchar* buf) {
         sql += quote_ident(
             std::string_view(f->field_name.str, f->field_name.length));
     }
-    // One-row probe (MIN/MAX, existence). Without LIMIT 1 we'd pay for
-    // sorting the whole stream and discard everything after the first row.
-    sql += " LIMIT 1";
+    // No LIMIT 1: besides MIN probes, MariaDB runs ordered full index
+    // scans (UPDATE/DELETE ... ORDER BY pk LIMIT n) as index_first then
+    // index_next, which reads on from this stream. (index_last stays a
+    // one-row probe: without HA_READ_PREV nothing scans backwards.)
     auto* ctx = get_thd_ctx(ha_thd());
     StoolapRows* rows = nullptr;
     int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);

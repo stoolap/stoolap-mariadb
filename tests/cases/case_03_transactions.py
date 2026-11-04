@@ -77,3 +77,51 @@ SELECT COUNT(*) FROM acct WHERE id = 3;
 """, force=True)
     last = out.strip().splitlines()[-1] if out.strip() else ""
     h.assert_eq("post-error rollback", "0", last)
+
+    h.section("Row-pump UPDATE keeps per-row duplicate handling")
+    # Stoolap checks UPDATE's UNIQUE constraints at commit inside a tx.
+    # Autocommit row-pump UPDATE must therefore not run in a statement
+    # tx: the duplicate has to reach MariaDB from update_row, for IGNORE,
+    # ODKU and AFTER triggers on other engines to behave as on InnoDB.
+    h.exec_script(f"""
+CREATE TABLE st_u (id INT NOT NULL PRIMARY KEY, u INT NOT NULL,
+                   UNIQUE KEY st_uu (u)) ENGINE={h.engine};
+INSERT INTO st_u VALUES (1, 1), (2, 3), (3, 6);
+CREATE TABLE st_ig (id INT NOT NULL PRIMARY KEY, u INT NOT NULL,
+                    UNIQUE KEY st_igu (u)) ENGINE={h.engine};
+INSERT INTO st_ig VALUES (1, 10), (2, 20), (3, 30);
+CREATE TABLE st_sw (id INT NOT NULL PRIMARY KEY, u INT NOT NULL,
+                    UNIQUE KEY st_swu (u)) ENGINE={h.engine};
+INSERT INTO st_sw VALUES (1, 10), (2, 20);
+CREATE TABLE st_tr (id INT NOT NULL PRIMARY KEY, u INT NOT NULL,
+                    UNIQUE KEY st_tru (u)) ENGINE={h.engine};
+INSERT INTO st_tr VALUES (1, 10), (2, 20);
+CREATE TABLE st_audit (id INT NOT NULL) ENGINE=InnoDB;
+CREATE TRIGGER st_tr_au AFTER UPDATE ON st_tr FOR EACH ROW
+    INSERT INTO st_audit VALUES (NEW.id);
+""")
+    h.assert_ok("UPDATE IGNORE skips only the conflicting row",
+                "UPDATE IGNORE st_ig SET u = IF(id = 1, 11, 30) "
+                "WHERE id <= 2 LIMIT 2")
+    h.assert_scalar("UPDATE IGNORE kept the valid row",
+                    "SELECT GROUP_CONCAT(u ORDER BY id) FROM st_ig",
+                    "11,20,30")
+    h.assert_err("ODKU swapping two UNIQUE values is refused",
+                 "INSERT INTO st_sw VALUES (1, 20), (2, 10) "
+                 "ON DUPLICATE KEY UPDATE u = VALUES(u)", "1062")
+    h.assert_err("failing UPDATE with an AFTER trigger on InnoDB",
+                 "UPDATE st_tr SET u = 20 WHERE id = 1 LIMIT 1", "1062")
+    h.assert_scalar("the trigger's InnoDB row did not survive",
+                    "SELECT COUNT(*) FROM st_audit", "0")
+
+    h.section("UPDATE duplicate found at COMMIT reports 1062")
+    # Stoolap checks UPDATE's UNIQUE constraints at commit inside an
+    # explicit transaction; the commit error must keep its class.
+    rc, out = h.run_client("""
+START TRANSACTION;
+UPDATE st_u SET u = 3 WHERE id = 1;
+COMMIT;
+""", force=True)
+    h.assert_eq("COMMIT duplicate errno", True, "ERROR 1062" in out)
+    h.assert_scalar("COMMIT duplicate rolled back",
+                    "SELECT GROUP_CONCAT(u ORDER BY id) FROM st_u", "1,3,6")

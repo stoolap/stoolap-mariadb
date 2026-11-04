@@ -58,6 +58,13 @@ jobs:
             -DSTOOLAP_DIR=$PWD/stoolap-fake
           cmake --build build -j
 
+      - name: Set up Python
+        # Pinned: mysql-connector-python fails to import on Python 3.15
+        # (ssl.PROTOCOL_TLSv1 removed), which macos-latest now ships.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
       - name: Install Python deps
         run: python3 -m pip install --break-system-packages --user mysql-connector-python
 

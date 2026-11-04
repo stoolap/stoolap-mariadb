@@ -619,8 +619,11 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
                 my_printf_error(ER_DUP_ENTRY, "stoolap: %s", MYF(0), msg);
                 break;
             case HA_ERR_NO_REFERENCED_ROW:
-            case HA_ERR_ROW_IS_REFERENCED:
                 my_printf_error(ER_NO_REFERENCED_ROW_2, "stoolap: %s", MYF(0),
+                                msg);
+                break;
+            case HA_ERR_ROW_IS_REFERENCED:
+                my_printf_error(ER_ROW_IS_REFERENCED_2, "stoolap: %s", MYF(0),
                                 msg);
                 break;
             case HA_ERR_LOCK_DEADLOCK:
