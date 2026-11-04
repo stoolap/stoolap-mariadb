@@ -85,6 +85,14 @@ def _show_cell(c):
         return "NULL"
     if c[0] == "bytes":
         return "0x" + c[1].hex()
+    if c[0] == "time":
+        us = (c[1] * 86400 + c[2]) * 1_000_000 + c[3]
+        sign, us = ("-", -us) if us < 0 else ("", us)
+        secs, frac = divmod(us, 1_000_000)
+        h, rem = divmod(secs, 3600)
+        m, sec = divmod(rem, 60)
+        return (f"{sign}{h:02d}:{m:02d}:{sec:02d}"
+                + (f".{frac:06d}" if frac else ""))
     return c[1]
 
 
