@@ -37,11 +37,10 @@ Subsystems that have settled recently:
   read-committed otherwise. `START TRANSACTION WITH CONSISTENT
   SNAPSHOT` is hooked through the `start_consistent_snapshot`
   handlerton callback.
-- `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT` route
-  through `stoolap_tx_savepoint` / `stoolap_tx_release_savepoint` /
-  `stoolap_tx_rollback_to_savepoint`. Names are synthesised
-  per-connection because MariaDB does not pass the user's SAVEPOINT
-  name to the engine.
+- `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT` run
+  as SQL on the open stoolap transaction (`stoolap_tx_exec`). Names
+  are synthesised per-connection because MariaDB does not pass the
+  user's SAVEPOINT name to the engine.
 - Error mapping: stoolap's error text (`*_errmsg`) is matched against
   a pattern table (`map_stoolap_error`) that picks the HA_ERR_*;
   wordings it doesn't cover bump `Stoolap_unmapped_errors`.

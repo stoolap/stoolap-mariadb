@@ -199,6 +199,21 @@ void format_savepoint_slot(StoolapSavepointSlot* slot, uint64_t id) {
     slot->name_len = static_cast<uint8_t>(n);
 }
 
+// Runs "<verb> <slot name>" on the open tx; stoolap executes SAVEPOINT /
+// RELEASE SAVEPOINT / ROLLBACK TO SAVEPOINT as SQL on a tx handle.
+int exec_savepoint_sql(stoolap_mariadb::ThdContext* ctx, const char* verb,
+                       const StoolapSavepointSlot* slot) {
+    char sql[64];
+    std::snprintf(sql, sizeof(sql), "%s %.*s", verb,
+                  static_cast<int>(slot->name_len), slot->name);
+    if (stoolap_tx_exec(ctx->tx(), sql, nullptr) != STOOLAP_OK) {
+        auto verr = fetch_tx_error(ctx->tx());
+        sql_print_error("stoolap: %s failed: %s", verb, verr.message);
+        return report_stoolap_error(verr);
+    }
+    return 0;
+}
+
 int stoolap_savepoint_set_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     auto* ctx = get_thd_ctx(thd);
     if (!ctx || !ctx->has_tx()) {
@@ -207,43 +222,23 @@ int stoolap_savepoint_set_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     }
     auto* slot = static_cast<StoolapSavepointSlot*>(sv);
     format_savepoint_slot(slot, ctx->next_savepoint_id());
-    int rc = stoolap_tx_savepoint(ctx->tx(), slot->name,
-                                  static_cast<int32_t>(slot->name_len));
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_tx_error(ctx->tx());
-        sql_print_error("stoolap: SAVEPOINT failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    return 0;
+    return exec_savepoint_sql(ctx, "SAVEPOINT", slot);
 }
 
 int stoolap_savepoint_release_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     auto* ctx = get_thd_ctx(thd);
     // Tx already gone (commit/rollback ran first): savepoint dissolved with it.
     if (!ctx || !ctx->has_tx()) return 0;
-    auto* slot = static_cast<StoolapSavepointSlot*>(sv);
-    int rc = stoolap_tx_release_savepoint(ctx->tx(), slot->name,
-                                          static_cast<int32_t>(slot->name_len));
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_tx_error(ctx->tx());
-        sql_print_error("stoolap: RELEASE SAVEPOINT failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    return 0;
+    return exec_savepoint_sql(ctx, "RELEASE SAVEPOINT",
+                              static_cast<StoolapSavepointSlot*>(sv));
 }
 
 int stoolap_savepoint_rollback_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     auto* ctx = get_thd_ctx(thd);
     if (!ctx || !ctx->has_tx()) return 0;
-    auto* slot = static_cast<StoolapSavepointSlot*>(sv);
-    int rc = stoolap_tx_rollback_to_savepoint(
-        ctx->tx(), slot->name, static_cast<int32_t>(slot->name_len));
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_tx_error(ctx->tx());
-        sql_print_error("stoolap: ROLLBACK TO SAVEPOINT failed: %s",
-                        verr.message);
-        return report_stoolap_error(verr);
-    }
+    int rc = exec_savepoint_sql(ctx, "ROLLBACK TO SAVEPOINT",
+                                static_cast<StoolapSavepointSlot*>(sv));
+    if (rc) return rc;
     // We track count deltas at tx granularity, not per-savepoint, so any
     // adjusted count is now wrong; re-fetch on next read.
     ctx->invalidate_dirty_records();
