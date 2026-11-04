@@ -85,18 +85,16 @@ int register_trx(THD* thd) {
     return 0;
 }
 
-// Pointers inside `details` remain valid only until the next FFI call on
-// the originating handle, so consume the view inline before issuing any
-// further FFI on that handle. `details.message` is normalised to "".
+// `message` remains valid only until the next FFI call on the originating
+// handle, so consume the view inline before issuing any further FFI on
+// that handle. Never NULL; normalised to "".
 struct StoolapErrorView {
-    int32_t code;
-    StoolapErrorDetails details;
+    const char* message;
 };
 
 StoolapErrorView fetch_db_error(StoolapDB* db);
 StoolapErrorView fetch_tx_error(StoolapTx* tx);
 StoolapErrorView fetch_stmt_error(StoolapStmt* stmt);
-StoolapErrorView fetch_rows_error(StoolapRows* rows);
 int report_stoolap_error(const StoolapErrorView& v);
 
 namespace {
@@ -201,6 +199,21 @@ void format_savepoint_slot(StoolapSavepointSlot* slot, uint64_t id) {
     slot->name_len = static_cast<uint8_t>(n);
 }
 
+// Runs "<verb> <slot name>" on the open tx; stoolap executes SAVEPOINT /
+// RELEASE SAVEPOINT / ROLLBACK TO SAVEPOINT as SQL on a tx handle.
+int exec_savepoint_sql(stoolap_mariadb::ThdContext* ctx, const char* verb,
+                       const StoolapSavepointSlot* slot) {
+    char sql[64];
+    std::snprintf(sql, sizeof(sql), "%s %.*s", verb,
+                  static_cast<int>(slot->name_len), slot->name);
+    if (stoolap_tx_exec(ctx->tx(), sql, nullptr) != STOOLAP_OK) {
+        auto verr = fetch_tx_error(ctx->tx());
+        sql_print_error("stoolap: %s failed: %s", verb, verr.message);
+        return report_stoolap_error(verr);
+    }
+    return 0;
+}
+
 int stoolap_savepoint_set_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     auto* ctx = get_thd_ctx(thd);
     if (!ctx || !ctx->has_tx()) {
@@ -209,44 +222,23 @@ int stoolap_savepoint_set_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     }
     auto* slot = static_cast<StoolapSavepointSlot*>(sv);
     format_savepoint_slot(slot, ctx->next_savepoint_id());
-    int rc = stoolap_tx_savepoint(ctx->tx(), slot->name,
-                                  static_cast<int32_t>(slot->name_len));
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_tx_error(ctx->tx());
-        sql_print_error("stoolap: SAVEPOINT failed: %s", verr.details.message);
-        return report_stoolap_error(verr);
-    }
-    return 0;
+    return exec_savepoint_sql(ctx, "SAVEPOINT", slot);
 }
 
 int stoolap_savepoint_release_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     auto* ctx = get_thd_ctx(thd);
     // Tx already gone (commit/rollback ran first): savepoint dissolved with it.
     if (!ctx || !ctx->has_tx()) return 0;
-    auto* slot = static_cast<StoolapSavepointSlot*>(sv);
-    int rc = stoolap_tx_release_savepoint(ctx->tx(), slot->name,
-                                          static_cast<int32_t>(slot->name_len));
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_tx_error(ctx->tx());
-        sql_print_error("stoolap: RELEASE SAVEPOINT failed: %s",
-                        verr.details.message);
-        return report_stoolap_error(verr);
-    }
-    return 0;
+    return exec_savepoint_sql(ctx, "RELEASE SAVEPOINT",
+                              static_cast<StoolapSavepointSlot*>(sv));
 }
 
 int stoolap_savepoint_rollback_cb(handlerton* /*hton*/, THD* thd, void* sv) {
     auto* ctx = get_thd_ctx(thd);
     if (!ctx || !ctx->has_tx()) return 0;
-    auto* slot = static_cast<StoolapSavepointSlot*>(sv);
-    int rc = stoolap_tx_rollback_to_savepoint(
-        ctx->tx(), slot->name, static_cast<int32_t>(slot->name_len));
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_tx_error(ctx->tx());
-        sql_print_error("stoolap: ROLLBACK TO SAVEPOINT failed: %s",
-                        verr.details.message);
-        return report_stoolap_error(verr);
-    }
+    int rc = exec_savepoint_sql(ctx, "ROLLBACK TO SAVEPOINT",
+                                static_cast<StoolapSavepointSlot*>(sv));
+    if (rc) return rc;
     // We track count deltas at tx granularity, not per-savepoint, so any
     // adjusted count is now wrong; re-fetch on next read.
     ctx->invalidate_dirty_records();
@@ -295,58 +287,27 @@ int query_params_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
                                 out_rows);
 }
 
-// O(1) MVCC-safe table count. tx-side sees this session's uncommitted
-// INSERT/DELETE; db-side returns the autocommit-visible count.
-int count_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
-              const char* table, uint64_t* out_count) {
-    if (ctx && ctx->has_tx()) {
-        return stoolap_tx_table_count(ctx->tx(), table, out_count);
-    }
-    return stoolap_table_count(warm_db(ctx, fallback), table, out_count);
-}
-
 }  // namespace (helpers below have external linkage so
 // ha_stoolap_select.cc can call them.)
 
 namespace {
 
-// Defensive: callers fetch only AFTER a non-OK FFI rc, so STOOLAP_ERR_OK
-// here means the error fetch itself is broken (NULL handle, wrong handle).
-// Promote to GENERIC so map_stoolap_errcode can't silently return 0.
-StoolapErrorView finish_view(StoolapErrorView v) {
-    if (!v.details.message) v.details.message = "";
-    v.code = v.details.code;
-    if (v.code == STOOLAP_ERR_OK) {
-        v.code = STOOLAP_ERR_GENERIC;
-        v.details.code = STOOLAP_ERR_GENERIC;
-    }
-    return v;
+StoolapErrorView make_view(const char* msg) {
+    return StoolapErrorView{msg ? msg : ""};
 }
 
 }  // namespace
 
 StoolapErrorView fetch_db_error(StoolapDB* db) {
-    StoolapErrorView v{};
-    if (db) (void)stoolap_errdetails(db, &v.details);
-    return finish_view(v);
+    return make_view(db ? stoolap_errmsg(db) : nullptr);
 }
 
 StoolapErrorView fetch_tx_error(StoolapTx* tx) {
-    StoolapErrorView v{};
-    if (tx) (void)stoolap_tx_errdetails(tx, &v.details);
-    return finish_view(v);
+    return make_view(tx ? stoolap_tx_errmsg(tx) : nullptr);
 }
 
 StoolapErrorView fetch_stmt_error(StoolapStmt* stmt) {
-    StoolapErrorView v{};
-    if (stmt) (void)stoolap_stmt_errdetails(stmt, &v.details);
-    return finish_view(v);
-}
-
-StoolapErrorView fetch_rows_error(StoolapRows* rows) {
-    StoolapErrorView v{};
-    if (rows) (void)stoolap_rows_errdetails(rows, &v.details);
-    return finish_view(v);
+    return make_view(stmt ? stoolap_stmt_errmsg(stmt) : nullptr);
 }
 
 // Pick the handle that owns the live error: tx if open, else warm db.
@@ -357,85 +318,55 @@ StoolapErrorView fetch_error_via(stoolap_mariadb::ThdContext* ctx,
     return fetch_db_error(d);
 }
 
-// Composite UNIQUE is refused at CREATE so every KEY has exactly one
-// user-defined part; if composite UNIQUE ever lands, walk every key part.
-uint find_key_for_column(TABLE_SHARE* share, std::string_view col) {
-    if (!share) return MAX_KEY;
+// MariaDB key build_create_sql emitted as the n-th table-level
+// UNIQUE (n counts non-PK HA_NOSAME keys in key order), or MAX_KEY.
+uint unique_key_by_ordinal(TABLE_SHARE* share, uint n) {
     for (uint i = 0; i < share->keys; ++i) {
-        KEY& k = share->key_info[i];
-        if (k.user_defined_key_parts == 0) continue;
-        Field* f = k.key_part[0].field;
-        if (f && col.size() == f->field_name.length &&
-            std::memcmp(col.data(), f->field_name.str, col.size()) == 0) {
-            return i;
-        }
+        if (i == share->primary_key) continue;
+        if (!(share->key_info[i].flags & HA_NOSAME)) continue;
+        if (n-- == 0) return i;
     }
     return MAX_KEY;
 }
 
-// Stoolap errors mix single-quoted ("column 'pid'") and bareword
-// ("on column u with value") tokens. Strip surrounding quotes if present.
-std::string_view extract_token(std::string_view msg, size_t pos) {
-    if (pos >= msg.size()) return {};
-    if (msg[pos] == '\'') {
-        size_t end = msg.find('\'', pos + 1);
-        if (end == std::string_view::npos) return {};
-        return msg.substr(pos + 1, end - pos - 1);
-    }
-    size_t end = pos;
-    while (end < msg.size() &&
-           !std::isspace(static_cast<unsigned char>(msg[end])) &&
-           msg[end] != '\'' && msg[end] != ',' && msg[end] != ':') {
-        ++end;
-    }
-    return msg.substr(pos, end - pos);
-}
-
-uint find_key_by_name(TABLE_SHARE* share, std::string_view name) {
-    if (!share || name.empty()) return MAX_KEY;
-    for (uint i = 0; i < share->keys; ++i) {
-        const KEY& k = share->key_info[i];
-        if (k.name.length == name.size() &&
-            ::strncasecmp(k.name.str, name.data(), name.size()) == 0) {
-            return i;
-        }
-    }
-    return MAX_KEY;
-}
-
-// Prefer details.constraint (typed index name); fall back to column lookup,
-// then to message-grep for stoolap codes that still come back GENERIC.
+// PK dup -> primary key; UNIQUE dup -> the key stoolap reports in
+// "unique constraint failed for index unique_<table>_<n> on column C
+// with value V". Stoolap names the n-th table-level UNIQUE of CREATE
+// TABLE unique_<table>_<n>, so n pins the key exactly; C must also be
+// that key's whole column name. Table and column names are unquoted and
+// may contain the separators, so every " on column " is tried until one
+// satisfies both. Composite UNIQUE is refused at CREATE, so key_part[0]
+// is the column.
 uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
     if (!share) return 0;
-    if (v.code == STOOLAP_ERR_PRIMARY_KEY) {
-        if (share->primary_key < share->keys) return share->primary_key;
-    } else if (v.code == STOOLAP_ERR_UNIQUE) {
-        if (v.details.constraint && *v.details.constraint) {
-            uint k = find_key_by_name(share, v.details.constraint);
-            if (k != MAX_KEY) return k;
-        }
-        if (v.details.column && *v.details.column) {
-            uint k = find_key_for_column(share, v.details.column);
-            if (k != MAX_KEY) return k;
-        }
-    }
-    // Prose fallback (stoolap returned GENERIC for what looks like a dup).
-    if (v.details.message && *v.details.message) {
-        std::string_view m(v.details.message);
-        auto starts_with = [&](std::string_view p) {
-            return m.size() >= p.size() && m.compare(0, p.size(), p) == 0;
-        };
-        if (starts_with("primary key constraint failed")) {
-            if (share->primary_key < share->keys) return share->primary_key;
-        } else if (starts_with("unique constraint failed")) {
-            const auto col = m.find("on column ");
-            if (col != std::string_view::npos) {
-                std::string_view name =
-                    extract_token(m, col + sizeof("on column ") - 1);
-                if (!name.empty()) {
-                    uint k = find_key_for_column(share, name);
-                    if (k != MAX_KEY) return k;
-                }
+    std::string_view m(v.message);
+    constexpr std::string_view kPrefix =
+        "unique constraint failed for index unique_";
+    constexpr std::string_view kCol = " on column ";
+    constexpr std::string_view kVal = " with value ";
+    if (m.compare(0, kPrefix.size(), kPrefix) == 0) {
+        for (size_t at = m.find(kCol, kPrefix.size());
+             at != std::string_view::npos; at = m.find(kCol, at + 1)) {
+            size_t d = at;
+            while (d > kPrefix.size() &&
+                   std::isdigit(static_cast<unsigned char>(m[d - 1]))) {
+                --d;
+            }
+            if (d == at || at - d > 6 || m[d - 1] != '_') continue;
+            uint n = 0;
+            for (size_t i = d; i < at; ++i)
+                n = n * 10 + (m[i] - '0');
+            const uint key = unique_key_by_ordinal(share, n);
+            if (key == MAX_KEY) continue;
+            const Field* f = share->key_info[key].key_part[0].field;
+            if (!f) continue;
+            const std::string_view name(f->field_name.str,
+                                        f->field_name.length);
+            const std::string_view rest = m.substr(at + kCol.size());
+            if (rest.size() >= name.size() + kVal.size() &&
+                rest.compare(0, name.size(), name) == 0 &&
+                rest.compare(name.size(), kVal.size(), kVal) == 0) {
+                return key;
             }
         }
     }
@@ -443,71 +374,16 @@ uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
     return 0;
 }
 
-// `known` is true iff the code matched an explicit case below. False
-// means the value fell through `default` (future stoolap code we don't
-// know about yet). Used by report_stoolap_error to gate the prose-grep
-// fallback to GENERIC/INTERNAL/unknown only -- codes deliberately mapped
-// to HA_ERR_GENERIC (NOT_NULL, CHECK, ...) stay typed-only.
+// `known` is false when no pattern matched: a stoolap wording this table
+// doesn't cover. report_stoolap_error counts those in unmapped_errors.
 struct ErrcodeMap {
     int ha_err;
     bool known;
 };
 
-ErrcodeMap map_stoolap_errcode(int32_t code) {
-    switch (code) {
-        case STOOLAP_ERR_OK:
-            return {0, true};
-        case STOOLAP_ERR_PRIMARY_KEY:
-        case STOOLAP_ERR_UNIQUE:
-            return {HA_ERR_FOUND_DUPP_KEY, true};
-        case STOOLAP_ERR_FOREIGN_KEY:
-            return {HA_ERR_NO_REFERENCED_ROW, true};
-        case STOOLAP_ERR_TABLE_NOT_FOUND:
-        case STOOLAP_ERR_VIEW_NOT_FOUND:
-            return {HA_ERR_NO_SUCH_TABLE, true};
-        case STOOLAP_ERR_TABLE_EXISTS:
-        case STOOLAP_ERR_VIEW_EXISTS:
-        case STOOLAP_ERR_INDEX_EXISTS:
-            return {HA_ERR_TABLE_EXIST, true};
-        case STOOLAP_ERR_TX_ABORTED:
-        case STOOLAP_ERR_DB_LOCKED:
-            // No deadlock vs lock-wait distinction in stoolap; both
-            // become 40001 so clients retry.
-            return {HA_ERR_LOCK_DEADLOCK, true};
-        case STOOLAP_ERR_NOT_SUPPORTED:
-            return {HA_ERR_UNSUPPORTED, true};
-        case STOOLAP_ERR_READ_ONLY:
-            return {HA_ERR_TABLE_READONLY, true};
-        case STOOLAP_ERR_NOT_NULL:
-        case STOOLAP_ERR_CHECK:
-        case STOOLAP_ERR_TYPE_MISMATCH:
-        case STOOLAP_ERR_VALUE_TOO_LONG:
-        case STOOLAP_ERR_INVALID_ARGUMENT:
-        case STOOLAP_ERR_PARSE:
-        case STOOLAP_ERR_DIVISION_BY_ZERO:
-        case STOOLAP_ERR_COLUMN_NOT_FOUND:
-        case STOOLAP_ERR_INDEX_NOT_FOUND:
-        case STOOLAP_ERR_TX_CLOSED:
-        case STOOLAP_ERR_IO:
-        case STOOLAP_ERR_QUERY_CANCELLED:
-        case STOOLAP_ERR_REOPEN_REQUIRED:
-            // No specific MariaDB code; surface as 1296 with stoolap text.
-            return {HA_ERR_GENERIC, true};
-        case STOOLAP_ERR_GENERIC:
-        case STOOLAP_ERR_INTERNAL:
-            // Stoolap explicitly said "no classification"; let prose try.
-            return {HA_ERR_GENERIC, true};
-        default:
-            // Unknown future code; let prose try and bump unmapped_errors.
-            return {HA_ERR_GENERIC, false};
-    }
-}
-
-// Legacy prose-grep fallback for typed codes that come back GENERIC.
 // Source of truth for the strings: ../stoolap/src/core/error.rs.
-int map_stoolap_error(const char* msg) {
-    if (!msg) return HA_ERR_GENERIC;
-    std::string_view m(msg);
+ErrcodeMap map_stoolap_error(const char* msg) {
+    std::string_view m(msg ? msg : "");
 
     // PREFIX anchors at pos 0; CONTAINS finds the needle anywhere
     // (used for tail markers like the truncate-blocked variant of
@@ -528,7 +404,8 @@ int map_stoolap_error(const char* msg) {
 
     // Order: most-specific first. PK/UNIQUE/FK use anchored prefixes
     // since the FK message contains "does not exist" which would
-    // otherwise route to NO_SUCH_TABLE.
+    // otherwise route to NO_SUCH_TABLE. HA_ERR_GENERIC rows are known
+    // classes with no MariaDB counterpart (surface as 1296 + text).
     static constexpr Pattern kTable[] = {
         {"primary key constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
         {"unique constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
@@ -536,19 +413,38 @@ int map_stoolap_error(const char* msg) {
         // Anchored so future similar wordings don't match by accident.
         {"not null constraint failed", HA_ERR_GENERIC, PREFIX},
         {"CHECK constraint failed", HA_ERR_GENERIC, PREFIX},
+        // "table 'T' schema changed; retry the statement" and "a truncate
+        // or drop overtook the statement's view; retry the statement".
+        {"; retry the statement", HA_ERR_LOCK_DEADLOCK, CONTAINS},
         {"' already exists", HA_ERR_TABLE_EXIST, CONTAINS},
+        // Column / index lookups also end in "' not found"; claim them
+        // before the table/view rule below.
+        {"column '", HA_ERR_GENERIC, PREFIX},
+        {"index '", HA_ERR_GENERIC, PREFIX},
         {"' not found", HA_ERR_NO_SUCH_TABLE, CONTAINS},
-        // "row N has uncommitted changes ..." + truncate-blocked variant.
+        // Truncate blocked by an open tx ("... have uncommitted changes").
         {"uncommitted changes", HA_ERR_LOCK_DEADLOCK, CONTAINS},
         {"write conflict", HA_ERR_LOCK_DEADLOCK, CONTAINS},
         {"failed to acquire lock", HA_ERR_LOCK_DEADLOCK, PREFIX},
+        {"transaction aborted", HA_ERR_LOCK_DEADLOCK, PREFIX},
+        {"database is locked", HA_ERR_LOCK_DEADLOCK, PREFIX},
         {"not supported", HA_ERR_UNSUPPORTED, CONTAINS},
         {"unsupported", HA_ERR_UNSUPPORTED, CONTAINS},
+        {"parse error", HA_ERR_GENERIC, PREFIX},
+        {"division by zero", HA_ERR_GENERIC, PREFIX},
+        {"type conversion error", HA_ERR_GENERIC, PREFIX},
+        {"type error", HA_ERR_GENERIC, PREFIX},
+        {"invalid argument", HA_ERR_GENERIC, PREFIX},
+        {"value for column ", HA_ERR_GENERIC, PREFIX},
+        {"IO error", HA_ERR_GENERIC, PREFIX},
+        {"query cancelled", HA_ERR_GENERIC, PREFIX},
+        {"transaction already", HA_ERR_GENERIC, PREFIX},
+        {"transaction not started", HA_ERR_GENERIC, PREFIX},
     };
     for (const Pattern& p : kTable) {
-        if (matches(p)) return p.ha_err;
+        if (matches(p)) return {p.ha_err, true};
     }
-    return HA_ERR_GENERIC;
+    return {HA_ERR_GENERIC, false};
 }
 
 // Brewed mariadbd exports my_error / my_printf_error directly, but the
@@ -561,38 +457,15 @@ extern "C" void my_printf_error(unsigned int nr, const char* fmt,
                                 unsigned long MyFlags, ...);
 
 int report_stoolap_error(const StoolapErrorView& v) {
-    const char* msg = v.details.message;
-    const bool have_text = (msg && *msg);
+    const char* msg = v.message;
+    const bool have_text = *msg;
 
-    const ErrcodeMap m = map_stoolap_errcode(v.code);
-    int rc = m.ha_err;
-
-    // Run prose-grep only when the typed surface had no specific opinion:
-    // unknown future code OR stoolap explicitly said GENERIC/INTERNAL.
-    const bool typed_unhelpful = !m.known || v.code == STOOLAP_ERR_GENERIC ||
-                                 v.code == STOOLAP_ERR_INTERNAL;
-    if (rc == HA_ERR_GENERIC && have_text && typed_unhelpful) {
-        const int prose_rc = map_stoolap_error(msg);
-        if (prose_rc != HA_ERR_GENERIC) {
-            // Typed surface lost an error class the prose can still
-            // classify -- record the gap and use the prose result so
-            // the user gets the right SQLSTATE. Log the (code, msg)
-            // pair so an operator can file an upstream typed-error
-            // request -- this is the signal that turns the counter
-            // from "something is off" into "here is the wording".
-            stoolap_mariadb::g_stats.typed_fallback_hits.fetch_add(
-                1, std::memory_order_relaxed);
-            sql_print_information(
-                "stoolap typed-error gap: code=%d msg='%s' "
-                "(prose mapped to ha_err=%d) -- file upstream so the "
-                "STOOLAP_ERR_* layer covers it directly",
-                v.code, msg, prose_rc);
-            rc = prose_rc;
-        } else {
-            // Unrecognised typed code AND wording; signal drift.
-            stoolap_mariadb::g_stats.unmapped_errors.fetch_add(
-                1, std::memory_order_relaxed);
-        }
+    const ErrcodeMap m = map_stoolap_error(msg);
+    const int rc = m.ha_err;
+    if (!m.known && have_text) {
+        // Wording no pattern covers: stoolap drift, see case_18.
+        stoolap_mariadb::g_stats.unmapped_errors.fetch_add(
+            1, std::memory_order_relaxed);
     }
 
     const bool needs_text = (rc == HA_ERR_GENERIC || rc == HA_ERR_UNSUPPORTED);
@@ -1228,7 +1101,7 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
         if (stoolap_exec(d, sql.c_str(), nullptr) != STOOLAP_OK) {
             auto verr = fetch_db_error(d);
             sql_print_error("stoolap: schema reconcile failed for '%s': %s",
-                            stoolap_table_.c_str(), verr.details.message);
+                            stoolap_table_.c_str(), verr.message);
             return report_stoolap_error(verr);
         }
         // Re-emit secondary indexes too: a wiped stoolap-side table comes
@@ -1305,8 +1178,7 @@ int ha_stoolap::create(const char* name, TABLE* form,
     if (!db) return HA_ERR_OUT_OF_MEM;
     if (stoolap_exec(db, sql.c_str(), nullptr) != STOOLAP_OK) {
         auto verr = fetch_db_error(db);
-        sql_print_error("stoolap: CREATE TABLE failed: %s",
-                        verr.details.message);
+        sql_print_error("stoolap: CREATE TABLE failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     g_engine.mark_reconciled(tbl);
@@ -1323,7 +1195,7 @@ int ha_stoolap::delete_table(const char* name) {
     int rc = stoolap_exec(db, sql.c_str(), nullptr);
     if (rc != STOOLAP_OK) {
         auto verr = fetch_db_error(db);
-        sql_print_error("stoolap: DROP TABLE failed: %s", verr.details.message);
+        sql_print_error("stoolap: DROP TABLE failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     g_engine.drop_reconciled(flat);
@@ -1346,8 +1218,7 @@ int ha_stoolap::rename_table(const char* from, const char* to) {
     int rc = stoolap_exec(db, sql.c_str(), nullptr);
     if (rc != STOOLAP_OK) {
         auto verr = fetch_db_error(db);
-        sql_print_error("stoolap: RENAME TABLE failed: %s",
-                        verr.details.message);
+        sql_print_error("stoolap: RENAME TABLE failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     g_engine.drop_reconciled(flat_from);
@@ -1596,9 +1467,8 @@ int ha_stoolap::flush_bulk_buffer() {
         if (stoolap_prepare(db_for_prepare, insert_sql_.c_str(), &fresh) !=
             STOOLAP_OK) {
             auto verr = fetch_db_error(db_for_prepare);
-            sql_print_error(
-                "stoolap: prepare bulk INSERT failed: %s",
-                *verr.details.message ? verr.details.message : "(no detail)");
+            sql_print_error("stoolap: prepare bulk INSERT failed: %s",
+                            *verr.message ? verr.message : "(no detail)");
             bulk_params_.clear();
             bulk_text_holders_.clear();
             return report_stoolap_error(verr);
@@ -1643,12 +1513,11 @@ int ha_stoolap::flush_bulk_buffer() {
         StoolapErrorView verr = (ctx && ctx->has_tx())
                                     ? fetch_tx_error(ctx->tx())
                                     : fetch_stmt_error(stmt_raw);
-        if (verr.code == STOOLAP_ERR_OK || !*verr.details.message) {
+        if (!*verr.message) {
             verr = fetch_db_error(db_for_prepare);
         }
-        sql_print_error(
-            "stoolap: batch INSERT failed: %s",
-            *verr.details.message ? verr.details.message : "(no detail)");
+        sql_print_error("stoolap: batch INSERT failed: %s",
+                        *verr.message ? verr.message : "(no detail)");
         invalidate_records_cache();
         int err = report_stoolap_error(verr);
         if (err == HA_ERR_FOUND_DUPP_KEY) {
@@ -1789,8 +1658,7 @@ int ha_stoolap::write_row(const uchar* buf) {
                               static_cast<int32_t>(params.size()), &affected);
             if (rc != STOOLAP_OK) {
                 auto verr = fetch_error_via(ctx, db_raw());
-                sql_print_error("stoolap: INSERT failed: %s",
-                                verr.details.message);
+                sql_print_error("stoolap: INSERT failed: %s", verr.message);
                 err = report_stoolap_error(verr);
                 if (err == HA_ERR_FOUND_DUPP_KEY) {
                     last_dup_key_ = errkey_from_view(verr, table_share);
@@ -1897,7 +1765,7 @@ int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
                           static_cast<int32_t>(params.size()), &affected);
         if (rc != STOOLAP_OK) {
             auto verr = fetch_error_via(ctx, db_raw());
-            sql_print_error("stoolap: UPDATE failed: %s", verr.details.message);
+            sql_print_error("stoolap: UPDATE failed: %s", verr.message);
             err = report_stoolap_error(verr);
         } else if (affected == 0) {
             err =
@@ -1938,7 +1806,7 @@ int ha_stoolap::delete_row(const uchar* buf) {
                           static_cast<int32_t>(params.size()), &affected);
         if (rc != STOOLAP_OK) {
             auto verr = fetch_error_via(ctx, db_raw());
-            sql_print_error("stoolap: DELETE failed: %s", verr.details.message);
+            sql_print_error("stoolap: DELETE failed: %s", verr.message);
             err = report_stoolap_error(verr);
         } else if (affected == 0) {
             err = HA_ERR_RECORD_DELETED;
@@ -1958,7 +1826,7 @@ int ha_stoolap::analyze(THD* /*thd*/, HA_CHECK_OPT* /*opt*/) {
     sql += quote_ident(stoolap_table_);
     if (stoolap_exec(db_ensure(), sql.c_str(), nullptr) != STOOLAP_OK) {
         auto verr = fetch_db_error(db_raw());
-        sql_print_error("stoolap: ANALYZE failed: %s", verr.details.message);
+        sql_print_error("stoolap: ANALYZE failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     return 0;
@@ -2103,7 +1971,7 @@ int ha_stoolap::delete_all_rows() {
 
     if (stoolap_exec(db_ensure(), sql.c_str(), nullptr) != STOOLAP_OK) {
         auto verr = fetch_db_error(db_raw());
-        sql_print_error("stoolap: TRUNCATE failed: %s", verr.details.message);
+        sql_print_error("stoolap: TRUNCATE failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     set_count_exact(0);
@@ -2161,7 +2029,7 @@ int ha_stoolap::rnd_init(bool /*scan*/) {
     int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
     if (rc != STOOLAP_OK) {
         auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: SELECT failed: %s", verr.details.message);
+        sql_print_error("stoolap: SELECT failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
 
@@ -2585,8 +2453,7 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
                               static_cast<int32_t>(params.size()), &rows);
     if (rc != STOOLAP_OK) {
         auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: index_read SELECT failed: %s",
-                        verr.details.message);
+        sql_print_error("stoolap: index_read SELECT failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     scan_.reset(rows);
@@ -2658,8 +2525,7 @@ int ha_stoolap::index_first(uchar* buf) {
     int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
     if (rc != STOOLAP_OK) {
         auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: index_first SELECT failed: %s",
-                        verr.details.message);
+        sql_print_error("stoolap: index_first SELECT failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     scan_.reset(rows);
@@ -2689,8 +2555,7 @@ int ha_stoolap::index_last(uchar* buf) {
     int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
     if (rc != STOOLAP_OK) {
         auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: index_last SELECT failed: %s",
-                        verr.details.message);
+        sql_print_error("stoolap: index_last SELECT failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     scan_.reset(rows);
@@ -2963,8 +2828,7 @@ int ha_stoolap::read_range_first(const key_range* start_key,
                               static_cast<int32_t>(params.size()), &rows);
     if (rc != STOOLAP_OK) {
         auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: read_range query failed: %s",
-                        verr.details.message);
+        sql_print_error("stoolap: read_range query failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     scan_.reset(rows);
@@ -3135,13 +2999,31 @@ ha_rows ha_stoolap::cached_records() {
         }
     }
 
-    // O(1) MVCC-safe count: tx-side sees own uncommitted writes,
-    // db-side returns autocommit-visible count via SegmentedTable.
+    // MVCC-visible COUNT(*): inside the tx it sees this session's own
+    // uncommitted writes; outside it answers from the autocommit view
+    // (stoolap's quiet-epoch row-count fast path).
     stoolap_mariadb::g_stats.records_live_counts.fetch_add(
         1, std::memory_order_relaxed);
-    uint64_t count = 0;
-    int rc = count_via(ctx, db_raw(), stoolap_table_.c_str(), &count);
-    if (rc != STOOLAP_OK) return stats.records;
+    const std::string sql =
+        "SELECT COUNT(*) FROM " + quote_ident(stoolap_table_);
+    const uint8_t* buf = nullptr;
+    int64_t len = 0;
+    int rc = stoolap_query_params_all(warm_db(ctx, db_raw()),
+                                      in_tx ? ctx->tx() : nullptr, sql.c_str(),
+                                      nullptr, 0, &buf, &len);
+    if (rc != STOOLAP_OK || !buf) return stats.records;
+    // One row, one INTEGER column: header, u32 row_count, tag, i64.
+    size_t pos = 0;
+    uint32_t cols = 0;
+    if (!stoolap_mariadb::pkt_parse_header(buf, static_cast<size_t>(len), &pos,
+                                           &cols) ||
+        cols != 1 || pos + 4 + 1 + 8 > static_cast<size_t>(len) ||
+        stoolap_mariadb::pkt_le32(buf + pos) != 1 ||
+        buf[pos + 4] != STOOLAP_TYPE_INTEGER) {
+        return stats.records;
+    }
+    const int64_t n = stoolap_mariadb::pkt_i64(buf + pos + 5);
+    const uint64_t count = n > 0 ? static_cast<uint64_t>(n) : 0;
 
     cached_records_ = static_cast<ha_rows>(count);
     cached_records_valid_ = true;
@@ -3443,9 +3325,6 @@ static struct st_mysql_show_var stoolap_status_vars[] = {
     {"Stoolap_buffered_rows", _SS_PTR(buffered_rows), SHOW_LONGLONG},
     // Strict drift counter (case_18 pins at 0); see PushdownStats.
     {"Stoolap_unmapped_errors", _SS_PTR(unmapped_errors), SHOW_LONGLONG},
-    // Stoolap-side typed-error gap signal; allowlisted in runner.
-    {"Stoolap_typed_fallback_hits", _SS_PTR(typed_fallback_hits),
-     SHOW_LONGLONG},
     // Per-phase ns; divide by Stoolap_perf_query_count (or
     // _next_row_count) for averages. Two clock_gettime per phase (~20ns).
     {"Stoolap_perf_factory_setup_ns", _SS_PTR(perf_factory_setup_ns),

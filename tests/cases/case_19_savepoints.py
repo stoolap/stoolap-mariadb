@@ -1,6 +1,5 @@
 """Savepoint plumbing: SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO
-routes through stoolap_tx_savepoint / stoolap_tx_release_savepoint /
-stoolap_tx_rollback_to_savepoint.
+run as SQL on the open stoolap transaction (stoolap_tx_exec).
 
 MariaDB does not pass the user's SAVEPOINT name to the engine; the
 plugin synthesises "sp<id>" from a per-connection counter and stashes
@@ -154,6 +153,5 @@ CREATE TABLE sp_t (id INT NOT NULL PRIMARY KEY, n INT) ENGINE={h.engine};
         h._pass(f"Stoolap_unmapped_errors still {val}")
     else:
         h._fail(f"Stoolap_unmapped_errors moved to {val}",
-                "savepoint paths produced an error wording the typed",
-                "and prose mappers both gave up on -- inspect log for",
-                "[Note] stoolap typed-error gap lines")
+                "savepoint paths produced an error wording",
+                "map_stoolap_error does not cover")

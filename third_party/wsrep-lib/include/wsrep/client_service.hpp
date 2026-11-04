@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 Codership Oy <info@codership.com>
+ * Copyright (C) 2018-2025 Codership Oy <info@codership.com>
  *
  * This file is part of wsrep-lib.
  *
@@ -227,7 +227,19 @@ namespace wsrep
          * been enabled.
          */
         virtual void debug_crash(const char* crash_point) = 0;
+
+        //
+        // Notify state change interface
+        //
+        // stoolap-mariadb local patch: MariaDB < 11.4.13 pins a wsrep-lib
+        // without this pure virtual, and its Wsrep_client_service (held by
+        // value in THD) would turn abstract. CMakeLists.txt defines the
+        // macro on 11.4.13+.
+#ifdef WSREP_LIB_HAS_NOTIFY_STATE_CHANGE
+        virtual void notify_state_change() = 0;
+#endif
     };
+
 }
 
 #endif // WSREP_CLIENT_SERVICE_HPP

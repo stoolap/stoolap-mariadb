@@ -8,13 +8,15 @@ permissions:
   contents: write
 
 env:
-  STOOLAP_VERSION: v0.4.0
+  # Track stoolap main until v0.5.0 is tagged (v0.4.x lacks FFI calls the
+  # plugin uses); then pin the tag here.
+  STOOLAP_VERSION: main
   MARIADB_VERSION: '11.4'
 
 jobs:
   # ----------------------------------------------------------------------
-  # Build libstoolap once per OS using the pinned STOOLAP_VERSION (not
-  # main, the way CI does). Shared with build-plugin via artifact.
+  # Build libstoolap once per OS from STOOLAP_VERSION. Shared with
+  # build-plugin via artifact.
   # ----------------------------------------------------------------------
   build-lib:
     name: Build libstoolap (${{ matrix.target }})

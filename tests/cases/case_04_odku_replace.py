@@ -34,6 +34,51 @@ INSERT INTO k VALUES (1, 'A', 10), (2, 'B', 20);
     h.assert_scalar("fresh row inserted", "SELECT COUNT(*) FROM k", "3")
     h.assert_scalar("fresh row content",  "SELECT n FROM k WHERE id = 3", "33")
 
+    h.section("ODKU on UNIQUE column whose name has a space (errkey parse)")
+    # Stoolap's UNIQUE error names the column unquoted ("on column code
+    # value with value 10"); errkey must match the whole name, and pick
+    # `code value` over the shorter `code` prefix.
+    h.exec_script(f"""
+CREATE TABLE ksp (
+    id INT NOT NULL PRIMARY KEY,
+    `code` INT NOT NULL UNIQUE,
+    `code value` INT NOT NULL UNIQUE,
+    n INT NOT NULL
+) ENGINE={h.engine};
+INSERT INTO ksp VALUES (1, 100, 10, 0);
+""")
+    h.assert_ok("ODKU on spaced UNIQUE match",
+                "INSERT INTO ksp VALUES (2, 200, 10, 5) "
+                "ON DUPLICATE KEY UPDATE n = VALUES(n)")
+    h.assert_scalar("spaced UNIQUE row updated",
+                    "SELECT n FROM ksp WHERE id = 1", "5")
+    h.assert_scalar("spaced UNIQUE no new row",
+                    "SELECT COUNT(*) FROM ksp", "1")
+
+    # A column name that itself contains the " with value " separator:
+    # text matching alone would bind the conflict to `code`.
+    h.exec_script(f"""
+CREATE TABLE ksv (
+    id INT NOT NULL PRIMARY KEY,
+    `code` INT UNIQUE,
+    `code with value suffix` INT UNIQUE,
+    n INT
+) ENGINE={h.engine};
+INSERT INTO ksv VALUES (1, 100, 10, 0);
+""")
+    h.assert_ok("ODKU on separator-named UNIQUE match",
+                "INSERT INTO ksv VALUES (2, 200, 10, 5) "
+                "ON DUPLICATE KEY UPDATE n = VALUES(n)")
+    h.assert_scalar("separator-named UNIQUE row updated",
+                    "SELECT n FROM ksv WHERE id = 1", "5")
+    h.assert_ok("ODKU on the shorter UNIQUE still binds to it",
+                "INSERT INTO ksv VALUES (3, 100, 30, 7) "
+                "ON DUPLICATE KEY UPDATE n = VALUES(n)")
+    h.assert_scalar("shorter UNIQUE row updated",
+                    "SELECT n FROM ksv WHERE id = 1", "7")
+    h.assert_scalar("separator-named no new row",
+                    "SELECT COUNT(*) FROM ksv", "1")
+
     h.section("REPLACE INTO")
     h.assert_ok("REPLACE on PK match", "REPLACE INTO k VALUES (1, 'A', 1)")
     h.assert_scalar("REPLACE updated", "SELECT n FROM k WHERE id = 1", "1")

@@ -37,17 +37,15 @@ Subsystems that have settled recently:
   read-committed otherwise. `START TRANSACTION WITH CONSISTENT
   SNAPSHOT` is hooked through the `start_consistent_snapshot`
   handlerton callback.
-- `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT` route
-  through `stoolap_tx_savepoint` / `stoolap_tx_release_savepoint` /
-  `stoolap_tx_rollback_to_savepoint`. Names are synthesised
-  per-connection because MariaDB does not pass the user's SAVEPOINT
-  name to the engine.
-- Typed error mapping: `STOOLAP_ERR_*` codes drive HA_ERR_*
-  selection directly; a prose-grep fallback runs only for codes
-  stoolap explicitly flagged as generic so it can retire once the
-  upstream typed surface fully covers every observed error.
-- MVCC-safe `cached_records()` via `stoolap_(tx_)table_count`
-  (O(1) atomic load instead of a SQL `SELECT COUNT(*)`).
+- `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT` run
+  as SQL on the open stoolap transaction (`stoolap_tx_exec`). Names
+  are synthesised per-connection because MariaDB does not pass the
+  user's SAVEPOINT name to the engine.
+- Error mapping: stoolap's error text (`*_errmsg`) is matched against
+  a pattern table (`map_stoolap_error`) that picks the HA_ERR_*;
+  wordings it doesn't cover bump `Stoolap_unmapped_errors`.
+- MVCC-safe `cached_records()` via a one-call `SELECT COUNT(*)`
+  (`stoolap_query_params_all`) on the session's tx or autocommit view.
 - Composite `PRIMARY KEY` / `UNIQUE` / multi-column or self-FK
   refused at `CREATE TABLE` (Stoolap enforces single-column only;
   silently accepting them would let duplicates and FK-violating
@@ -465,11 +463,10 @@ Session-level (`SET SESSION ...`):
 | `Stoolap_pushdown_hits`           | Whole-query plans accepted by the factory. |
 | `Stoolap_pushdown_misses`         | Plans that fell back to the row pump.    |
 | `Stoolap_direct_modify_hits`      | UPDATE / DELETE that took the direct path. |
-| `Stoolap_records_live_counts`     | `cached_records()` cache miss that fetched a fresh count via `stoolap_(tx_)table_count` (O(1) atomic load). High values mean the handler / tx / global record-count caches are not being reused. |
+| `Stoolap_records_live_counts`     | `cached_records()` cache miss that ran a live `SELECT COUNT(*)`. High values mean the handler / tx / global record-count caches are not being reused. |
 | `Stoolap_buffered_scans`          | `rnd_init` calls that used `fetch_all`.  |
 | `Stoolap_buffered_rows`           | Rows delivered through the buffered path. |
-| `Stoolap_unmapped_errors`         | Both the typed `STOOLAP_ERR_*` code AND the prose-grep fallback came back generic for a non-empty stoolap message. Non-zero means an unrecognised code or wording -- see `case_18_error_mapping`. |
-| `Stoolap_typed_fallback_hits`     | Typed code was generic but the prose pattern still classified the message into a specific HA_ERR_*. Stoolap-side typed-error gap; the plugin still produces the right SQLSTATE via the fallback. Each occurrence emits `[Note] stoolap typed-error gap: code=N msg='...'` so the wording can be filed upstream. |
+| `Stoolap_unmapped_errors`         | A non-empty stoolap error message matched no `map_stoolap_error` pattern. Non-zero means stoolap reworded or added an error class -- see `case_18_error_mapping`. |
 | `Stoolap_perf_factory_setup_ns`   | Time spent inside `create_select` / `create_derived`. |
 | `Stoolap_perf_eager_query_ns`     | Time spent inside `stoolap_query` / `fetch_all`. |
 | `Stoolap_perf_init_scan_ns`       | Time spent in `init_scan` per pushed query. |
@@ -538,7 +535,7 @@ visibility / isolation (`REPEATABLE READ` snapshot stability,
 `READ COMMITTED` post-commit visibility), unsupported-DDL
 rejection (composite PK/UNIQUE/FK, direct UPDATE/DELETE error
 mapping to ER_DUP_ENTRY 1062 / ER_NO_REFERENCED_ROW_2 1452),
-error-class round-trip (every known `STOOLAP_ERR_*` reaches the
+error-class round-trip (every known stoolap error class reaches the
 client with the right MariaDB errno; drift counters stay at
 baseline), and savepoint plumbing (SAVEPOINT / RELEASE / ROLLBACK
 TO including nested and reused names).
