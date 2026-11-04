@@ -81,6 +81,28 @@ INSERT INTO conf_t VALUES (1, 1);
     _assert_errno(h, "FK violation via direct UPDATE",
                   "UPDATE c_t SET pid = 999 WHERE id = 10", 1452)
 
+    h.section("Parent row still referenced -> ER_ROW_IS_REFERENCED_2 (1451)")
+    # c_t(10) references p_t(1). Deleting the parent is the other side of
+    # the FK: "still referenced", not "referenced row does not exist".
+    _assert_errno(h, "referenced parent via direct DELETE",
+                  "DELETE FROM p_t WHERE id = 1", 1451)
+    # LIMIT keeps the plugin off direct DML: delete_row per row.
+    _assert_errno(h, "referenced parent via row-pump DELETE",
+                  "DELETE FROM p_t ORDER BY id LIMIT 1", 1451)
+
+    h.section("Row-pump UPDATE duplicate -> ER_DUP_ENTRY (1062)")
+    # update_row must name the key (errkey) or MariaDB falls back to the
+    # keyless ER_DUP_KEY (1022). A fresh table, so no earlier INSERT on
+    # the same handler left a dup key behind.
+    h.exec_script(f"""
+CREATE TABLE uq_upd (id INT NOT NULL PRIMARY KEY,
+                     u INT NOT NULL,
+                     UNIQUE KEY uq_upd_u (u)) ENGINE={h.engine};
+INSERT INTO uq_upd VALUES (1, 10), (2, 20);
+""")
+    _assert_errno(h, "UNIQUE violation via row-pump UPDATE",
+                  "UPDATE uq_upd SET u = 10 WHERE id = 2 LIMIT 1", 1062)
+
     h.section("Table lifecycle errors")
     _assert_errno(h, "CREATE TABLE on existing name -> 1050",
                   f"CREATE TABLE pk_t (x INT) ENGINE={h.engine}", 1050)

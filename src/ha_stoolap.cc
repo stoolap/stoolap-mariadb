@@ -409,6 +409,10 @@ ErrcodeMap map_stoolap_error(const char* msg) {
     static constexpr Pattern kTable[] = {
         {"primary key constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
         {"unique constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
+        // Parent side (DELETE / UPDATE of a referenced row): "...
+        // still referenced by table 'C'". The child side ("referenced row
+        // ... does not exist") falls through to NO_REFERENCED_ROW.
+        {"still referenced by table", HA_ERR_ROW_IS_REFERENCED, CONTAINS},
         {"foreign key constraint violation", HA_ERR_NO_REFERENCED_ROW, PREFIX},
         // Anchored so future similar wordings don't match by accident.
         {"not null constraint failed", HA_ERR_GENERIC, PREFIX},
@@ -1767,6 +1771,10 @@ int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
             auto verr = fetch_error_via(ctx, db_raw());
             sql_print_error("stoolap: UPDATE failed: %s", verr.message);
             err = report_stoolap_error(verr);
+            if (err == HA_ERR_FOUND_DUPP_KEY) {
+                last_dup_key_ = errkey_from_view(verr, table->s);
+                errkey = last_dup_key_;
+            }
         } else if (affected == 0) {
             err =
                 HA_ERR_RECORD_DELETED;  // row vanished between scan and update
