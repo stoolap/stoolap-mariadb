@@ -179,6 +179,21 @@ class Result:
         return statistics.quantiles(self.samples, n=20)[18]
 
 
+class Op:
+    """One benchmarked operation on one engine: step(k) runs iteration k
+    (iteration-dependent parameters stay aligned across engines), and
+    explain() is called once after timing."""
+    __slots__ = ("name", "step", "iters", "warmup", "explain")
+
+    def __init__(self, name: str, step: Callable[[int], None], iters: int,
+                 warmup: int, explain: Callable[[], str]):
+        self.name    = name
+        self.step    = step
+        self.iters   = iters
+        self.warmup  = warmup
+        self.explain = explain
+
+
 # --------------------------------------------------------------------------
 # Schema setup
 # --------------------------------------------------------------------------
@@ -266,50 +281,6 @@ def populate_orders(cur, table: str, engine: str,
         )
 
 
-# --------------------------------------------------------------------------
-# Timed loop with per-iteration samples
-# --------------------------------------------------------------------------
-def time_each(cur, sql: str, *,
-              iters: int, warmup: int = WARMUP,
-              params_seq=None, fetch: bool = True) -> List[float]:
-    """Return per-iteration microsecond samples after a warmup pass."""
-    for k in range(warmup):
-        if params_seq is None:
-            cur.execute(sql)
-        else:
-            cur.execute(sql, params_seq[k % len(params_seq)])
-        if fetch:
-            cur.fetchall()
-
-    samples = [0.0] * iters
-    for k in range(iters):
-        if params_seq is None:
-            t0 = time.perf_counter()
-            cur.execute(sql)
-            if fetch:
-                cur.fetchall()
-        else:
-            p = params_seq[k % len(params_seq)]
-            t0 = time.perf_counter()
-            cur.execute(sql, p)
-            if fetch:
-                cur.fetchall()
-        samples[k] = (time.perf_counter() - t0) * 1_000_000.0
-    return samples
-
-
-def time_callable(fn: Callable[[], None], *,
-                   iters: int, warmup: int = 0) -> List[float]:
-    for _ in range(warmup):
-        fn()
-    samples = [0.0] * iters
-    for k in range(iters):
-        t0 = time.perf_counter()
-        fn()
-        samples[k] = (time.perf_counter() - t0) * 1_000_000.0
-    return samples
-
-
 def capture_explain(cur, sql: str, params=None) -> str:
     """Run EXPLAIN once and return a one-line summary plus the type/Extra
     column, which is what we usually care about for plan diagnosis."""
@@ -338,7 +309,9 @@ def capture_explain(cur, sql: str, params=None) -> str:
 # Workload definition
 # --------------------------------------------------------------------------
 def run_engine(socket: str, label: str, engine: str, suffix: str,
-                rng: random.Random, args) -> dict:
+                rng: random.Random, args):
+    """Populate this engine's tables and return (ops, conn). Nothing is
+    timed here: run_interleaved times every engine's ops side by side."""
     users  = f"users_{suffix}"
     orders = f"orders_{suffix}"
 
@@ -356,16 +329,20 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
     iters_med  = max(1, args.iterations // 2)
     iters_heav = max(1, args.iterations // 10)
 
-    out: dict[str, Result] = {}
+    ops: List[Op] = []
 
     def b(name: str, sql: str, *, iters: int = iters_pt,
           params_seq=None, fetch: bool = True, warmup: int = WARMUP):
-        r = Result(name, label)
-        r.samples = time_each(cur, sql, iters=iters, params_seq=params_seq,
-                              fetch=fetch, warmup=warmup)
+        def step(k):
+            if params_seq is None:
+                cur.execute(sql)
+            else:
+                cur.execute(sql, params_seq[k % len(params_seq)])
+            if fetch:
+                cur.fetchall()
         sample_params = params_seq[0] if params_seq else None
-        r.explain = capture_explain(cur, sql, sample_params)
-        out[name] = r
+        ops.append(Op(name, step, iters, warmup,
+                      lambda: capture_explain(cur, sql, sample_params)))
 
     # ---- core ----
     b("SELECT by ID",
@@ -499,10 +476,8 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
             "VALUES (%s,%s,%s,%s,%s)", rows)
         c.commit()
 
-    r = Result("Batch INSERT (100 rows)", label)
-    r.samples = time_callable(batch_run, iters=iters_pt, warmup=0)
-    r.explain = "<batch INSERT, no EXPLAIN>"
-    out["Batch INSERT (100 rows)"] = r
+    ops.append(Op("Batch INSERT (100 rows)", lambda k: batch_run(), iters_pt,
+                  0, lambda: "<batch INSERT, no EXPLAIN>"))
 
     # ---- bottleneck hunters ----
     b("DISTINCT (no ORDER)", f"SELECT DISTINCT age FROM {users}")
@@ -649,8 +624,46 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
     b("UPDATE row-pump (100 rows)", upd_sql, params_seq=upd_params,
       iters=iters_med, fetch=False)
 
-    cur.close()
-    c.close()
+    return ops, c
+
+
+# Each op's iterations are timed in this many chunks, alternating which
+# engine goes first, so drift in machine load (other processes, thermal)
+# lands on both engines instead of on whichever ran second.
+INTERLEAVE_CHUNKS = 5
+
+
+def run_interleaved(engine_ops: dict) -> dict:
+    """engine_ops: {label: [Op, ...]} with the same op order per engine.
+    Returns {label: {op_name: Result}}."""
+    labels = list(engine_ops)
+    out = {label: {} for label in labels}
+    for idx in range(len(engine_ops[labels[0]])):
+        ops = {label: engine_ops[label][idx] for label in labels}
+        name = ops[labels[0]].name
+        assert all(op.name == name for op in ops.values()), name
+        for label in labels:
+            op = ops[label]
+            for k in range(op.warmup):
+                op.step(k)
+        iters = ops[labels[0]].iters
+        chunks = max(1, min(INTERLEAVE_CHUNKS, iters))
+        bounds = [(iters * i // chunks, iters * (i + 1) // chunks)
+                  for i in range(chunks)]
+        samples = {label: [] for label in labels}
+        for r, (lo, hi) in enumerate(bounds):
+            for label in (labels if r % 2 == 0 else labels[::-1]):
+                step = ops[label].step
+                for k in range(lo, hi):
+                    t0 = time.perf_counter()
+                    step(k)
+                    samples[label].append(
+                        (time.perf_counter() - t0) * 1_000_000.0)
+        for label in labels:
+            res = Result(name, label)
+            res.samples = samples[label]
+            res.explain = ops[label].explain()
+            out[label][name] = res
     return out
 
 
@@ -975,14 +988,18 @@ def main():
         if args.runs > 1:
             print(f"\n=== run {run_idx + 1}/{args.runs} ===")
         setup_db(args.socket)
-        run_results = {}
+        engine_ops, conns = {}, []
         for label, engine, suffix in ENGINES:
-            print(f">>> running {label} ({engine}) ...", flush=True)
+            print(f">>> preparing {label} ({engine}) ...", flush=True)
             # Same seed for every engine in every run -> byte-identical data.
             rng = random.Random(args.seed)
-            run_results[label] = run_engine(
+            engine_ops[label], conn = run_engine(
                 args.socket, label, engine, suffix, rng, args)
-        per_run.append(run_results)
+            conns.append(conn)
+        print(">>> timing both engines, interleaved ...", flush=True)
+        per_run.append(run_interleaved(engine_ops))
+        for conn in conns:
+            conn.close()
         # Tear down between runs so the next iteration starts clean.
         boot = mysql.connector.connect(
             user="root", unix_socket=args.socket, autocommit=True)
