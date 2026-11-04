@@ -166,11 +166,6 @@ private:
 
     std::string stoolap_table_;
 
-    // Autocommit row-pump UPDATE/DELETE: open one stoolap tx for the
-    // statement (commit_cb / rollback_cb end it) so a failure on row k
-    // also undoes rows 1..k-1. No-op when a tx is already open.
-    int ensure_stmt_tx();
-
     // get_dup_key() resets errkey then calls info(HA_STATUS_ERRKEY); we
     // stash the most recent dup key here. Reset to MAX_KEY on each write.
     uint last_dup_key_ = MAX_KEY;

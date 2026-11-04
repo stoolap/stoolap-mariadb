@@ -1707,19 +1707,6 @@ done:
     return err;
 }
 
-int ha_stoolap::ensure_stmt_tx() {
-    THD* thd = ha_thd();
-    auto* ctx = get_thd_ctx(thd);
-    if (!ctx || ctx->has_tx()) return 0;
-    if (ctx->begin() != STOOLAP_OK) {
-        sql_print_error("stoolap: statement tx open failed: %s",
-                        stoolap_errmsg(ctx->db()));
-        return HA_ERR_GENERIC;
-    }
-    trans_register_ha(thd, /*all=*/false, stoolap_hton, /*flags=*/0);
-    return 0;
-}
-
 int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
 
@@ -1803,7 +1790,6 @@ int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
         }
     }
 
-    if ((err = ensure_stmt_tx())) goto done;
     {
         auto* ctx = get_thd_ctx(ha_thd());
         int64_t affected = 0;
@@ -1849,7 +1835,6 @@ int ha_stoolap::delete_row(const uchar* buf) {
         goto done;
     }
 
-    if ((err = ensure_stmt_tx())) goto done;
     {
         auto* ctx = get_thd_ctx(ha_thd());
         int64_t affected = 0;
