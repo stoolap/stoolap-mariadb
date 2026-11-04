@@ -32,6 +32,7 @@ tests/
     case_18_error_mapping.py         every stoolap error class round-trips to the right MariaDB errno; drift counters stay at baseline
     case_19_savepoints.py            SAVEPOINT / RELEASE / ROLLBACK TO, nested + reused names, unknown-name error
     case_20_composite_keys.py        composite PRIMARY KEY / UNIQUE: dup key names, ODKU / REPLACE, row-pump DML, mixed-engine probe, ALTER ADD UNIQUE
+    case_21_differential.py          runs every tests/diff/*.sql on STOOLAP and InnoDB and compares each statement's rows / errno / affected rows and the final tables
 ```
 
 ## Requirements

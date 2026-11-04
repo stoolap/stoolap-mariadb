@@ -1,0 +1,6 @@
+-- known-diff-file: read path: utf8mb4_bin ref lookups ignore PAD SPACE
+CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(10) COLLATE utf8mb4_bin, KEY ks (s)) ENGINE={E};
+INSERT INTO t VALUES (1,'a'),(2,'a ');
+CREATE TABLE i (k INT PRIMARY KEY, s VARCHAR(10) COLLATE utf8mb4_bin) ENGINE=InnoDB;
+INSERT INTO i VALUES (1,'a');
+SELECT i.k, t.id FROM i STRAIGHT_JOIN t FORCE INDEX(ks) ON t.s = i.s ORDER BY t.id;
