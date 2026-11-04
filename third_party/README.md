@@ -13,6 +13,13 @@ Source: <https://github.com/codership/wsrep-lib> commit
 
 License: GPL-2.0 (see `wsrep-lib/COPYING` and `wsrep-lib/LICENSE`).
 
+Local patch: `client_service.hpp` declares the pure virtual
+`notify_state_change()` (new in this commit) only under
+`WSREP_LIB_HAS_NOTIFY_STATE_CHANGE`, which `CMakeLists.txt` defines for
+MariaDB 11.4.13+. MariaDB 11.4.10 - 11.4.12 pin wsrep-lib `7010f0a`, which
+lacks it; their `Wsrep_client_service` doesn't implement it and would
+otherwise become abstract.
+
 Only the public `include/wsrep/*.hpp` files are vendored. Source files,
 tests, and CMake glue are not.
 

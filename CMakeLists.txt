@@ -89,6 +89,28 @@ add_library(ha_stoolap MODULE
 set(WSREP_LIB_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/third_party/wsrep-lib/include")
 set(WSREP_API_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/third_party/wsrep-API")
 
+# The vendored headers are wsrep-lib 5eeef40 (MariaDB 11.4.13's pin). It
+# added the pure virtual client_service::notify_state_change(), which
+# 11.4.13+ servers override and older 11.4 servers don't implement, so
+# the declaration is gated on the server version (see third_party/README.md).
+find_file(MARIADB_MYSQL_VERSION_H mysql_version.h
+    PATHS ${MARIADB_INCLUDE_DIRS} NO_DEFAULT_PATH)
+if(NOT MARIADB_MYSQL_VERSION_H)
+    message(FATAL_ERROR "mysql_version.h not found in ${MARIADB_INCLUDE_DIRS}")
+endif()
+file(STRINGS "${MARIADB_MYSQL_VERSION_H}" _mariadb_version_line
+    REGEX "^#define[ \t]+MYSQL_VERSION_ID[ \t]+[0-9]+")
+string(REGEX MATCH "[0-9]+$" MARIADB_VERSION_ID "${_mariadb_version_line}")
+message(STATUS "MariaDB version id: ${MARIADB_VERSION_ID}")
+if(MARIADB_VERSION_ID VERSION_LESS 110400 OR
+   MARIADB_VERSION_ID VERSION_GREATER_EQUAL 110500)
+    message(WARNING "Only MariaDB 11.4.x is supported (found ${MARIADB_VERSION_ID})")
+endif()
+if(MARIADB_VERSION_ID VERSION_GREATER_EQUAL 110413)
+    target_compile_definitions(ha_stoolap PRIVATE
+        WSREP_LIB_HAS_NOTIFY_STATE_CHANGE)
+endif()
+
 target_include_directories(ha_stoolap PRIVATE
     ${WSREP_LIB_INCLUDE_DIR}
     ${WSREP_API_INCLUDE_DIR}
