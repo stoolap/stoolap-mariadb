@@ -1,0 +1,9 @@
+-- known-diff-file: direct DML: aliases, qualified SET columns and LOW_PRIORITY / IGNORE / QUICK fail to parse
+CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT) ENGINE={E};
+INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+UPDATE t AS x SET x.v = 10 WHERE x.id = 1;
+UPDATE t SET t.v = 11 WHERE t.id = 4;
+UPDATE LOW_PRIORITY t SET v = 20 WHERE id = 2;
+DELETE IGNORE FROM t WHERE id = 3;
+DELETE QUICK FROM t WHERE id = 2;
+SELECT id, v FROM t ORDER BY id;

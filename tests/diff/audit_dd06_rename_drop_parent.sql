@@ -1,0 +1,9 @@
+-- known-diff-file: DDL: RENAME of a parent breaks child FKs; DROP of a parent strips them
+CREATE TABLE p (id INT PRIMARY KEY) ENGINE={E};
+CREATE TABLE c (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES p(id)) ENGINE={E};
+INSERT INTO p VALUES (1);
+RENAME TABLE p TO p2;
+INSERT INTO c VALUES (1, 1);
+DROP TABLE p2;
+INSERT INTO c VALUES (2, 77);
+SELECT id, pid FROM c ORDER BY id;

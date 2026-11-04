@@ -1,0 +1,4 @@
+-- known-diff-file: pushdown: SUBSTRING with an out-of-range negative start differs
+CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(10) COLLATE utf8mb4_bin) ENGINE={E};
+INSERT INTO t VALUES (1,'abcdef');
+SELECT id, SUBSTRING(s,0), SUBSTRING(s,0,3), SUBSTRING(s,-10), SUBSTRING(s,4,-2) FROM t ORDER BY id;

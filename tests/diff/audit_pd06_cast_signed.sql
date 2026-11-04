@@ -1,0 +1,5 @@
+-- known-diff-file: pushdown: CAST(x AS SIGNED/UNSIGNED) becomes a TEXT cast in stoolap
+CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(10) COLLATE utf8mb4_bin) ENGINE={E};
+INSERT INTO t VALUES (1,'10'),(2,'8'),(3,'9');
+SELECT id FROM t ORDER BY CAST(s AS SIGNED);
+SELECT id FROM t WHERE CAST(s AS UNSIGNED) > 9 ORDER BY id;

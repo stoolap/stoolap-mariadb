@@ -13,9 +13,12 @@ Scenario format:
   accept for now (with the issue that tracks it). It is reported, not
   failed; a known-diff statement that starts to match fails, so the
   note gets removed. `-- known-diff-final: <reason>` anywhere does the
-  same for the final table contents.
+  same for the final table contents, and `-- known-diff-file: <reason>`
+  for the whole scenario (an open finding from the audit backlog: it
+  fails once the scenario matches, so the note gets removed).
 - Other `--` lines are comments."""
 
+import os
 import re
 from pathlib import Path
 
@@ -23,7 +26,14 @@ import mysql.connector
 
 from harness import _format_cell
 
-DIFF_DIR = Path(__file__).resolve().parent.parent / "diff"
+# STOOLAP_DIFF_DIR points the case at another directory of scenarios
+# (e.g. candidates being triaged) without touching tests/diff.
+# Scenarios include statements stoolap answers with an error MariaDB maps
+# differently; the per-statement errno comparison already reports those.
+STOOLAP_COUNTERS_ALLOW_DELTA = {"Stoolap_unmapped_errors"}
+
+DIFF_DIR = Path(os.environ.get(
+    "STOOLAP_DIFF_DIR", Path(__file__).resolve().parent.parent / "diff"))
 ENGINES = ("STOOLAP", "InnoDB")
 
 
@@ -33,7 +43,7 @@ def _parse(path):
     for line in path.read_text().splitlines():
         stripped = line.strip()
         if not buf and stripped.startswith("--"):
-            if re.match(r"--\s*known-diff-final:", stripped):
+            if re.match(r"--\s*known-diff-(final|file):", stripped):
                 continue
             m = re.match(r"--\s*known-diff:\s*(.+)", stripped)
             if m:
@@ -92,14 +102,15 @@ def _fresh(h, db):
     return h._connect(database=db)
 
 
-def _final_known(path):
-    m = re.search(r"^--\s*known-diff-final:\s*(.+)$", path.read_text(),
+def _directive(path, name):
+    m = re.search(rf"^--\s*known-diff-{name}:\s*(.+)$", path.read_text(),
                   re.MULTILINE)
     return m.group(1) if m else None
 
 
 def _run_scenario(h, path):
-    final_known = _final_known(path)
+    final_known = _directive(path, "final")
+    file_known = _directive(path, "file")
     conns = {e: _fresh(h, f"{h.db}_{e.lower()}") for e in ENGINES}
     curs = {e: conns[e].cursor() for e in ENGINES}
     mismatches, known_seen, stale = [], [], []
@@ -131,6 +142,13 @@ def _run_scenario(h, path):
             mismatches.append((0, sql, out))
     elif final_known:
         stale.append(("final", "final contents", final_known, None))
+    if file_known:
+        if mismatches or known_seen:
+            h.skipped += 1
+            print(f"  KNOWN {label}: {file_known}")
+        else:
+            h._fail(label, f"known-diff-file no longer differs: {file_known}")
+        return
     for i, sql, reason, out in known_seen:
         h.skipped += 1
         print(f"  KNOWN {label} #{i}: {reason}")

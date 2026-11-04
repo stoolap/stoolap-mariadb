@@ -1,0 +1,6 @@
+-- known-diff-file: pushdown: FLOAT / TEXT truth values differ in WHERE and CASE
+CREATE TABLE t (id INT PRIMARY KEY, f DOUBLE, s VARCHAR(5) COLLATE utf8mb4_bin) ENGINE={E};
+INSERT INTO t VALUES (1,0.5,'1'),(2,0.0,'0');
+SELECT id FROM t WHERE f ORDER BY id;
+SELECT id, CASE WHEN f THEN 1 ELSE 0 END FROM t ORDER BY id;
+SELECT id FROM t WHERE s ORDER BY id;

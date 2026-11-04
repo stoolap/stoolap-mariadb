@@ -1,0 +1,4 @@
+-- known-diff-file: pushdown: stoolap keeps the backslash in '\"'
+CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(10) COLLATE utf8mb4_bin) ENGINE={E};
+INSERT INTO t VALUES (1,'a"b');
+SELECT id FROM t WHERE s = 'a\"b' ORDER BY id;
