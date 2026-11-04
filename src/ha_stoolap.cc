@@ -318,58 +318,35 @@ StoolapErrorView fetch_error_via(stoolap_mariadb::ThdContext* ctx,
     return fetch_db_error(d);
 }
 
-// Composite UNIQUE is refused at CREATE so every KEY has exactly one
-// user-defined part; if composite UNIQUE ever lands, walk every key part.
-uint find_key_for_column(TABLE_SHARE* share, std::string_view col) {
-    if (!share) return MAX_KEY;
-    for (uint i = 0; i < share->keys; ++i) {
-        KEY& k = share->key_info[i];
-        if (k.user_defined_key_parts == 0) continue;
-        Field* f = k.key_part[0].field;
-        if (f && col.size() == f->field_name.length &&
-            std::memcmp(col.data(), f->field_name.str, col.size()) == 0) {
-            return i;
-        }
-    }
-    return MAX_KEY;
-}
-
-// Stoolap errors mix single-quoted ("column 'pid'") and bareword
-// ("on column u with value") tokens. Strip surrounding quotes if present.
-std::string_view extract_token(std::string_view msg, size_t pos) {
-    if (pos >= msg.size()) return {};
-    if (msg[pos] == '\'') {
-        size_t end = msg.find('\'', pos + 1);
-        if (end == std::string_view::npos) return {};
-        return msg.substr(pos + 1, end - pos - 1);
-    }
-    size_t end = pos;
-    while (end < msg.size() &&
-           !std::isspace(static_cast<unsigned char>(msg[end])) &&
-           msg[end] != '\'' && msg[end] != ',' && msg[end] != ':') {
-        ++end;
-    }
-    return msg.substr(pos, end - pos);
-}
-
 // PK dup -> primary key; UNIQUE dup -> the key on the reported column
 // ("unique constraint failed for index I on column C with value V").
 // Stoolap auto-names inline UNIQUE indexes, so the column is the stable
-// link back to the MariaDB KEY, not the index name.
+// link back to the MariaDB KEY, not the index name. C is unquoted and may
+// hold spaces, so match each key's whole column name against the text
+// after "on column " up to " with value ", never a token cut at a space.
+// Composite UNIQUE is refused at CREATE, so key_part[0] is the column.
 uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
     if (!share) return 0;
     std::string_view m(v.message);
-    auto starts_with = [&](std::string_view p) {
-        return m.size() >= p.size() && m.compare(0, p.size(), p) == 0;
-    };
-    if (starts_with("unique constraint failed")) {
-        const auto col = m.find("on column ");
-        if (col != std::string_view::npos) {
-            std::string_view name =
-                extract_token(m, col + sizeof("on column ") - 1);
-            if (!name.empty()) {
-                uint k = find_key_for_column(share, name);
-                if (k != MAX_KEY) return k;
+    constexpr std::string_view kPrefix = "unique constraint failed";
+    constexpr std::string_view kCol = "on column ";
+    constexpr std::string_view kVal = " with value ";
+    const auto at = m.compare(0, kPrefix.size(), kPrefix) == 0
+                        ? m.find(kCol)
+                        : std::string_view::npos;
+    if (at != std::string_view::npos) {
+        const std::string_view rest = m.substr(at + kCol.size());
+        for (uint i = 0; i < share->keys; ++i) {
+            const KEY& k = share->key_info[i];
+            if (k.user_defined_key_parts == 0) continue;
+            const Field* f = k.key_part[0].field;
+            if (!f) continue;
+            const std::string_view name(f->field_name.str,
+                                        f->field_name.length);
+            if (rest.size() >= name.size() + kVal.size() &&
+                rest.compare(0, name.size(), name) == 0 &&
+                rest.compare(name.size(), kVal.size(), kVal) == 0) {
+                return i;
             }
         }
     }
