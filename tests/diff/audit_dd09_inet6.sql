@@ -1,4 +1,3 @@
--- known-diff-file: types: INET6 compares as text
 CREATE TABLE t (id INT PRIMARY KEY, ip INET6) ENGINE={E};
 INSERT INTO t VALUES (1,'9.0.0.1'),(2,'10.0.0.1');
 SELECT id FROM t ORDER BY ip, id;

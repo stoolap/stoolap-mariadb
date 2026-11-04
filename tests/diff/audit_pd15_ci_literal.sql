@@ -1,4 +1,3 @@
--- known-diff-file: pushdown: literal and expression collations are not guarded (ci compares bytewise)
 CREATE TABLE t (id INT PRIMARY KEY, n INT) ENGINE={E};
 INSERT INTO t VALUES (1,1);
 SELECT id, 'abc' = 'ABC' FROM t ORDER BY id;

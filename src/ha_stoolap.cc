@@ -1058,6 +1058,10 @@ int stoolap_done_func(void*) {
 
 }  // namespace
 
+std::string stoolap_table_name(const TABLE_SHARE* share) {
+    return stoolap_table_from_path(share->normalized_path.str);
+}
+
 // ---------------------------------------------------------------------------
 // ha_stoolap implementation
 // ---------------------------------------------------------------------------

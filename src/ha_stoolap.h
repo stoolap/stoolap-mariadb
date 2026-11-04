@@ -253,3 +253,7 @@ private:
     void apply_count_delta(int64_t delta);
     void set_count_exact(uint64_t value);
 };
+
+// Stoolap name of the table behind `share`, derived from its path the
+// same way create() and open() derive it.
+std::string stoolap_table_name(const TABLE_SHARE* share);

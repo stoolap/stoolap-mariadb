@@ -76,6 +76,7 @@ endif()
 add_library(ha_stoolap MODULE
     src/ha_stoolap.cc
     src/ha_stoolap_select.cc
+    src/stoolap_sqlgen.cc
     src/stoolap_bridge.cc
     src/stoolap_thd_context.cc
     src/stoolap_thd_inspect.cc

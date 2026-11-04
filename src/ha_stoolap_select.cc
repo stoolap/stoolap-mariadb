@@ -28,6 +28,7 @@
 
 #include "stoolap_bridge.h"
 #include "stoolap_packet.h"
+#include "stoolap_sqlgen.h"
 #include "stoolap_thd_context.h"
 #include "stoolap_thd_inspect.h"
 
@@ -1207,20 +1208,6 @@ bool order_list_uses_ci_string(SQL_I_List<ORDER>& lst) {
 }
 
 // Reuses the direct-DML identifier rewriter.
-bool build_pushdown_select_sql(THD* thd, SELECT_LEX* sel_lex,
-                               std::string& out_sql) {
-    if (!thd || !sel_lex) return false;
-    if (!thd->query() || thd->query_length() == 0) return false;
-
-    std::string raw(thd->query(), thd->query_length());
-    std::vector<LeafName> leaves;
-    collect_leaf_names(sel_lex, leaves);
-    if (leaves.empty()) return false;
-
-    out_sql = rewrite_table_names(raw, leaves, thd->db.str);
-    return !out_sql.empty();
-}
-
 // `storage` owns string copies so StoolapValue.text.ptr stays valid
 // for the duration of the stoolap call. PREPARE phase is filtered out
 // upstream (factory bails on is_stmt_prepare).
@@ -1287,8 +1274,12 @@ bool collect_bound_params(THD* thd, std::vector<StoolapValue>& out,
 }
 
 // false -> factory returns NULL -> MariaDB falls back to row pump.
+// semantic_guards: the ci / DECIMAL / placeholder checks the text-based
+// unit and derived paths rely on. The single-SELECT path passes false:
+// stoolap_sqlgen makes those decisions per expression.
 bool can_pushdown_select(THD* thd, SELECT_LEX* sel_lex,
-                         SELECT_LEX_UNIT* sel_unit) {
+                         SELECT_LEX_UNIT* sel_unit,
+                         bool semantic_guards = true) {
     if (!thd || !sel_lex) return false;
     // Single-SELECT only. Unit / partial pushdown handled elsewhere.
     if (sel_unit) return false;
@@ -1350,6 +1341,8 @@ bool can_pushdown_select(THD* thd, SELECT_LEX* sel_lex,
             }
         }
     }
+
+    if (!semantic_guards) return true;
 
     // ci guard: bail when ci columns appear in WHERE/HAVING/ORDER/GROUP
     // or in non-bare projections (LOWER(s), scalar subqueries, ...).
@@ -1523,28 +1516,22 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
                                               SELECT_LEX_UNIT* sel_unit) {
     const bool trace = perf_trace_on();
     const uint64_t t_factory_start = trace ? now_ns() : 0;
-    if (!can_pushdown_select(thd, sel_lex, sel_unit)) {
+    if (!can_pushdown_select(thd, sel_lex, sel_unit,
+                             /*semantic_guards=*/false)) {
         stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
             1, std::memory_order_relaxed);
         return nullptr;
     }
 
-    // Statement-scope param backstop: bail when our per-SELECT walker
-    // accounted for fewer placeholders in WHERE/HAVING than
-    // `LEX::param_list` reports for the whole statement. The shortfall
-    // means a placeholder lives in an Item subclass we don't reach;
-    // pushing would risk a NULL projection. (The unit factory has its
-    // own backstop scoped across all legs.)
-    if (thd->lex && thd->lex->param_list.elements > 0 &&
-        statement_param_backstop_unsafe(
-            thd, select_count_predicate_params(sel_lex))) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;
-    }
-
-    std::string sql;
-    if (!build_pushdown_select_sql(thd, sel_lex, sql)) {
+    // SQL from the prepared Item tree. Placeholders of an EXECUTE are
+    // bound Item_params there and become literals, so no parameters are
+    // passed below.
+    std::string sql, why;
+    if (!stoolap_sqlgen::gen_select(thd, sel_lex, &sql, &why)) {
+        if (stoolap_thd_explain_pushdown(thd)) {
+            sql_print_information("stoolap[explain]: not pushed: %s",
+                                  why.c_str());
+        }
         stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
             1, std::memory_order_relaxed);
         return nullptr;
@@ -1596,17 +1583,6 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
         }
     }
 
-    // Bind any prepared-statement parameters. In PREPARE phase the
-    // factory has already bailed; here we're in EXECUTE phase or plain
-    // (non-prepared) mode. param_list is empty for plain SELECTs.
-    std::vector<StoolapValue> params;
-    std::vector<std::string> param_storage;
-    if (!collect_bound_params(thd, params, param_storage)) {
-        stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
-            1, std::memory_order_relaxed);
-        return nullptr;  // unsupported param type -> row-pump fallback
-    }
-
     // Eagerly run so we can fall back to row-pump on any stoolap-side
     // error (unknown function, type mismatch, ...). Once we return
     // non-NULL, MariaDB has committed and a later init_scan/next_row
@@ -1616,16 +1592,8 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
     StoolapRows* raw = nullptr;
     int rc;
     const uint64_t t_eager_start = trace ? now_ns() : 0;
-    if (params.empty()) {
-        rc = ctx->has_tx() ? stoolap_tx_query(ctx->tx(), sql.c_str(), &raw)
-                           : stoolap_query(db, sql.c_str(), &raw);
-    } else {
-        const StoolapValue* pv = params.data();
-        const int32_t pn = static_cast<int32_t>(params.size());
-        rc = ctx->has_tx()
-                 ? stoolap_tx_query_params(ctx->tx(), sql.c_str(), pv, pn, &raw)
-                 : stoolap_query_params(db, sql.c_str(), pv, pn, &raw);
-    }
+    rc = ctx->has_tx() ? stoolap_tx_query(ctx->tx(), sql.c_str(), &raw)
+                       : stoolap_query(db, sql.c_str(), &raw);
     const uint64_t eager_ns = trace ? (now_ns() - t_eager_start) : 0;
     if (trace) {
         stoolap_mariadb::g_stats.perf_eager_query_ns.fetch_add(
@@ -1633,6 +1601,12 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
     }
     if (rc != STOOLAP_OK) {
         // No error surfacing: row-pump fallback may still complete.
+        if (stoolap_thd_explain_pushdown(thd)) {
+            const char* msg = ctx->has_tx() ? stoolap_tx_errmsg(ctx->tx())
+                                            : stoolap_errmsg(db);
+            sql_print_information("stoolap[explain]: not pushed: %s: %s",
+                                  msg ? msg : "", sql.c_str());
+        }
         stoolap_mariadb::g_stats.pushdown_misses.fetch_add(
             1, std::memory_order_relaxed);
         return nullptr;

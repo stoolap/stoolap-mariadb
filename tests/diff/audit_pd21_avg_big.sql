@@ -1,4 +1,3 @@
--- known-diff-file: pushdown: stoolap AVG is f64, MariaDB returns exact DECIMAL
 CREATE TABLE t (id INT PRIMARY KEY, b BIGINT) ENGINE={E};
 INSERT INTO t VALUES (1,9007199254740993),(2,9007199254740993);
 SELECT AVG(b) FROM t;
