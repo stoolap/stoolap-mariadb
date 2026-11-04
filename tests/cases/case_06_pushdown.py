@@ -191,8 +191,11 @@ INSERT INTO exo VALUES (1,1,'X'),(2,2,'y');
                         "SELECT COUNT(*) FROM exu WHERE 'x' IN "
                         "(SELECT LOWER(s) FROM exo WHERE exo.uid = exu.id)")
     # The ci column is only projected (no comparison), so it pushes.
-    h.assert_pushed("scalar subq with LOWER(s) projection pushes",
-                    "SELECT id, (SELECT LOWER(s) FROM exo WHERE exo.uid = exu.id LIMIT 1) FROM exu")
+    h.assert_pushed("scalar subq with ci s projection pushes",
+                    "SELECT id, (SELECT s FROM exo WHERE exo.uid = exu.id LIMIT 1) FROM exu")
+    # LOWER cases by the collation (Turkish i), which stoolap does not.
+    h.assert_not_pushed("scalar subq with LOWER(s) projection bails",
+                        "SELECT id, (SELECT LOWER(s) FROM exo WHERE exo.uid = exu.id LIMIT 1) FROM exu")
 
     h.section("ci-collation guard recurses into derived nested inside subqueries")
     h.exec_script(f"""

@@ -2556,9 +2556,14 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
             }
         }
         if (need_order) {
-            sql += " ORDER BY ";
+            // A filtered part is an equality MariaDB's collation decides:
+            // its matches all sort as one key value, so ordering by their
+            // stoolap bytes would break the order of the parts after it.
+            bool first = true;
             for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
-                if (i) sql += ", ";
+                if (filter_mask & (uint32_t(1) << i)) continue;
+                sql += first ? " ORDER BY " : ", ";
+                first = false;
                 Field* f = key_info.key_part[i].field;
                 sql += quote_ident(
                     std::string_view(f->field_name.str, f->field_name.length));

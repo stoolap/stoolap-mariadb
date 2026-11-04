@@ -78,6 +78,10 @@ public:
 
     std::string out;
     const char* why = nullptr;
+    SELECT_LEX* top = nullptr;  // the statement's own SELECT
+
+    // Set for the SELECT of an EXISTS, whose select list is never read.
+    bool exists_list_ = false;
 
 private:
     bool fail(const char* w) {
@@ -102,6 +106,8 @@ private:
     bool in_subquery(Item* left, Item_subselect* s);
     bool in_optimizer(Item_in_optimizer* o);
     bool order_list(SQL_I_List<ORDER>* lst, bool directions);
+    bool branch(Item* it, Cls result);
+    bool branches(Item_func* f, Item** args, uint n);
     bool frame_bound(Window_frame_bound* b);
     bool binop(Item* a, const char* op, Item* b);
     bool args_csv(Item** args, uint n);
@@ -242,6 +248,23 @@ bool Gen::same_family(Item** args, uint n) {
     return !(any_num && any_str);
 }
 
+// One value of a mixed result (IF / CASE / COALESCE): MariaDB converts it
+// to the function's type, stoolap keeps each branch's own, so an integer
+// branch of a DOUBLE result is cast (else 3 / 2 divides as integers).
+bool Gen::branch(Item* it, Cls result) {
+    if (result != Cls::REAL || cls(it) != Cls::INT) return expr(it);
+    out += "CAST(";
+    if (!expr(it)) return false;
+    out += " AS FLOAT)";
+    return true;
+}
+
+// The branch types must agree, and the result must be a type we map
+// (a DECIMAL result prints differently).
+bool Gen::branches(Item_func* f, Item** args, uint n) {
+    return same_family(args, n) && cls(f) != Cls::UNSAFE;
+}
+
 // ---------------------------------------------------------------------------
 // SELECT
 // ---------------------------------------------------------------------------
@@ -249,6 +272,10 @@ bool Gen::same_family(Item** args, uint n) {
 bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names) {
     if (sel->olap != UNSPECIFIED_OLAP_TYPE) return fail("WITH ROLLUP");
     if (sel->next_select()) return fail("set operation");
+    const bool any_row = exists_list_;
+    exists_list_ = false;
+    if (sel->limit_params.with_ties) return fail("WITH TIES");
+    if (sel->options & OPTION_FOUND_ROWS) return fail("SQL_CALC_FOUND_ROWS");
 
     // FROM first, so every table has an alias before any expression
     // (including correlated subqueries below) refers to it.
@@ -260,23 +287,29 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names) {
     from_sql.swap(out);
     out.swap(head);
 
-    const bool distinct = sel->options & SELECT_DISTINCT;
-    out += distinct ? "SELECT DISTINCT " : "SELECT ";
-    List_iterator_fast<Item> it(sel->item_list);
-    uint n = 0;
-    for (Item* item; (item = it++); ++n) {
-        if (distinct && !orderable(item)) return fail("DISTINCT type");
-        if (n) out += ", ";
-        if (!expr(item)) return false;
-        out += " AS ";
-        if (names) {
-            if (n >= names->size()) return fail("derived column names");
-            out += quote_ident((*names)[n]);
-        } else {
-            out += quote_ident("c" + std::to_string(n));
+    // Without aggregates, an EXISTS sees rows whatever the list holds,
+    // so it need not be translatable.
+    if (any_row && !sel->with_sum_func) {
+        out += "SELECT 1 AS " + quote_ident("c0") + from_sql;
+    } else {
+        const bool distinct = sel->options & SELECT_DISTINCT;
+        out += distinct ? "SELECT DISTINCT " : "SELECT ";
+        List_iterator_fast<Item> it(sel->item_list);
+        uint n = 0;
+        for (Item* item; (item = it++); ++n) {
+            if (distinct && !orderable(item)) return fail("DISTINCT type");
+            if (n) out += ", ";
+            if (!expr(item)) return false;
+            out += " AS ";
+            if (names) {
+                if (n >= names->size()) return fail("derived column names");
+                out += quote_ident((*names)[n]);
+            } else {
+                out += quote_ident("c" + std::to_string(n));
+            }
         }
+        out += from_sql;
     }
-    out += from_sql;
 
     if (sel->where) {
         out += " WHERE ";
@@ -290,9 +323,21 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names) {
         out += " HAVING ";
         if (!condition(sel->having)) return false;
     }
-    if (sel->order_list.elements) {
+    // MariaDB sorts GROUP BY results by the group keys (in their given
+    // directions) unless an ORDER BY says otherwise; ORDER BY NULL or
+    // another constant leaves the order free, so the group order fits.
+    // Inside a subquery the order only matters under a LIMIT.
+    bool const_order = true;
+    for (ORDER* o = sel->order_list.first; o; o = o->next)
+        if (!o->item || !*o->item || !(*o->item)->const_item())
+            const_order = false;
+    if (!const_order) {
         out += " ORDER BY ";
         if (!order_list(&sel->order_list, true)) return false;
+    } else if (sel->group_list.elements &&
+               (sel == top || sel->limit_params.explicit_limit)) {
+        out += " ORDER BY ";
+        if (!order_list(&sel->group_list, true)) return false;
     }
     if (sel->limit_params.explicit_limit) {
         Item* lim = sel->limit_params.select_limit;
@@ -667,18 +712,19 @@ bool Gen::func(Item_func* f) {
             // args: when1..whenN, then1..thenN, [else]
             const uint whens = n / 2;
             const bool with_else = n % 2;
-            if (!same_family(a + whens, n - whens))
+            if (!branches(f, a + whens, n - whens))
                 return fail("CASE result types");
+            const Cls rc = cls(f);
             out += "(CASE";
             for (uint i = 0; i < whens; ++i) {
                 out += " WHEN ";
                 if (!condition(a[i])) return false;
                 out += " THEN ";
-                if (!expr(a[whens + i])) return false;
+                if (!branch(a[whens + i], rc)) return false;
             }
             if (with_else) {
                 out += " ELSE ";
-                if (!expr(a[n - 1])) return false;
+                if (!branch(a[n - 1], rc)) return false;
             }
             out += " END)";
             return true;
@@ -692,19 +738,20 @@ bool Gen::func(Item_func* f) {
             for (uint i = 0; i < whens; ++i)
                 if (!comparable(a[0], a[1 + i], cc))
                     return fail("CASE value types");
-            if (!same_family(a + 1 + whens, n - 1 - whens))
+            if (!branches(f, a + 1 + whens, n - 1 - whens))
                 return fail("CASE result types");
+            const Cls rc = cls(f);
             out += "(CASE ";
             if (!expr(a[0])) return false;
             for (uint i = 0; i < whens; ++i) {
                 out += " WHEN ";
                 if (!expr(a[1 + i])) return false;
                 out += " THEN ";
-                if (!expr(a[1 + whens + i])) return false;
+                if (!branch(a[1 + whens + i], rc)) return false;
             }
             if (with_else) {
                 out += " ELSE ";
-                if (!expr(a[n - 1])) return false;
+                if (!branch(a[n - 1], rc)) return false;
             }
             out += " END)";
             return true;
@@ -738,9 +785,12 @@ bool Gen::named_func(Item_func* f) {
         return true;
     }
     if (name == "coalesce" || name == "ifnull") {
-        if (n < 1 || !same_family(a, n)) return fail("COALESCE types");
+        if (n < 1 || !branches(f, a, n)) return fail("COALESCE types");
         out += name == "coalesce" ? "COALESCE(" : "IFNULL(";
-        if (!args_csv(a, n)) return false;
+        for (uint i = 0; i < n; ++i) {
+            if (i) out += ", ";
+            if (!branch(a[i], cls(f))) return false;
+        }
         out.push_back(')');
         return true;
     }
@@ -755,22 +805,14 @@ bool Gen::named_func(Item_func* f) {
         return true;
     }
     if (name == "if") {
-        if (n != 3 || !same_family(a + 1, 2)) return fail("IF");
+        if (n != 3 || !branches(f, a + 1, 2)) return fail("IF");
         out += "(CASE WHEN ";
         if (!condition(a[0])) return false;
         out += " THEN ";
-        if (!expr(a[1])) return false;
+        if (!branch(a[1], cls(f))) return false;
         out += " ELSE ";
-        if (!expr(a[2])) return false;
+        if (!branch(a[2], cls(f))) return false;
         out += " END)";
-        return true;
-    }
-    if (name == "upper" || name == "ucase" || name == "lower" ||
-        name == "lcase") {
-        if (n != 1 || cls(a[0]) != Cls::STR) return fail("UPPER/LOWER");
-        out += (name == "upper" || name == "ucase") ? "UPPER(" : "LOWER(";
-        if (!expr(a[0])) return false;
-        out.push_back(')');
         return true;
     }
     if (name == "char_length" || name == "character_length") {
@@ -785,19 +827,18 @@ bool Gen::named_func(Item_func* f) {
     if (name == "concat") {
         for (uint i = 0; i < n; ++i)
             if (cls(a[i]) != Cls::STR) return fail("CONCAT argument");
-        out += "CONCAT(";
-        if (!args_csv(a, n)) return false;
+        // Stoolap's CONCAT skips NULLs; its || returns NULL, as CONCAT
+        // does in MariaDB.
+        out.push_back('(');
+        for (uint i = 0; i < n; ++i) {
+            if (i) out += " || ";
+            if (!expr(a[i])) return false;
+        }
         out.push_back(')');
         return true;
     }
-    if (name == "trim" || name == "ltrim" || name == "rtrim") {
-        // One argument: strip spaces. The FROM / remstr forms differ.
-        if (n != 1 || cls(a[0]) != Cls::STR) return fail("TRIM");
-        out += name == "trim" ? "TRIM(" : name == "ltrim" ? "LTRIM(" : "RTRIM(";
-        if (!expr(a[0])) return false;
-        out.push_back(')');
-        return true;
-    }
+    // Not translated: TRIM (stoolap strips all whitespace, MariaDB only
+    // spaces) and UPPER / LOWER (MariaDB cases by the collation).
     return fail("function");
 }
 
@@ -813,6 +854,7 @@ bool Gen::in_optimizer(Item_in_optimizer* o) {
     switch (s->substype()) {
         case Item_subselect::EXISTS_SUBS:
             out += "(EXISTS (";
+            exists_list_ = true;
             if (!subquery(s->unit)) return false;
             out += "))";
             return true;
@@ -833,6 +875,7 @@ bool Gen::subselect(Item_subselect* s) {
             return true;
         case Item_subselect::EXISTS_SUBS:
             out += "(EXISTS (";
+            exists_list_ = true;
             if (!subquery(s->unit)) return false;
             out += "))";
             return true;
@@ -1028,6 +1071,7 @@ bool Gen::order_list(SQL_I_List<ORDER>* lst, bool directions) {
 bool gen_select(THD* thd, st_select_lex* sel, std::string* out,
                 std::string* why) {
     Gen g(thd);
+    g.top = sel;
     if (!g.select(sel, nullptr)) {
         if (why) *why = g.why ? g.why : "unknown";
         return false;

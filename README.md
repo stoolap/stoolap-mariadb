@@ -163,11 +163,16 @@ left to MariaDB:
 - NULL ordering is explicit (`ASC NULLS FIRST` / `DESC NULLS LAST`),
   `<=>` becomes `IS NOT DISTINCT FROM`, literals are always single-quoted,
   and an EXECUTE's placeholders are written as their bound values.
+- `CONCAT` becomes `||` (NULL if any argument is NULL), an integer
+  branch of a DOUBLE `IF` / `CASE` / `COALESCE` is cast to FLOAT, a
+  GROUP BY without ORDER BY is ordered by its keys as MariaDB does, and
+  an EXISTS subquery without aggregates selects `1`.
 - Comparisons, GROUP BY, ORDER BY, DISTINCT and MIN / MAX push only for
   types that compare the same way in both engines: integers, doubles,
   DATETIME, and strings under a binary NO PAD collation (or any collation
   with `stoolap_trust_binary_strings = 1`).
 - Integer `/`, DECIMAL arithmetic, `LENGTH`, `ROUND`, `SUBSTRING`, CAST,
+  `TRIM`, `UPPER` / `LOWER`, `WITH TIES`, `SQL_CALC_FOUND_ROWS`,
   non-boolean WHERE operands and other constructs without an exact
   stoolap equivalent are not pushed.
 With `SET stoolap_explain_pushdown = 1` the error log names why a SELECT
