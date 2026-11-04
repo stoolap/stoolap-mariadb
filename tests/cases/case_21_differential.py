@@ -60,11 +60,32 @@ def _parse(path):
         raise ValueError(f"{path.name}: trailing statement without ';'")
 
 
+def _cell(v):
+    """Lossless comparison key for one value: NULL, bytes and text stay
+    distinct ('NULL' text is not NULL; b'\\xff' is not b'\\xfe').
+    _format_cell is for display only."""
+    if v is None:
+        return ("null",)
+    if isinstance(v, (bytes, bytearray)):
+        return ("bytes", bytes(v))
+    if isinstance(v, str):
+        return ("str", v)
+    return ("val", _format_cell(v))
+
+
+def _show_cell(c):
+    if c[0] == "null":
+        return "NULL"
+    if c[0] == "bytes":
+        return "0x" + c[1].hex()
+    return c[1]
+
+
 def _outcome(cur, sql):
     try:
         cur.execute(sql)
         if cur.with_rows:
-            rows = [tuple(_format_cell(c) for c in r) for r in cur.fetchall()]
+            rows = [tuple(_cell(c) for c in r) for r in cur.fetchall()]
             if not re.search(r"\border\s+by\b", sql, re.IGNORECASE):
                 rows.sort()
             return ("rows", rows)
@@ -77,7 +98,8 @@ def _show(outcome, limit=6):
     kind, val = outcome
     if kind == "rows":
         more = f" ... ({len(val)} rows)" if len(val) > limit else ""
-        return f"rows {val[:limit]}{more}"
+        shown = [tuple(_show_cell(c) for c in r) for r in val[:limit]]
+        return f"rows {shown}{more}"
     if kind == "err":
         return f"errno {val}"
     return f"ok, {val} row(s) affected"
@@ -88,8 +110,7 @@ def _table_dump(cur):
     out = {}
     for (t,) in cur.fetchall():
         cur.execute(f"SELECT * FROM `{t}`")
-        out[t] = sorted(tuple(_format_cell(c) for c in r)
-                        for r in cur.fetchall())
+        out[t] = sorted(tuple(_cell(c) for c in r) for r in cur.fetchall())
     return out
 
 
@@ -166,7 +187,15 @@ def _run_scenario(h, path):
 
 
 def run(h):
+    # A missing or empty directory (a mistyped STOOLAP_DIFF_DIR) must not
+    # pass with zero comparisons.
+    if not DIFF_DIR.is_dir():
+        h._fail(f"scenario directory {DIFF_DIR} does not exist")
+        return
     scenarios = sorted(DIFF_DIR.glob("*.sql"))
-    h.section(f"{len(scenarios)} scenarios from tests/diff/")
+    if not scenarios:
+        h._fail(f"no *.sql scenarios in {DIFF_DIR}")
+        return
+    h.section(f"{len(scenarios)} scenarios from {DIFF_DIR}")
     for path in scenarios:
         _run_scenario(h, path)
