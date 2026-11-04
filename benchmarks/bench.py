@@ -39,7 +39,7 @@ import random
 import statistics
 import sys
 import time
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import mysql.connector
 
@@ -182,16 +182,19 @@ class Result:
 class Op:
     """One benchmarked operation on one engine: step(k) runs iteration k
     (iteration-dependent parameters stay aligned across engines), and
-    explain() is called once after timing."""
-    __slots__ = ("name", "step", "iters", "warmup", "explain")
+    explain() is called once after timing. prepare(), if set, runs right
+    before the op's warmup, at the op's place in the sequence."""
+    __slots__ = ("name", "step", "iters", "warmup", "explain", "prepare")
 
     def __init__(self, name: str, step: Callable[[int], None], iters: int,
-                 warmup: int, explain: Callable[[], str]):
+                 warmup: int, explain: Callable[[], str],
+                 prepare: Optional[Callable[[], None]] = None):
         self.name    = name
         self.step    = step
         self.iters   = iters
         self.warmup  = warmup
         self.explain = explain
+        self.prepare = prepare
 
 
 # --------------------------------------------------------------------------
@@ -332,7 +335,8 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
     ops: List[Op] = []
 
     def b(name: str, sql: str, *, iters: int = iters_pt,
-          params_seq=None, fetch: bool = True, warmup: int = WARMUP):
+          params_seq=None, fetch: bool = True, warmup: int = WARMUP,
+          prepare=None):
         def step(k):
             if params_seq is None:
                 cur.execute(sql)
@@ -342,7 +346,8 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
                 cur.fetchall()
         sample_params = params_seq[0] if params_seq else None
         ops.append(Op(name, step, iters, warmup,
-                      lambda: capture_explain(cur, sql, sample_params)))
+                      lambda: capture_explain(cur, sql, sample_params),
+                      prepare))
 
     # ---- core ----
     b("SELECT by ID",
@@ -573,9 +578,9 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
     # from pushing the SELECT (index_read_map per outer row), and LIMIT
     # keeps the plugin off direct UPDATE (update_row per matched row).
     def require_row_pump(name: str, sql: str, params, counter: str):
-        """Run the case once and fail if STOOLAP served it by pushdown."""
-        if engine != "STOOLAP":
-            return
+        """An Op.prepare that runs the case once, on every engine so the
+        data stays identical, and fails if STOOLAP served it by
+        pushdown."""
         keys = (counter, "Stoolap_pushdown_hits",
                 "Stoolap_direct_modify_hits")
         probe = ("SHOW SESSION STATUS WHERE Variable_name IN "
@@ -585,16 +590,21 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
             cur.execute(probe, keys)
             return {k: int(v) for k, v in cur.fetchall()}
 
-        before = snap()
-        cur.execute(sql, params)
-        if cur.with_rows:
-            cur.fetchall()
-        after = snap()
-        delta = {k: after.get(k, 0) - before.get(k, 0) for k in keys}
-        if (delta[counter] <= 0 or delta["Stoolap_pushdown_hits"]
-                or delta["Stoolap_direct_modify_hits"]):
-            raise SystemExit(f"bench: '{name}' did not run on the handler "
-                             f"row pump: {delta}")
+        def check():
+            before = snap() if engine == "STOOLAP" else None
+            cur.execute(sql, params)
+            if cur.with_rows:
+                cur.fetchall()
+            if before is None:
+                return
+            after = snap()
+            delta = {k: after.get(k, 0) - before.get(k, 0) for k in keys}
+            if (delta[counter] <= 0 or delta["Stoolap_pushdown_hits"]
+                    or delta["Stoolap_direct_modify_hits"]):
+                raise SystemExit(f"bench: '{name}' did not run on the "
+                                 f"handler row pump: {delta}")
+
+        return check
 
     drv = f"drv_{suffix}"
     cur.execute(f"CREATE TABLE {drv} (k INT NOT NULL PRIMARY KEY) "
@@ -603,13 +613,15 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
                     [(i,) for i in range(1, 1001)])
 
     eq_ref_sql = f"SELECT SUM(u.age) FROM {drv} d JOIN {users} u ON u.id = d.k"
-    require_row_pump("Mixed JOIN eq_ref", eq_ref_sql, None, "Handler_read_key")
-    b("Mixed JOIN eq_ref (1000 lookups)", eq_ref_sql, iters=iters_med)
+    b("Mixed JOIN eq_ref (1000 lookups)", eq_ref_sql, iters=iters_med,
+      prepare=require_row_pump("Mixed JOIN eq_ref", eq_ref_sql, None,
+                               "Handler_read_key"))
 
     ref_sql = (f"SELECT COUNT(*) FROM {drv} d JOIN {orders} o "
                f"ON o.user_id = d.k")
-    require_row_pump("Mixed JOIN ref", ref_sql, None, "Handler_read_key")
-    b("Mixed JOIN ref (1000 lookups)", ref_sql, iters=iters_heav)
+    b("Mixed JOIN ref (1000 lookups)", ref_sql, iters=iters_heav,
+      prepare=require_row_pump("Mixed JOIN ref", ref_sql, None,
+                               "Handler_read_key"))
 
     # 100-row id windows sliding over the table (one window when
     # --rows <= 100).
@@ -619,10 +631,10 @@ def run_engine(socket: str, label: str, engine: str, suffix: str,
     upd_params = [(s0, s0 + span - 1) for s0 in
                   ((i * span) % (args.rows - span + 1) + 1
                    for i in range(iters_med))]
-    require_row_pump("UPDATE row-pump", upd_sql, upd_params[0],
-                     "Handler_update")
     b("UPDATE row-pump (100 rows)", upd_sql, params_seq=upd_params,
-      iters=iters_med, fetch=False)
+      iters=iters_med, fetch=False,
+      prepare=require_row_pump("UPDATE row-pump", upd_sql, upd_params[0],
+                               "Handler_update"))
 
     return ops, c
 
@@ -644,6 +656,8 @@ def run_interleaved(engine_ops: dict) -> dict:
         assert all(op.name == name for op in ops.values()), name
         for label in labels:
             op = ops[label]
+            if op.prepare:
+                op.prepare()
             for k in range(op.warmup):
                 op.step(k)
         iters = ops[labels[0]].iters
