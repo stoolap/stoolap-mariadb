@@ -33,7 +33,7 @@
 //       JSON(6)      u32 len, u8[len] bytes
 //       BLOB(7)      u32 len, u8[len] bytes
 
-#include <stoolap.h>
+#include "stoolap_mariadb.h"
 
 #include "field.h"
 #include "my_global.h"

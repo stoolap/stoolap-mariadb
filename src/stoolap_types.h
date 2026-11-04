@@ -32,7 +32,7 @@
 
 #pragma once
 
-#include <stoolap.h>
+#include "stoolap_mariadb.h"
 
 #include "sql_time.h"
 
