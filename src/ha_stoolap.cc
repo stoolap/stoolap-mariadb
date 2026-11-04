@@ -1985,10 +1985,25 @@ using stoolap_mariadb::pkt_parse_header;
 using stoolap_mariadb::pkt_skip_value;
 using stoolap_mariadb::pkt_store_value;
 
+std::vector<uint32_t> ha_stoolap::projection_words() const {
+    std::vector<uint32_t> w;
+    if (!table->read_set || !table->write_set) return w;
+    const uint fields = table->s->fields;
+    w.assign((fields + 31) / 32, 0);
+    for (uint i = 0; i < fields; ++i) {
+        if (bitmap_is_set(table->read_set, i) ||
+            bitmap_is_set(table->write_set, i)) {
+            w[i / 32] |= uint32_t(1) << (i % 32);
+        }
+    }
+    return w;
+}
+
 std::string ha_stoolap::build_scan_columns() {
     // Project read_set | write_set: write_set covers UPDATE's old/new
     // compare; ORDER BY columns are already in read_set (filesort would
     // read garbage otherwise). Only-read_set broke ORDER BY paths.
+    scan_proj_cols_ = projection_words();
     scan_proj_.assign(table->s->fields, -1);
     if (!table->read_set || !table->write_set) {
         for (uint i = 0; i < table->s->fields; ++i)
@@ -2341,14 +2356,8 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
     move_fields(table, d);
 
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
-    sql += " WHERE ";
-
-    std::vector<StoolapValue> params;
-    std::vector<std::string> text_holders;
-    params.reserve(nparts);
-    text_holders.reserve(nparts);
+    ir_params_.clear();
+    ir_text_.resize(nparts);
 
     // ci-string ref: MariaDB's ci collations case+accent fold; stoolap
     // compares bytes. Drop the engine-side WHERE, pull all rows in index
@@ -2387,46 +2396,31 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         }
     }
     const bool ci_collation_lookup = any_ci_part;
-    int rc_err = 0;
-    int next_param = 1;
-    if (ci_collation_lookup) {
-        // index_next does the work; strip the trailing " WHERE ".
-        if (sql.size() >= 7 && sql.compare(sql.size() - 7, 7, " WHERE ") == 0) {
-            sql.resize(sql.size() - 7);
-        }
-    } else {
+
+    // Bind the key values; the SQL text depends only on the shape below.
+    uint32_t null_mask = 0;
+    if (!ci_collation_lookup) {
         for (uint i = 0; i < nparts; ++i) {
             Field* f = key_info.key_part[i].field;
-            const bool is_last = (i == nparts - 1);
-            const char* op = is_last ? last_op : "=";
-
-            if (i) sql += " AND ";
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
             if (f->is_null()) {
                 // NULL with range op = no rows; equality uses IS NULL.
-                if (op[0] == '=' && op[1] == '\0') {
-                    sql += " IS NULL";
-                    continue;
+                const bool is_last = (i == nparts - 1);
+                if (is_last && std::strcmp(last_op, "=") != 0) {
+                    move_fields(table, -d);
+                    return HA_ERR_KEY_NOT_FOUND;
                 }
-                move_fields(table, -d);
-                return HA_ERR_KEY_NOT_FOUND;
+                null_mask |= uint32_t(1) << i;
+                continue;
             }
             StoolapValue v{};
-            text_holders.emplace_back();
-            if (!extract_field(f, v, text_holders.back())) {
-                rc_err = HA_ERR_UNSUPPORTED;
-                break;
+            if (!extract_field(f, v, ir_text_[i])) {
+                move_fields(table, -d);
+                return HA_ERR_UNSUPPORTED;
             }
-            sql.push_back(' ');
-            sql += op;
-            sql += " $";
-            sql += std::to_string(next_param++);
-            params.push_back(v);
+            ir_params_.push_back(v);
         }
     }
     move_fields(table, -d);
-    if (rc_err) return rc_err;
 
     // Skip ORDER BY when an exact lookup is bound by a unique key (one
     // row max). For unsorted forward scans we also drop it; backward
@@ -2436,21 +2430,59 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         nparts == key_info.user_defined_key_parts &&
         (key_info.flags & HA_NOSAME);
     const bool need_order = !exact_unique_lookup && (index_sorted_ || desc);
-    if (need_order) {
-        sql += " ORDER BY ";
-        for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
-            if (i) sql += ", ";
-            Field* f = key_info.key_part[i].field;
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-            if (desc) sql += " DESC";
+
+    IndexReadShape shape;
+    shape.index = active_index;
+    shape.find_flag = static_cast<int>(find_flag);
+    shape.nparts = nparts;
+    shape.null_mask = null_mask;
+    shape.ci = ci_collation_lookup;
+    shape.order = need_order;
+    shape.cols = projection_words();
+
+    if (!(shape == ir_shape_)) {
+        std::string sql = "SELECT " + build_scan_columns() + " FROM ";
+        sql += quote_ident(stoolap_table_);
+        if (!ci_collation_lookup) {
+            // ci lookups: index_next does the work, no engine WHERE.
+            sql += " WHERE ";
+            int next_param = 1;
+            for (uint i = 0; i < nparts; ++i) {
+                Field* f = key_info.key_part[i].field;
+                if (i) sql += " AND ";
+                sql += quote_ident(
+                    std::string_view(f->field_name.str, f->field_name.length));
+                if (null_mask & (uint32_t(1) << i)) {
+                    sql += " IS NULL";
+                    continue;
+                }
+                sql.push_back(' ');
+                sql += (i == nparts - 1) ? last_op : "=";
+                sql += " $";
+                sql += std::to_string(next_param++);
+            }
         }
+        if (need_order) {
+            sql += " ORDER BY ";
+            for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
+                if (i) sql += ", ";
+                Field* f = key_info.key_part[i].field;
+                sql += quote_ident(
+                    std::string_view(f->field_name.str, f->field_name.length));
+                if (desc) sql += " DESC";
+            }
+        }
+        ir_sql_ = std::move(sql);
+        ir_shape_ = std::move(shape);
+    } else if (scan_proj_cols_ != ir_shape_.cols) {
+        // A scan with another projection rebuilt scan_proj_ since.
+        (void)build_scan_columns();
     }
 
     auto* ctx = get_thd_ctx(ha_thd());
     StoolapRows* rows = nullptr;
-    int rc = query_params_via(ctx, db_raw(), sql.c_str(), params.data(),
-                              static_cast<int32_t>(params.size()), &rows);
+    int rc = query_params_via(ctx, db_raw(), ir_sql_.c_str(), ir_params_.data(),
+                              static_cast<int32_t>(ir_params_.size()), &rows);
     if (rc != STOOLAP_OK) {
         auto verr = fetch_error_via(ctx, db_raw());
         sql_print_error("stoolap: index_read SELECT failed: %s", verr.message);
