@@ -318,35 +318,55 @@ StoolapErrorView fetch_error_via(stoolap_mariadb::ThdContext* ctx,
     return fetch_db_error(d);
 }
 
-// PK dup -> primary key; UNIQUE dup -> the key on the reported column
-// ("unique constraint failed for index I on column C with value V").
-// Stoolap auto-names inline UNIQUE indexes, so the column is the stable
-// link back to the MariaDB KEY, not the index name. C is unquoted and may
-// hold spaces, so match each key's whole column name against the text
-// after "on column " up to " with value ", never a token cut at a space.
-// Composite UNIQUE is refused at CREATE, so key_part[0] is the column.
+// MariaDB key build_create_sql emitted as the n-th table-level
+// UNIQUE (n counts non-PK HA_NOSAME keys in key order), or MAX_KEY.
+uint unique_key_by_ordinal(TABLE_SHARE* share, uint n) {
+    for (uint i = 0; i < share->keys; ++i) {
+        if (i == share->primary_key) continue;
+        if (!(share->key_info[i].flags & HA_NOSAME)) continue;
+        if (n-- == 0) return i;
+    }
+    return MAX_KEY;
+}
+
+// PK dup -> primary key; UNIQUE dup -> the key stoolap reports in
+// "unique constraint failed for index unique_<table>_<n> on column C
+// with value V". Stoolap names the n-th table-level UNIQUE of CREATE
+// TABLE unique_<table>_<n>, so n pins the key exactly; C must also be
+// that key's whole column name. Table and column names are unquoted and
+// may contain the separators, so every " on column " is tried until one
+// satisfies both. Composite UNIQUE is refused at CREATE, so key_part[0]
+// is the column.
 uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
     if (!share) return 0;
     std::string_view m(v.message);
-    constexpr std::string_view kPrefix = "unique constraint failed";
-    constexpr std::string_view kCol = "on column ";
+    constexpr std::string_view kPrefix =
+        "unique constraint failed for index unique_";
+    constexpr std::string_view kCol = " on column ";
     constexpr std::string_view kVal = " with value ";
-    const auto at = m.compare(0, kPrefix.size(), kPrefix) == 0
-                        ? m.find(kCol)
-                        : std::string_view::npos;
-    if (at != std::string_view::npos) {
-        const std::string_view rest = m.substr(at + kCol.size());
-        for (uint i = 0; i < share->keys; ++i) {
-            const KEY& k = share->key_info[i];
-            if (k.user_defined_key_parts == 0) continue;
-            const Field* f = k.key_part[0].field;
+    if (m.compare(0, kPrefix.size(), kPrefix) == 0) {
+        for (size_t at = m.find(kCol, kPrefix.size());
+             at != std::string_view::npos; at = m.find(kCol, at + 1)) {
+            size_t d = at;
+            while (d > kPrefix.size() &&
+                   std::isdigit(static_cast<unsigned char>(m[d - 1]))) {
+                --d;
+            }
+            if (d == at || at - d > 6 || m[d - 1] != '_') continue;
+            uint n = 0;
+            for (size_t i = d; i < at; ++i)
+                n = n * 10 + (m[i] - '0');
+            const uint key = unique_key_by_ordinal(share, n);
+            if (key == MAX_KEY) continue;
+            const Field* f = share->key_info[key].key_part[0].field;
             if (!f) continue;
             const std::string_view name(f->field_name.str,
                                         f->field_name.length);
+            const std::string_view rest = m.substr(at + kCol.size());
             if (rest.size() >= name.size() + kVal.size() &&
                 rest.compare(0, name.size(), name) == 0 &&
                 rest.compare(name.size(), kVal.size(), kVal) == 0) {
-                return i;
+                return key;
             }
         }
     }
