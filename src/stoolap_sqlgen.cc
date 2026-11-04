@@ -80,7 +80,7 @@ bool numeric(Cls c) {
 class Gen {
 public:
     explicit Gen(THD* thd)
-        : trust_bin_(stoolap_thd_trust_binary_strings(thd) != 0) {
+        : thd_(thd), trust_bin_(stoolap_thd_trust_binary_strings(thd) != 0) {
         out.reserve(1024);
     }
 
@@ -158,6 +158,7 @@ private:
     bool orderable(Item* it);
     bool same_family(Item** args, uint n);
 
+    THD* thd_;
     bool trust_bin_;
     std::unordered_map<const TABLE_LIST*, std::string> alias_;
     // Columns of a derived table emitted as a subquery: the items a view
@@ -796,34 +797,52 @@ bool Gen::field(Item_field* f) {
 // parsed with the comparison flags and packed like the column
 // (stoolap_types.h). Strings that parse with a warning, or to a date
 // with a zero part (sql_mode decides those), are left to MariaDB.
+// h is null for BETWEEN, whose comparator MariaDB does not expose: the
+// column's kind decides there, as it does in MariaDB for a string bound
+// (a DATE BETWEEN times of day also compares as DATETIME).
 bool Gen::temporal_literal(Item* col, Item* k, const Type_handler* h,
                            std::string* lit) {
     const Cls c = cls(col);
-    if ((c != Cls::DATETIME && c != Cls::TIME) || !h) return false;
-    if (!k->basic_const_item() || k->cmp_type() != STRING_RESULT ||
-        k->is_null())
-        return false;
-    bool want_time;
-    switch (h->field_type()) {
-        case MYSQL_TYPE_DATE:
-        case MYSQL_TYPE_NEWDATE:
-        case MYSQL_TYPE_DATETIME:
-        case MYSQL_TYPE_DATETIME2:
-            want_time = false;
-            break;
-        case MYSQL_TYPE_TIME:
-        case MYSQL_TYPE_TIME2:
-            want_time = true;
-            break;
-        default:
-            return false;
+    if (c != Cls::DATETIME && c != Cls::TIME) return false;
+    if (!k->basic_const_item() || k->is_null()) return false;
+    bool want_time = c == Cls::TIME;
+    if (h) {
+        switch (h->field_type()) {
+            case MYSQL_TYPE_DATE:
+            case MYSQL_TYPE_NEWDATE:
+            case MYSQL_TYPE_DATETIME:
+            case MYSQL_TYPE_DATETIME2:
+                want_time = false;
+                break;
+            case MYSQL_TYPE_TIME:
+            case MYSQL_TYPE_TIME2:
+                want_time = true;
+                break;
+            default:
+                return false;
+        }
     }
     if (want_time != (c == Cls::TIME)) return false;
+    MYSQL_TIME mt;
+    if (k->cmp_type() == TIME_RESULT) {
+        // A temporal literal MariaDB made while preparing (BETWEEN turns
+        // its string bounds into these): its packed DATETIME / TIME, the
+        // value the comparator reads, is already pack_time()'s.
+        const longlong packed =
+            want_time ? k->val_time_packed(thd_) : k->val_datetime_packed(thd_);
+        if (k->null_value) return false;
+        unpack_time(
+            packed, &mt,
+            want_time ? MYSQL_TIMESTAMP_TIME : MYSQL_TIMESTAMP_DATETIME);
+        if (!want_time && (!mt.year || !mt.month || !mt.day)) return false;
+        *lit = std::to_string(static_cast<long long>(packed));
+        return true;
+    }
+    if (k->cmp_type() != STRING_RESULT) return false;
     char buf[80];
     String tmp(buf, sizeof(buf), &my_charset_bin);
     const String* s = k->val_str(&tmp);
     if (!s || !s->charset() || s->charset()->mbminlen != 1) return false;
-    MYSQL_TIME mt;
     MYSQL_TIME_STATUS st;
     my_time_status_init(&st);
     if (want_time) {
@@ -955,6 +974,15 @@ bool Gen::func(Item_func* f) {
         case Item_func::BETWEEN: {
             auto* b = static_cast<Item_func_between*>(f);
             const CHARSET_INFO* cc = b->compare_collation();
+            std::string lo, hi;
+            if (n == 3 && temporal_literal(a[0], a[1], nullptr, &lo) &&
+                temporal_literal(a[0], a[2], nullptr, &hi)) {
+                out.push_back('(');
+                if (!expr(a[0])) return false;
+                out += b->negated ? " NOT BETWEEN " : " BETWEEN ";
+                out += lo + " AND " + hi + ")";
+                return true;
+            }
             if (n != 3 || !comparable(a[0], a[1], cc) ||
                 !comparable(a[0], a[2], cc))
                 return fail("BETWEEN");

@@ -179,9 +179,9 @@ the statement is left to MariaDB:
   DATETIME together), and utf8 strings under a binary NO PAD collation
   (or any collation with `stoolap_trust_binary_strings = 1`).
 - A DATE / DATETIME or TIME column compared with a string constant
-  pushes with the constant converted the way MariaDB's comparison would
-  (`d >= '2024-01-01'`), unless it parses with a warning or has a zero
-  date part.
+  (`d >= '2024-01-01'`, `dt BETWEEN '2024-01-01' AND '2024-02-01'`)
+  pushes with the constant converted the way MariaDB's comparison would,
+  unless it parses with a warning or has a zero date part.
 - Integer `/`, DECIMAL arithmetic, `LENGTH`, `ROUND`, `SUBSTRING`, CAST,
   `TRIM`, `UPPER` / `LOWER`, `WITH TIES`, `SQL_CALC_FOUND_ROWS`,
   non-boolean WHERE operands and other constructs without an exact
