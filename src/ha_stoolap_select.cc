@@ -1300,13 +1300,13 @@ bool run_pushdown(THD* thd, const std::string& sql, PushdownPacked* packed,
     // EXPLAIN only says "PUSHED ..."). Costs an extra query, so opt-in.
     const bool explain = stoolap_thd_explain_pushdown(thd);
     if (explain) {
+        sql_print_information("stoolap[explain]: %s", sql.c_str());
         std::string esql = "EXPLAIN " + sql;
         StoolapRows* erows = nullptr;
         const int erc = ctx->has_tx()
                             ? stoolap_tx_query(ctx->tx(), esql.c_str(), &erows)
                             : stoolap_query(db, esql.c_str(), &erows);
         if (erc == STOOLAP_OK && erows) {
-            sql_print_information("stoolap[explain]: %s", sql.c_str());
             while (stoolap_rows_next(erows) == STOOLAP_ROW) {
                 int64_t len = 0;
                 const char* line = stoolap_rows_column_text(erows, 0, &len);
@@ -1486,6 +1486,25 @@ derived_handler* create_stoolap_derived_handler(THD* thd, TABLE_LIST* derived) {
     if (!thd || !derived || !derived->derived) return nullptr;
     SELECT_LEX_UNIT* unit = derived->derived;
     if (!unit->first_select()) return nullptr;
+
+    // This factory runs its query at once, during prepare. In a SELECT
+    // over stoolap tables only, the select or unit handler takes the
+    // whole statement, derived table included, and this result would be
+    // thrown away; if they cannot, MariaDB materializes the derived table.
+    if (thd->lex->sql_command == SQLCOM_SELECT) {
+        SELECT_LEX* top = derived->select_lex;
+        while (top && top->outer_select())
+            top = top->outer_select();
+        bool all_stoolap = top != nullptr, any = false;
+        for (SELECT_LEX* sl = top ? top->master_unit()->first_select()
+                                  : nullptr;
+             sl && all_stoolap; sl = sl->next_select()) {
+            bool leg_any = false;
+            all_stoolap = every_table_is_stoolap(sl, leg_any);
+            any |= leg_any;
+        }
+        if (all_stoolap && any) return nullptr;
+    }
     for (SELECT_LEX* sel = unit->first_select(); sel;
          sel = sel->next_select()) {
         if (!can_pushdown_select(thd, sel, /*sel_unit=*/nullptr)) {
