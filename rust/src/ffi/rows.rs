@@ -22,9 +22,7 @@ use stoolap::core::types::DataType;
 use stoolap::core::{Result, Value};
 
 use super::types::StoolapRows;
-use super::{
-    STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW,
-};
+use super::{STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
 
 /// Advance to the next row.
 ///
@@ -239,7 +237,10 @@ pub(crate) fn reset_packed(buf: &mut Vec<u8>) {
 
 /// Writes the column names and a zero row count, returning where the
 /// row count sits so `write_rows` can patch it
-pub(crate) fn write_header<'a>(names: impl ExactSizeIterator<Item = &'a [u8]>, buf: &mut Vec<u8>) -> usize {
+pub(crate) fn write_header<'a>(
+    names: impl ExactSizeIterator<Item = &'a [u8]>,
+    buf: &mut Vec<u8>,
+) -> usize {
     buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
     for name in names {
         buf.extend_from_slice(&(name.len() as u16).to_le_bytes());

@@ -20,8 +20,8 @@
 //! Build: `cargo build --release --features ffi` produces `libstoolap.{so,dylib,dll}`
 
 mod database;
-mod read;
 mod error;
+mod read;
 mod rows;
 mod statement;
 mod transaction;
@@ -35,8 +35,8 @@ pub use rows::*;
 pub use statement::*;
 pub use transaction::*;
 pub use types::{
-    StoolapBlobData, StoolapDB, StoolapRows, StoolapStmt, StoolapTextData,
-    StoolapTx, StoolapValue, StoolapValueData,
+    StoolapBlobData, StoolapDB, StoolapRows, StoolapStmt, StoolapTextData, StoolapTx, StoolapValue,
+    StoolapValueData,
 };
 
 // Status codes

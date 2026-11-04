@@ -74,7 +74,11 @@ impl Cursor {
             if c < schema.columns.len() {
                 Ok(())
             } else {
-                Err(Error::internal(format!("no column {} in {}", c, table.name())))
+                Err(Error::internal(format!(
+                    "no column {} in {}",
+                    c,
+                    table.name()
+                )))
             }
         };
         for &c in spec.columns.iter().chain(spec.order) {

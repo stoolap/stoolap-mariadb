@@ -108,4 +108,3 @@ pub(crate) unsafe fn params_to_vec(params: *const StoolapValue, len: i32) -> Res
     let slice = std::slice::from_raw_parts(params, len as usize);
     slice.iter().map(|v| ffi_value_to_rust(v)).collect()
 }
-

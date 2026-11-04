@@ -24,8 +24,8 @@ use rustc_hash::FxHashMap;
 use stoolap::api::{Database, ParamVec};
 use stoolap::core::{Error, IsolationLevel, Result, Row};
 use stoolap::executor::{CachedPlanRef, ExecutionContext, Executor};
-use stoolap::storage::mvcc::registry::StatementView;
 use stoolap::parser::ast::{RollbackStatement, Statement};
+use stoolap::storage::mvcc::registry::StatementView;
 use stoolap::storage::traits::{QueryResult, Table, Transaction};
 
 pub struct Session {
@@ -133,12 +133,19 @@ impl Session {
 
     /// Runs `f` on the handle on `table` of the open transaction, or
     /// else of the statement's own read transaction
-    pub fn with_table<R>(&self, table: &str, f: impl FnOnce(&mut dyn Table) -> Result<R>) -> Result<R> {
+    pub fn with_table<R>(
+        &self,
+        table: &str,
+        f: impl FnOnce(&mut dyn Table) -> Result<R>,
+    ) -> Result<R> {
         let mut tables = lock(&self.tables);
         if !tables.contains_key(table) {
             let handle = if self.in_transaction() {
                 // The executor holds the transaction between statements
-                let tx = self.exec.take_transaction().ok_or(Error::TransactionEnded)?;
+                let tx = self
+                    .exec
+                    .take_transaction()
+                    .ok_or(Error::TransactionEnded)?;
                 let handle = self.open_table(tx.as_ref(), *lock(&self.level), table);
                 self.exec.install_transaction(tx);
                 handle?
@@ -157,7 +164,12 @@ impl Session {
 
     /// `tx`'s handle on `table`, through the statement's view under read
     /// committed
-    fn open_table(&self, tx: &dyn Transaction, level: IsolationLevel, table: &str) -> Result<Box<dyn Table>> {
+    fn open_table(
+        &self,
+        tx: &dyn Transaction,
+        level: IsolationLevel,
+        table: &str,
+    ) -> Result<Box<dyn Table>> {
         if level != IsolationLevel::ReadCommitted {
             return tx.get_table(table);
         }

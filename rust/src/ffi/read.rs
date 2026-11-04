@@ -117,7 +117,8 @@ pub unsafe extern "C" fn stoolap_read(
                 CondOp::IsNull | CondOp::IsNotNull => stoolap::core::Value::null_unknown(),
                 _ => value::ffi_value_to_rust(&c.value)?,
             };
-            let column = usize::try_from(c.column).map_err(|_| Error::internal("negative column"))?;
+            let column =
+                usize::try_from(c.column).map_err(|_| Error::internal("negative column"))?;
             cond_list.push(Cond { column, op, value });
         }
         let spec = ReadSpec {

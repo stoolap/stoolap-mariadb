@@ -24,9 +24,9 @@ use stoolap::common::version::VERSION;
 use super::error;
 use super::rows::pack_all;
 use super::types::{StoolapDB, StoolapRows, StoolapTx, StoolapValue};
-use crate::session::{Rows, Session};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
+use crate::session::{Rows, Session};
 
 /// Version string with static lifetime, initialized once.
 static VERSION_CSTR: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
@@ -214,7 +214,11 @@ pub unsafe extern "C" fn stoolap_exec(
             }
         };
 
-        match handle.session.run(sql_str, Default::default()).map(|r| r.rows_affected()) {
+        match handle
+            .session
+            .run(sql_str, Default::default())
+            .map(|r| r.rows_affected())
+        {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
