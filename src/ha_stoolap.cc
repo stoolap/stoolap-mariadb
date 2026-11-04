@@ -591,7 +591,6 @@ const char* stoolap_type_for(const Field* f) {
         case Enc::INDEX:
             return "INTEGER";
         case Enc::HEX:
-        case Enc::TO_UTF8:
             return "TEXT";
         case Enc::PLAIN:
             break;

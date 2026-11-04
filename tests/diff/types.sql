@@ -90,11 +90,16 @@ SELECT id, s FROM te ORDER BY id;
 CREATE TABLE tb (id INT NOT NULL PRIMARY KEY, b VARBINARY(8), f BINARY(4),
                  bl BLOB, l VARCHAR(10) CHARACTER SET latin1 COLLATE latin1_bin,
                  KEY kb (b), KEY kl (l)) ENGINE={E};
-INSERT INTO tb VALUES (1, 0x00FF7F, 0x01, 0xDEADBEEF00, _latin1 X'E9', 'x'),
-                      (2, 'abc', 'ab', '', 'Ã©', NULL),
-                      (3, 0x00, NULL, NULL, 'é', 'e'),
-                      (4, 0xFF, 0x00000000, 0x00, NULL, NULL);
-SELECT id, HEX(b), HEX(f), HEX(bl), HEX(l) FROM tb ORDER BY id;
+INSERT INTO tb VALUES (1, 0x00FF7F, 0x01, 0xDEADBEEF00, _latin1 X'E9'),
+                      (2, 'abc', 'ab', '', 'Ã©'),
+                      (3, 0x00, NULL, NULL, 'é'),
+                      (4, 0xFF, 0x00000000, 0x00, NULL),
+                      (5, 0x0080, 'x', 'y', _latin1 X'80');
+SELECT COUNT(*) FROM tb;
+SELECT id, HEX(b), HEX(f), HEX(l) FROM tb ORDER BY id;
+-- (No ORDER BY: MariaDB re-reads sorted rows by position, which the
+-- plugin refuses on BLOB tables; see README, Known limitations.)
+SELECT id, HEX(bl) FROM tb;
 SELECT id FROM tb ORDER BY b, id;
 SELECT id FROM tb WHERE b = 0x00FF7F;
 SELECT id FROM tb WHERE b > 0x00 ORDER BY id;
@@ -102,3 +107,21 @@ SELECT id FROM tb WHERE l = 'é' ORDER BY id;
 SELECT id, LENGTH(b), LENGTH(f) FROM tb ORDER BY id;
 UPDATE tb SET b = 0x0102 WHERE f = 0x01;
 SELECT id, HEX(b) FROM tb ORDER BY id;
+-- A binary or latin1 result that is not a stored column has no hex form.
+SELECT id, _binary '4142' FROM tb ORDER BY id;
+SELECT id, _binary '4142', HEX(_binary '4142') FROM tb ORDER BY id;
+SELECT id, _latin1 'abcd', CONCAT(l, 'x') FROM tb ORDER BY id;
+SELECT id, b, l FROM tb ORDER BY id;
+-- latin1_bin orders by byte: 0x80 (the euro sign) before 0xE9.
+SELECT id FROM tb FORCE INDEX (kl) WHERE l < _latin1 X'E9' ORDER BY id;
+SELECT id FROM tb FORCE INDEX (kl) WHERE l >= _latin1 X'80' ORDER BY id;
+SELECT HEX(l) FROM tb FORCE INDEX (kl) WHERE l IS NOT NULL ORDER BY l;
+SELECT id FROM tb FORCE INDEX (kb) WHERE b BETWEEN 0x00 AND 0x00FF ORDER BY id;
+
+-- TIME BETWEEN datetime bounds compares as DATETIME.
+CREATE TABLE tt2 (id INT NOT NULL PRIMARY KEY, tm TIME, d DATE) ENGINE={E};
+INSERT INTO tt2 VALUES (1, '11:00:00', '2000-01-01'), (2, '23:00:00', '2024-02-29');
+SELECT id FROM tt2 WHERE tm BETWEEN TIMESTAMP '2000-01-01 10:00:00' AND TIMESTAMP '2000-01-01 12:00:00' ORDER BY id;
+SELECT id FROM tt2 WHERE tm BETWEEN TIME '10:00:00' AND TIME '12:00:00' ORDER BY id;
+SELECT id FROM tt2 WHERE d BETWEEN TIME '10:00:00' AND TIME '12:00:00' ORDER BY id;
+SELECT id FROM tt2 WHERE d BETWEEN DATE '2000-01-01' AND TIMESTAMP '2000-01-01 00:00:00' ORDER BY id;

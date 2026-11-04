@@ -202,9 +202,11 @@ Cls Gen::cls(Item* it) {
             case MYSQL_TYPE_BLOB:
             case MYSQL_TYPE_MEDIUM_BLOB:
             case MYSQL_TYPE_LONG_BLOB:
-                // Binary strings, INET6 / UUID (no charset) do not
-                // compare as stoolap TEXT does.
-                if (!f->has_charset() || f->charset() == &my_charset_bin)
+                // Binary and non-utf8 strings are stored as hex, INET6 /
+                // UUID as their text: neither compares as stoolap TEXT.
+                if (stoolap_mariadb::field_enc(f) !=
+                        stoolap_mariadb::Enc::PLAIN ||
+                    !f->has_charset() || f->charset() == &my_charset_bin)
                     return Cls::UNSAFE;
                 return Cls::STR;
             case MYSQL_TYPE_DATE:
@@ -243,9 +245,10 @@ Cls Gen::cls(Item* it) {
             // against INT / DOUBLE values; a DECIMAL expression does not.
             return it->basic_const_item() ? Cls::REAL : Cls::UNSAFE;
         case STRING_RESULT:
-            // A binary-collation result would be read back as hex.
-            return it->collation.collation == &my_charset_bin ? Cls::UNSAFE
-                                                              : Cls::STR;
+            // A binary or non-utf8 result would be read back as hex.
+            return stoolap_mariadb::text_is_utf8(it->collation.collation)
+                       ? Cls::STR
+                       : Cls::UNSAFE;
         default:
             return Cls::UNSAFE;
     }
@@ -256,8 +259,7 @@ Cls Gen::cls(Item* it) {
 // trailing spaces. Stoolap compares bytes, which only a binary NO PAD
 // collation agrees with, unless the session opted into byte semantics.
 bool Gen::cs_safe(const CHARSET_INFO* cs) {
-    // Other character sets are stored converted to utf8mb4, whose byte
-    // order is not theirs.
+    // Other character sets are stored as hex (stoolap_types.h).
     if (!stoolap_mariadb::text_is_utf8(cs)) return false;
     if (trust_bin_) return true;
     return cs && (cs->state & MY_CS_BINSORT) && (cs->state & MY_CS_NOPAD);
@@ -367,6 +369,12 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
         uint n = 0;
         for (Item* item; (item = it++); ++n) {
             if (distinct && !orderable(item)) return fail("DISTINCT type");
+            // The reader decodes a binary or non-utf8 result column from
+            // hex: only a stored column of such a type comes back so.
+            if (item->cmp_type() == STRING_RESULT &&
+                !stoolap_mariadb::text_is_utf8(item->collation.collation) &&
+                item->real_item()->type() != Item::FIELD_ITEM)
+                return fail("binary / non-utf8 string result");
             if (n) out += ", ";
             if (cols) {
                 // A leg's value must already have the result's type, or
@@ -825,6 +833,22 @@ bool Gen::temporal_literal(Item* col, Item* k, const Type_handler* h,
     if (want_time != (c == Cls::TIME)) return false;
     MYSQL_TIME mt;
     if (k->cmp_type() == TIME_RESULT) {
+        // Of the column's own kind: MariaDB compares a TIME column with a
+        // DATETIME bound (or a DATE one with a TIME bound) as DATETIME.
+        switch (k->field_type()) {
+            case MYSQL_TYPE_TIME:
+            case MYSQL_TYPE_TIME2:
+                if (!want_time) return false;
+                break;
+            case MYSQL_TYPE_DATE:
+            case MYSQL_TYPE_NEWDATE:
+            case MYSQL_TYPE_DATETIME:
+            case MYSQL_TYPE_DATETIME2:
+                if (want_time) return false;
+                break;
+            default:
+                return false;
+        }
         // A temporal literal MariaDB made while preparing (BETWEEN turns
         // its string bounds into these): its packed DATETIME / TIME, the
         // value the comparator reads, is already pack_time()'s.

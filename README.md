@@ -207,7 +207,7 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 | `CREATE TABLE` with DECIMAL                    | Yes (round-tripped via TEXT) |
 | `CREATE TABLE` with ENUM / SET                 | Yes (index / bit mask; UNIQUE allowed) |
 | `CREATE TABLE` with BINARY / VARBINARY / BLOB  | Yes (any bytes) |
-| Character sets other than utf8 (latin1, ...)   | Yes (stored as utf8mb4) |
+| Character sets other than utf8 (latin1, ...)   | Yes (stored as hex; not pushed) |
 | `CREATE TABLE` with JSON                       | Yes (LONGTEXT route)        |
 | `DROP TABLE` / `RENAME TABLE` / `TRUNCATE`     | Yes |
 | `CREATE INDEX` (single or multi-column)        | Yes |
@@ -301,8 +301,7 @@ MariaDB's (`src/stoolap_types.h`):
 | DATE, DATETIME, TIME | INTEGER | MariaDB's `pack_time()` value: years 0000-9999, zero and partial dates, negative and >99 h times; a DATE is the DATETIME at midnight |
 | TIMESTAMP | INTEGER | UTC microseconds since the epoch, independent of `time_zone` |
 | ENUM / SET | INTEGER | the index / bit mask MariaDB sorts by |
-| BINARY / VARBINARY / BLOB | TEXT | uppercase hex of the bytes (stoolap TEXT is UTF-8; its BLOB type holds vectors) |
-| text in latin1 etc. | TEXT | converted to utf8mb4 |
+| BINARY / VARBINARY / BLOB, and text in latin1 etc. | TEXT | uppercase hex of the bytes, which keeps their order (stoolap TEXT is UTF-8; its BLOB type holds vectors) |
 | DECIMAL | TEXT | the decimal string |
 | integers, doubles, utf8 text | INTEGER / FLOAT / TEXT | as is |
 

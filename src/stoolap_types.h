@@ -21,9 +21,10 @@
 // - TIMESTAMP is an INTEGER: UTC microseconds since the epoch, the value
 //   MariaDB stores; 0 is the zero timestamp.
 // - ENUM is its index and SET its bit mask, the values MariaDB sorts by.
-// - Binary strings are TEXT holding uppercase hex (stoolap TEXT must be
-//   UTF-8; hex keeps byte order and equality).
-// - Text in another character set is TEXT converted to utf8mb4.
+// - Binary strings, and text in a character set other than utf8 /
+//   ascii, are TEXT holding the bytes in uppercase hex: stoolap TEXT must
+//   be UTF-8, and hex keeps byte order and equality (so a latin1_bin key
+//   orders as MariaDB's, which converting to utf8 would not).
 // Everything else (integers, doubles, utf8 / ascii text, DECIMAL as its
 // decimal string) is stored as is.
 //
@@ -46,8 +47,7 @@ enum class Enc : uint8_t {
     PACKED_TIME,  // DATE, DATETIME, TIME
     UTC_MICROS,   // TIMESTAMP
     INDEX,        // ENUM, SET
-    HEX,          // binary strings
-    TO_UTF8,      // text in a character set other than utf8 / ascii
+    HEX,          // binary strings, text in non-utf8 character sets
 };
 
 // Text whose bytes are already valid UTF-8 in the same order.
@@ -85,9 +85,7 @@ inline Enc field_enc(const Field* f) {
             // but read and write their text form, stored as is.
             if (!f->type_handler()->is_traditional_scalar_type())
                 return Enc::PLAIN;
-            if (!f->has_charset() || f->charset() == &my_charset_bin)
-                return Enc::HEX;
-            return Enc::TO_UTF8;
+            return Enc::HEX;
         default:
             return Enc::PLAIN;
     }
@@ -138,27 +136,16 @@ inline bool encode_field(Field* f, StoolapValue& v, std::string& holder) {
             v.value_type = STOOLAP_TYPE_INTEGER;
             v.v.integer = static_cast<int64_t>(f->val_int());
             return true;
-        case Enc::HEX:
-        case Enc::TO_UTF8: {
+        case Enc::HEX: {
             char tmp[256];
             String tmp_str(tmp, sizeof(tmp), f->charset());
             const String* s = f->val_str(&tmp_str);
-            if (field_enc(f) == Enc::HEX) {
-                static const char digits[] = "0123456789ABCDEF";
-                holder.resize(s->length() * 2);
-                const auto* p = reinterpret_cast<const uchar*>(s->ptr());
-                for (size_t i = 0; i < s->length(); ++i) {
-                    holder[2 * i] = digits[p[i] >> 4];
-                    holder[2 * i + 1] = digits[p[i] & 15];
-                }
-            } else {
-                String conv;
-                uint errors = 0;
-                if (conv.copy(s->ptr(), s->length(), s->charset(),
-                              &my_charset_utf8mb4_bin, &errors) ||
-                    errors)
-                    return false;
-                holder.assign(conv.ptr(), conv.length());
+            static const char digits[] = "0123456789ABCDEF";
+            holder.resize(s->length() * 2);
+            const auto* p = reinterpret_cast<const uchar*>(s->ptr());
+            for (size_t i = 0; i < s->length(); ++i) {
+                holder[2 * i] = digits[p[i] >> 4];
+                holder[2 * i + 1] = digits[p[i] & 15];
             }
             v.value_type = STOOLAP_TYPE_TEXT;
             v.v.text.ptr = holder.data();
@@ -219,13 +206,13 @@ inline void store_text(Field* f, const char* s, size_t n) {
             bytes[i] = static_cast<char>((hi << 4) | lo);
         }
         if (ok) {
-            f->store(bytes.data(), bytes.size(), &my_charset_bin);
+            // The bytes are in the field's own character set.
+            f->store(bytes.data(), bytes.size(), cs);
             return;
         }
     }
-    // TO_UTF8 text converts back; anything else (a DECIMAL's string)
-    // reads in the field's own character set, as before.
-    f->store(s, n, enc == Enc::TO_UTF8 ? &my_charset_utf8mb4_bin : cs);
+    // Anything else (a DECIMAL's string) reads as before.
+    f->store(s, n, cs);
 }
 
 }  // namespace stoolap_mariadb
