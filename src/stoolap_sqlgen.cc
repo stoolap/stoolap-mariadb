@@ -97,6 +97,7 @@ private:
     bool from(SELECT_LEX* sel);
     bool join_list(List<TABLE_LIST>* jl);
     bool table_ref(TABLE_LIST* t);
+    TABLE_LIST* mergeable_base(TABLE_LIST* t);
     bool condition(Item* it);
     bool expr(Item* it);
     bool literal(Item* it);
@@ -130,6 +131,12 @@ private:
     // Columns of a derived table emitted as a subquery: the items a view
     // reference points at (field_translation) -> "alias"."column".
     std::unordered_map<const Item*, std::string> view_cols_;
+    // WHERE conditions of derived tables merged into the current SELECT's
+    // FROM without an ON to carry them (see table_ref).
+    std::vector<Item*> merged_where_;
+    // Set by table_ref for a merged derived table: its WHERE, for the
+    // caller's ON.
+    Item* merged_on_ = nullptr;
     int next_alias_ = 0;
 };
 
@@ -290,7 +297,13 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
     std::string head;
     head.swap(out);
     if (sel->table_list.elements == 0) return fail("no table");
-    if (!from(sel)) return false;
+    std::vector<Item*> outer_merged;
+    outer_merged.swap(merged_where_);
+    const bool from_ok = from(sel);
+    std::vector<Item*> where_parts;
+    where_parts.swap(merged_where_);
+    merged_where_.swap(outer_merged);
+    if (!from_ok) return false;
     std::string from_sql;
     from_sql.swap(out);
     out.swap(head);
@@ -330,9 +343,11 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
         out += from_sql;
     }
 
-    if (sel->where) {
-        out += " WHERE ";
-        if (!condition(sel->where)) return false;
+    if (sel->where) where_parts.insert(where_parts.begin(), sel->where);
+    for (size_t i = 0; i < where_parts.size(); ++i) {
+        out += i ? " AND (" : " WHERE (";
+        if (!condition(where_parts[i])) return false;
+        out.push_back(')');
     }
     if (sel->group_list.elements) {
         out += " GROUP BY ";
@@ -489,20 +504,73 @@ bool Gen::join_list(List<TABLE_LIST>* jl) {
             if (!join_list(&t->nested_join->join_list)) return false;
             continue;
         }
+        merged_on_ = nullptr;
         if (!table_ref(t)) return false;
+        Item* merged = merged_on_;
+        merged_on_ = nullptr;
         if (t->on_expr) {
             if (first) return fail("ON on first table");
-            out += " ON ";
+            out += " ON (";
             if (!condition(t->on_expr)) return false;
+            out.push_back(')');
+            // A merged derived table's WHERE filters its rows before the
+            // join, which in an ON (outer joins included) means the same.
+            if (merged) {
+                out += " AND (";
+                if (!condition(merged)) return false;
+                out.push_back(')');
+            }
         } else if (outer) {
             return fail("outer join without ON");
+        } else if (merged) {
+            merged_where_.push_back(merged);
         }
     }
     return true;
 }
 
+// A derived table (CTE, view) MariaDB would merge, over one base table:
+// that table, else nullptr. Written as the table itself, its WHERE moved
+// to the ON or the outer WHERE, and its columns as their expressions, it
+// lets stoolap join and stop at a LIMIT instead of materializing.
+TABLE_LIST* Gen::mergeable_base(TABLE_LIST* t) {
+    SELECT_LEX_UNIT* u = t->derived;
+    SELECT_LEX* d = u ? u->first_select() : nullptr;
+    if (!d || !d->is_mergeable() || d->have_window_funcs() || d->tvc ||
+        d->olap != UNSPECIFIED_OLAP_TYPE ||
+        (d->uncacheable & UNCACHEABLE_RAND) ||
+        (u->with_element && u->with_element->is_recursive))
+        return nullptr;
+    if (d->top_join_list.elements != 1) return nullptr;
+    TABLE_LIST* b = d->top_join_list.head();
+    if (!b || b->derived || b->nested_join || b->on_expr ||
+        (b->outer_join & (JOIN_TYPE_LEFT | JOIN_TYPE_RIGHT)) || !b->table ||
+        !b->table->s)
+        return nullptr;
+    // On the inner side of an outer join a NULL-complemented row must
+    // read NULL in every column: true of b's own columns, not of a
+    // constant or an expression like COALESCE(x, 0).
+    const bool outer_inner =
+        (t->outer_join & (JOIN_TYPE_LEFT | JOIN_TYPE_RIGHT)) ||
+        (t->embedding && t->embedding->outer_join);
+    if (outer_inner) {
+        List_iterator_fast<Item> it(d->item_list);
+        for (Item* item; (item = it++);)
+            if (item->real_item()->type() != Item::FIELD_ITEM) return nullptr;
+    }
+    // The same unit reached twice (a CTE used twice shares it) would give
+    // one table two aliases.
+    if (alias_.count(b)) return nullptr;
+    return b;
+}
+
 bool Gen::table_ref(TABLE_LIST* t) {
     if (t->derived) {
+        if (TABLE_LIST* b = mergeable_base(t)) {
+            if (!table_ref(b)) return false;
+            merged_on_ = t->derived->first_select()->where;
+            return true;
+        }
         // A derived table (or CTE / view) is written as a subquery from
         // its unit. A mergeable one is only merged into this select by
         // JOIN::optimize(), which a pushed select skips, so its unit
