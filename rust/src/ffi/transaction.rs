@@ -12,21 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Transaction FFI functions.
+//! Transaction FFI functions. A transaction is installed in its database
+//! handle's session; the `StoolapTx` handle names it until commit or
+//! rollback consumes the handle.
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic;
+use std::sync::Arc;
 
 use stoolap::core::types::IsolationLevel;
+use stoolap::core::{Error, Result};
 
-use super::types::{
-    StoolapDB, StoolapRows, StoolapStmt, StoolapTx, StoolapValue,
-};
+use super::types::{StoolapDB, StoolapRows, StoolapStmt, StoolapTx, StoolapValue};
 use super::value;
 use super::{
     STOOLAP_ERROR, STOOLAP_ISOLATION_READ_COMMITTED, STOOLAP_ISOLATION_SNAPSHOT, STOOLAP_OK,
 };
+use crate::session::{Rows, Session};
 
 /// Begin a transaction with a specific isolation level.
 ///
@@ -66,13 +69,12 @@ pub unsafe extern "C" fn stoolap_begin_with_isolation(
     };
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        match handle.db.begin_with_isolation(level) {
-            Ok(tx) => {
-                let tx_handle = Box::new(StoolapTx {
-                    tx: Some(tx),
+        match handle.session.begin(level) {
+            Ok(()) => {
+                *out_tx = Box::into_raw(Box::new(StoolapTx {
+                    session: Arc::clone(&handle.session),
                     last_error: None,
-                });
-                *out_tx = Box::into_raw(tx_handle);
+                }));
                 STOOLAP_OK
             }
             Err(e) => {
@@ -86,6 +88,44 @@ pub unsafe extern "C" fn stoolap_begin_with_isolation(
         handle.set_error("panic during stoolap_begin_with_isolation");
         STOOLAP_ERROR
     })
+}
+
+/// Runs `f` on the transaction's session, recording an error or a panic
+/// on the handle.
+unsafe fn on_tx(tx: *mut StoolapTx, what: &str, f: impl FnOnce(&Session) -> Result<()>) -> i32 {
+    let handle = match tx.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        if !handle.session.in_transaction() {
+            return Err(Error::TransactionEnded);
+        }
+        f(&handle.session)
+    }));
+
+    match result {
+        Ok(Ok(())) => STOOLAP_OK,
+        Ok(Err(e)) => {
+            handle.set_error(&e.to_string());
+            STOOLAP_ERROR
+        }
+        Err(_) => {
+            handle.set_error(&format!("panic during {}", what));
+            STOOLAP_ERROR
+        }
+    }
+}
+
+unsafe fn sql_str<'a>(sql: *const c_char) -> Result<&'a str> {
+    if sql.is_null() {
+        return Err(Error::internal("SQL string is NULL"));
+    }
+    CStr::from_ptr(sql)
+        .to_str()
+        .map_err(|e| Error::internal(format!("invalid UTF-8 in SQL: {}", e)))
 }
 
 /// Execute a SQL statement within a transaction (no parameters).
@@ -120,51 +160,14 @@ pub unsafe extern "C" fn stoolap_tx_exec_params(
     params_len: i32,
     rows_affected: *mut i64,
 ) -> i32 {
-    let handle = match tx.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    if sql.is_null() {
-        handle.set_error("SQL string is NULL");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let inner_tx = match &mut handle.tx {
-            Some(t) => t,
-            None => {
-                handle.set_error("transaction already ended");
-                return STOOLAP_ERROR;
-            }
-        };
-
-        let sql_str = match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
-                return STOOLAP_ERROR;
-            }
-        };
-
-        match value::params_to_vec(params, params_len).and_then(|p| inner_tx.execute(sql_str, p)) {
-            Ok(affected) => {
-                if !rows_affected.is_null() {
-                    *rows_affected = affected;
-                }
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    on_tx(tx, "stoolap_tx_exec_params", |session| {
+        let sql = sql_str(sql)?;
+        let p = value::params_to_vec(params, params_len)?;
+        let affected = session.run(sql, p)?.rows_affected();
+        if !rows_affected.is_null() {
+            *rows_affected = affected;
         }
-    }));
-
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_tx_exec_params");
-        STOOLAP_ERROR
+        Ok(())
     })
 }
 
@@ -204,51 +207,30 @@ pub unsafe extern "C" fn stoolap_tx_query_params(
         return STOOLAP_ERROR;
     }
     *out_rows = std::ptr::null_mut();
+    on_tx(tx, "stoolap_tx_query_params", |session| {
+        let sql = sql_str(sql)?;
+        let p = value::params_to_vec(params, params_len)?;
+        *out_rows = StoolapRows::boxed(Rows::new(session.run(sql, p)?));
+        Ok(())
+    })
+}
 
-    let handle = match tx.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    if sql.is_null() {
-        handle.set_error("SQL string is NULL");
+/// Ends a transaction with `end`; the handle is consumed (freed), so an
+/// error goes to the thread's global error.
+unsafe fn end_tx(tx: *mut StoolapTx, end: impl FnOnce(&Session) -> Result<()>) -> i32 {
+    if tx.is_null() {
         return STOOLAP_ERROR;
     }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let inner_tx = match &mut handle.tx {
-            Some(t) => t,
-            None => {
-                handle.set_error("transaction already ended");
-                return STOOLAP_ERROR;
-            }
-        };
-
-        let sql_str = match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
-                return STOOLAP_ERROR;
-            }
-        };
-
-        match value::params_to_vec(params, params_len).and_then(|p| inner_tx.query(sql_str, p)) {
-            Ok(rows) => {
-                *out_rows = StoolapRows::boxed(rows);
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    let handle = Box::from_raw(tx);
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| end(&handle.session)));
+    match result {
+        Ok(Ok(())) => STOOLAP_OK,
+        Ok(Err(e)) => {
+            super::error::set_global_error(&e.to_string());
+            STOOLAP_ERROR
         }
-    }));
-
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_tx_query_params");
-        STOOLAP_ERROR
-    })
+        Err(_) => STOOLAP_ERROR,
+    }
 }
 
 /// Commit a transaction. The tx handle is consumed (freed).
@@ -259,34 +241,7 @@ pub unsafe extern "C" fn stoolap_tx_query_params(
 /// After this call (success or failure), the pointer is invalid.
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_tx_commit(tx: *mut StoolapTx) -> i32 {
-    if tx.is_null() {
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let mut handle = Box::from_raw(tx);
-
-        let rc = match handle.tx.take() {
-            Some(mut inner_tx) => match inner_tx.commit() {
-                Ok(()) => STOOLAP_OK,
-                Err(e) => {
-                    // Transaction is consumed regardless; log the error globally
-                    super::error::set_global_error(&e.to_string());
-                    STOOLAP_ERROR
-                }
-            },
-            None => {
-                super::error::set_global_error("transaction already ended");
-                STOOLAP_ERROR
-            }
-        };
-
-        drop(handle);
-
-        rc
-    }));
-
-    result.unwrap_or(STOOLAP_ERROR)
+    end_tx(tx, Session::commit)
 }
 
 /// Rollback a transaction. The tx handle is consumed (freed).
@@ -297,39 +252,10 @@ pub unsafe extern "C" fn stoolap_tx_commit(tx: *mut StoolapTx) -> i32 {
 /// After this call (success or failure), the pointer is invalid.
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_tx_rollback(tx: *mut StoolapTx) -> i32 {
-    if tx.is_null() {
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let mut handle = Box::from_raw(tx);
-
-        let rc = match handle.tx.take() {
-            Some(mut inner_tx) => match inner_tx.rollback() {
-                Ok(()) => STOOLAP_OK,
-                Err(e) => {
-                    super::error::set_global_error(&e.to_string());
-                    STOOLAP_ERROR
-                }
-            },
-            None => {
-                super::error::set_global_error("transaction already ended");
-                STOOLAP_ERROR
-            }
-        };
-
-        drop(handle);
-
-        rc
-    }));
-
-    result.unwrap_or(STOOLAP_ERROR)
+    end_tx(tx, Session::rollback)
 }
 
 /// Execute a prepared statement within a transaction (with parameters).
-///
-/// This gives both parse-once performance AND transaction atomicity.
-/// The statement must have been created via `stoolap_prepare()`.
 ///
 /// # Safety
 ///
@@ -345,47 +271,19 @@ pub unsafe extern "C" fn stoolap_tx_stmt_exec(
     params_len: i32,
     rows_affected: *mut i64,
 ) -> i32 {
-    let handle = match tx.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    let stmt_handle = match stmt.as_ref() {
-        Some(h) => h,
-        None => {
-            handle.set_error("statement handle is NULL");
-            return STOOLAP_ERROR;
+    let Some(stmt_handle) = stmt.as_ref() else {
+        if let Some(h) = tx.as_mut() {
+            h.set_error("statement handle is NULL");
         }
+        return STOOLAP_ERROR;
     };
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let inner_tx = match &mut handle.tx {
-            Some(t) => t,
-            None => {
-                handle.set_error("transaction already ended");
-                return STOOLAP_ERROR;
-            }
-        };
-
-        let param_vec = value::params_to_vec(params, params_len);
-        match param_vec.and_then(|p| stmt_handle.stmt.execute_in(inner_tx, p)) {
-            Ok(affected) => {
-                if !rows_affected.is_null() {
-                    *rows_affected = affected;
-                }
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    on_tx(tx, "stoolap_tx_stmt_exec", |session| {
+        let p = value::params_to_vec(params, params_len)?;
+        let affected = session.run_plan(&stmt_handle.plan, p)?.rows_affected();
+        if !rows_affected.is_null() {
+            *rows_affected = affected;
         }
-    }));
-
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_tx_stmt_exec");
-        STOOLAP_ERROR
+        Ok(())
     })
 }
 

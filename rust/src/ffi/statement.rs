@@ -18,13 +18,11 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic;
 
-use stoolap::api::transaction::Transaction;
-use stoolap::api::{Database, ParamVec};
-use stoolap::core::{Error, Result};
+use std::sync::Arc;
 
-use super::types::{
-    StoolapDB, StoolapStmt, StoolapTx, StoolapValue,
-};
+use stoolap::api::ParamVec;
+
+use super::types::{StoolapDB, StoolapStmt, StoolapValue};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -66,13 +64,12 @@ pub unsafe extern "C" fn stoolap_prepare(
             }
         };
 
-        match handle.db.prepare(sql_str) {
-            Ok(stmt) => {
-                let db_keepalive = handle.db.clone();
+        match handle.session.prepare(sql_str) {
+            Ok(plan) => {
                 let stmt_handle = Box::new(StoolapStmt {
-                    stmt,
+                    plan,
                     last_error: None,
-                    _db_keepalive: db_keepalive,
+                    _session: Arc::clone(&handle.session),
                 });
                 *out_stmt = Box::into_raw(stmt_handle);
                 STOOLAP_OK
@@ -144,13 +141,12 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
     }
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let mut tx = match db_handle.db.begin() {
-            Ok(t) => t,
-            Err(e) => {
-                db_handle.set_error(&e.to_string());
-                return STOOLAP_ERROR;
-            }
-        };
+        let session = &db_handle.session;
+        let level = session.isolation_level();
+        if let Err(e) = session.begin(level) {
+            db_handle.set_error(&e.to_string());
+            return STOOLAP_ERROR;
+        }
 
         let ppr = params_per_row as usize;
         let mut total: i64 = 0;
@@ -162,17 +158,17 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
                 value::params_to_vec(params.add(r * ppr), params_per_row)
             };
 
-            match param_vec.and_then(|p| stmt_handle.stmt.execute_in(&mut tx, p)) {
-                Ok(affected) => total += affected,
+            match param_vec.and_then(|p| session.run_plan(&stmt_handle.plan, p)) {
+                Ok(result) => total += result.rows_affected(),
                 Err(e) => {
-                    let _ = tx.rollback();
+                    let _ = session.rollback();
                     db_handle.set_error(&e.to_string());
                     return STOOLAP_ERROR;
                 }
             }
         }
 
-        match tx.commit() {
+        match session.commit() {
             Ok(_) => {
                 if !total_affected.is_null() {
                     *total_affected = total;
@@ -192,36 +188,6 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
     })
 }
 
-/// The open transaction behind `tx`: None for NULL, an error once it ended
-pub(super) unsafe fn open_transaction<'a>(
-    tx: *mut StoolapTx,
-) -> Result<Option<&'a mut Transaction>> {
-    match tx.as_mut() {
-        None => Ok(None),
-        Some(tx_handle) => match &mut tx_handle.tx {
-            Some(inner_tx) => Ok(Some(inner_tx)),
-            None => Err(Error::TransactionEnded),
-        },
-    }
-}
-
-/// `open_transaction`. (The plugin opens one engine, so a `tx` is never
-/// another engine's; stoolap's own FFI checks that with private API.)
-pub(super) unsafe fn open_transaction_on<'a>(
-    _db: &Database,
-    tx: *mut StoolapTx,
-) -> Result<Option<&'a mut Transaction>> {
-    open_transaction(tx)
-}
-
-/// Finalize (destroy) a prepared statement and free resources.
-///
-/// Safe to call with NULL (no-op).
-///
-/// # Safety
-///
-/// `stmt` must be a pointer returned by `stoolap_prepare`, or NULL.
-/// After this call, the pointer is invalid.
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_stmt_finalize(stmt: *mut StoolapStmt) {
     if stmt.is_null() {

@@ -17,8 +17,11 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
 
-use stoolap::api::transaction::Transaction;
-use stoolap::api::{Database, Rows, Statement};
+use std::sync::Arc;
+
+use stoolap::executor::CachedPlanRef;
+
+use crate::session::{Rows, Session};
 
 /// FFI-safe tagged union for passing parameter values across the C boundary.
 #[repr(C)]
@@ -58,7 +61,7 @@ pub struct StoolapBlobData {
 
 /// Opaque handle wrapping a [`Database`] connection.
 pub struct StoolapDB {
-    pub(crate) db: Database,
+    pub(crate) session: Arc<Session>,
     pub(crate) last_error: Option<CString>,
     /// Buffer behind `stoolap_query_params_all()`, reused across calls
     pub(crate) packed: Vec<u8>,
@@ -66,16 +69,17 @@ pub struct StoolapDB {
 
 /// Opaque handle wrapping a [`Statement`].
 pub struct StoolapStmt {
-    pub(crate) stmt: Statement,
+    pub(crate) plan: CachedPlanRef,
     pub(crate) last_error: Option<CString>,
-    /// Keeps the originating `DatabaseInner` alive so the `Statement`'s `Weak`
-    /// reference can be upgraded, and with it the engine.
-    pub(crate) _db_keepalive: Database,
+    /// Keeps the session it was prepared on, and with it the engine, open
+    pub(crate) _session: Arc<Session>,
 }
 
 /// Opaque handle wrapping a [`Transaction`].
+/// The transaction open in `session`, until commit or rollback consumes
+/// the handle
 pub struct StoolapTx {
-    pub(crate) tx: Option<Transaction>,
+    pub(crate) session: Arc<Session>,
     pub(crate) last_error: Option<CString>,
 }
 
@@ -127,6 +131,16 @@ impl StoolapTx {
         match &self.last_error {
             Some(cs) => cs.as_ptr(),
             None => super::error::empty_cstr(),
+        }
+    }
+}
+
+impl Drop for StoolapTx {
+    fn drop(&mut self) {
+        // A handle dropped without commit or rollback rolls back, as
+        // stoolap's own Transaction does
+        if self.session.in_transaction() {
+            let _ = self.session.rollback();
         }
     }
 }

@@ -12,3 +12,4 @@
 //! include/stoolap_mariadb.h.
 
 pub mod ffi;
+pub mod session;

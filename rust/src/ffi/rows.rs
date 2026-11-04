@@ -17,7 +17,7 @@
 use std::os::raw::c_char;
 use std::panic;
 
-use stoolap::api::Rows;
+use crate::session::Rows;
 use stoolap::core::types::DataType;
 use stoolap::core::{Result, Value};
 

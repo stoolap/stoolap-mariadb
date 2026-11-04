@@ -24,6 +24,7 @@ use stoolap::common::version::VERSION;
 use super::error;
 use super::rows::pack_all;
 use super::types::{StoolapDB, StoolapRows, StoolapTx, StoolapValue};
+use crate::session::{Rows, Session};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -70,7 +71,7 @@ pub unsafe extern "C" fn stoolap_open(dsn: *const c_char, out_db: *mut *mut Stoo
         match Database::open(dsn_str) {
             Ok(db) => {
                 let handle = Box::new(StoolapDB {
-                    db,
+                    session: Session::new(&db),
                     last_error: None,
                     packed: Vec::new(),
                 });
@@ -147,9 +148,8 @@ pub unsafe extern "C" fn stoolap_clone(db: *const StoolapDB, out_db: *mut *mut S
     };
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let cloned = handle.db.clone();
         let new_handle = Box::new(StoolapDB {
-            db: cloned,
+            session: Session::new(handle.session.db()),
             last_error: None,
             packed: Vec::new(),
         });
@@ -214,7 +214,7 @@ pub unsafe extern "C" fn stoolap_exec(
             }
         };
 
-        match handle.db.execute(sql_str, ()) {
+        match handle.session.run(sql_str, Default::default()).map(|r| r.rows_affected()) {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -270,7 +270,10 @@ pub unsafe extern "C" fn stoolap_exec_params(
             }
         };
 
-        match value::params_to_vec(params, params_len).and_then(|p| handle.db.execute(sql_str, p)) {
+        let run = value::params_to_vec(params, params_len)
+            .and_then(|p| handle.session.run(sql_str, p))
+            .map(|r| r.rows_affected());
+        match run {
             Ok(affected) => {
                 if !rows_affected.is_null() {
                     *rows_affected = affected;
@@ -347,7 +350,10 @@ pub unsafe extern "C" fn stoolap_query_params(
             }
         };
 
-        match value::params_to_vec(params, params_len).and_then(|p| handle.db.query(sql_str, p)) {
+        let run = value::params_to_vec(params, params_len)
+            .and_then(|p| handle.session.run(sql_str, p))
+            .map(Rows::new);
+        match run {
             Ok(rows) => {
                 *out_rows = StoolapRows::boxed(rows);
                 STOOLAP_OK
@@ -418,12 +424,14 @@ pub unsafe extern "C" fn stoolap_query_params_all(
             }
         };
 
-        let rows = value::params_to_vec(params, params_len).and_then(|p| {
-            match super::statement::open_transaction_on(&handle.db, tx)? {
-                None => handle.db.query(sql_str, p),
-                Some(inner_tx) => inner_tx.query(sql_str, p),
-            }
-        });
+        // A transaction runs in its own session
+        let session = match tx.as_ref() {
+            Some(t) => &t.session,
+            None => &handle.session,
+        };
+        let rows = value::params_to_vec(params, params_len)
+            .and_then(|p| session.run(sql_str, p))
+            .map(Rows::new);
         match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
             Ok(_) => {
                 *out_buf = handle.packed.as_ptr();
