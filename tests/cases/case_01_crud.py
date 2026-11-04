@@ -98,3 +98,23 @@ INSERT INTO pk VALUES (1,10),(2,10),(3,10);
                 "UPDATE pk SET b = b + 100 ORDER BY id LIMIT 1")
     h.assert_scalar("PK row-pump LIMIT touched exactly one row",
                     "SELECT COUNT(*) FROM pk WHERE b = 110", "1")
+
+    h.section("Ordered row-pump UPDATE/DELETE scans past the first row")
+    # ORDER BY <pk> LIMIT n drives the handler with index_first then
+    # index_next; index_first must open the whole ordered stream, not a
+    # one-row probe, or only the first row is touched.
+    h.exec_script(f"""
+CREATE TABLE ord (id INT NOT NULL PRIMARY KEY, n INT NOT NULL) ENGINE={h.engine};
+INSERT INTO ord VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
+""")
+    h.assert_ok("UPDATE ORDER BY pk LIMIT 3",
+                "UPDATE ord SET n = n + 100 ORDER BY id LIMIT 3")
+    h.assert_scalar("UPDATE ORDER BY pk LIMIT 3 touched rows 1-3",
+                    "SELECT GROUP_CONCAT(n ORDER BY id) FROM ord",
+                    "101,102,103,4,5")
+    h.assert_ok("DELETE ORDER BY pk LIMIT 2",
+                "DELETE FROM ord ORDER BY id LIMIT 2")
+    h.assert_scalar("DELETE ORDER BY pk LIMIT 2 removed rows 1-2",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ord", "3,4,5")
+    h.assert_scalar("MIN/MAX still answered",
+                    "SELECT CONCAT(MIN(id), '-', MAX(id)) FROM ord", "3-5")

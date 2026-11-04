@@ -2549,9 +2549,10 @@ int ha_stoolap::index_first(uchar* buf) {
         sql += quote_ident(
             std::string_view(f->field_name.str, f->field_name.length));
     }
-    // One-row probe (MIN/MAX, existence). Without LIMIT 1 we'd pay for
-    // sorting the whole stream and discard everything after the first row.
-    sql += " LIMIT 1";
+    // No LIMIT 1: besides MIN probes, MariaDB runs ordered full index
+    // scans (UPDATE/DELETE ... ORDER BY pk LIMIT n) as index_first then
+    // index_next, which reads on from this stream. (index_last stays a
+    // one-row probe: without HA_READ_PREV nothing scans backwards.)
     auto* ctx = get_thd_ctx(ha_thd());
     StoolapRows* rows = nullptr;
     int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
