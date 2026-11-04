@@ -10,8 +10,11 @@ INSERT INTO s VALUES ('a', 1), ('b', 2);
 UPDATE s SET id = 'c' WHERE id = 'a';
 -- known-diff: table s was not created
 SELECT id, n FROM s ORDER BY id;
--- known-diff: stoolap refuses a non-INTEGER single-column PRIMARY KEY
+-- A DATE is stored as an INTEGER, so it can be the PRIMARY KEY.
 CREATE TABLE dpk (d DATE NOT NULL PRIMARY KEY) ENGINE={E};
+INSERT INTO dpk VALUES ('2024-02-29'), ('0000-00-00'), ('1999-12-31');
+SELECT d FROM dpk ORDER BY d;
+SELECT d FROM dpk WHERE d >= '1999-12-31' ORDER BY d DESC;
 CREATE TABLE cpk (id VARCHAR(10) COLLATE utf8mb4_bin NOT NULL, x INT NOT NULL,
                   PRIMARY KEY (id, x)) ENGINE={E};
 INSERT INTO cpk VALUES ('a', 1), ('a', 2);

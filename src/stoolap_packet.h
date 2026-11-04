@@ -37,6 +37,7 @@
 
 #include "field.h"
 #include "my_global.h"
+#include "stoolap_types.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -140,20 +141,9 @@ inline int pkt_store_value(const uint8_t* buf, size_t len, size_t* pos,
     switch (tag) {
         case STOOLAP_TYPE_INTEGER: {
             if (*pos + 8 > len) return HA_ERR_GENERIC;
-            int64_t v = pkt_i64(buf + *pos);
+            const int64_t v = pkt_i64(buf + *pos);
             *pos += 8;
-            // Preserve UNSIGNED_FLAG through Field::store. Stoolap's
-            // INTEGER is i64, so for non-BIGINT unsigned types (TINYINT
-            // / SMALLINT / MEDIUMINT / INT UNSIGNED) the bit pattern
-            // fits and Field::store will write the correct unsigned
-            // value. For BIGINT UNSIGNED with stored values > INT64_MAX
-            // the value comes back here as a negative i64 (the bit
-            // pattern), and Field::store(..., unsigned=true) reinterprets
-            // it as the original unsigned value -- so round-trip via
-            // equality is preserved. (Range/order operations *inside*
-            // stoolap on those out-of-range bigint-unsigned values are
-            // not faithful; the write path rejects them up front.)
-            f->store(v, /*unsigned=*/f->is_unsigned());
+            store_int(f, v);  // decodes by f's type (stoolap_types.h)
             return 0;
         }
         case STOOLAP_TYPE_FLOAT: {
@@ -177,7 +167,7 @@ inline int pkt_store_value(const uint8_t* buf, size_t len, size_t* pos,
             if (*pos + bl > len) return HA_ERR_GENERIC;
             const char* s = reinterpret_cast<const char*>(buf + *pos);
             *pos += bl;
-            f->store(s, bl, f->charset());
+            store_text(f, s, bl);
             return 0;
         }
         case STOOLAP_TYPE_BLOB: {

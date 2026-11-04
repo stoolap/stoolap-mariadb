@@ -33,6 +33,7 @@
 #include "item_sum.h"
 #include "item_subselect.h"
 #include "item_windowfunc.h"
+#include "stoolap_types.h"
 #include "sql_window.h"
 
 #include "ha_stoolap.h"
@@ -63,7 +64,14 @@ std::string quote_ident(std::string_view s) {
 
 // What a value is to stoolap, for deciding whether an operation on it
 // means the same thing on both sides.
-enum class Cls { INT, REAL, STR, DATETIME, UNSAFE };
+// DATETIME covers DATE too, and TIME and TSTAMP (TIMESTAMP) are their
+// own: stoolap holds each as an INTEGER that orders like the MariaDB
+// value (stoolap_types.h), and a DATE packs as the DATETIME at midnight.
+enum class Cls { INT, REAL, STR, DATETIME, TIME, TSTAMP, UNSAFE };
+
+bool temporal(Cls c) {
+    return c == Cls::DATETIME || c == Cls::TIME || c == Cls::TSTAMP;
+}
 
 bool numeric(Cls c) {
     return c == Cls::INT || c == Cls::REAL;
@@ -195,12 +203,20 @@ Cls Gen::cls(Item* it) {
                 if (!f->has_charset() || f->charset() == &my_charset_bin)
                     return Cls::UNSAFE;
                 return Cls::STR;
+            case MYSQL_TYPE_DATE:
+            case MYSQL_TYPE_NEWDATE:
             case MYSQL_TYPE_DATETIME:
             case MYSQL_TYPE_DATETIME2:
                 return Cls::DATETIME;
+            case MYSQL_TYPE_TIME:
+            case MYSQL_TYPE_TIME2:
+                return Cls::TIME;
+            case MYSQL_TYPE_TIMESTAMP:
+            case MYSQL_TYPE_TIMESTAMP2:
+                return Cls::TSTAMP;
             default:
-                // DECIMAL, DATE, TIME, ENUM, SET (TEXT in stoolap), BIT,
-                // TIMESTAMP (session-zone wall clock), JSON, GEOMETRY.
+                // DECIMAL (TEXT in stoolap), ENUM / SET (index / mask),
+                // BIT, JSON, GEOMETRY.
                 return Cls::UNSAFE;
         }
     }
@@ -223,7 +239,9 @@ Cls Gen::cls(Item* it) {
             // against INT / DOUBLE values; a DECIMAL expression does not.
             return it->basic_const_item() ? Cls::REAL : Cls::UNSAFE;
         case STRING_RESULT:
-            return Cls::STR;
+            // A binary-collation result would be read back as hex.
+            return it->collation.collation == &my_charset_bin ? Cls::UNSAFE
+                                                              : Cls::STR;
         default:
             return Cls::UNSAFE;
     }
@@ -234,6 +252,9 @@ Cls Gen::cls(Item* it) {
 // trailing spaces. Stoolap compares bytes, which only a binary NO PAD
 // collation agrees with, unless the session opted into byte semantics.
 bool Gen::cs_safe(const CHARSET_INFO* cs) {
+    // Other character sets are stored converted to utf8mb4, whose byte
+    // order is not theirs.
+    if (!stoolap_mariadb::text_is_utf8(cs)) return false;
     if (trust_bin_) return true;
     return cs && (cs->state & MY_CS_BINSORT) && (cs->state & MY_CS_NOPAD);
 }
@@ -254,14 +275,14 @@ bool Gen::comparable(Item* a, Item* b, const CHARSET_INFO* cmp_cs) {
     if (numeric(ca) && numeric(cb)) return true;
     if (ca == Cls::STR && cb == Cls::STR)
         return cmp_cs ? cs_safe(cmp_cs) : str_cmp_safe(a) && str_cmp_safe(b);
-    // Only DATETIME columns against each other: a literal or another
-    // temporal type would need MariaDB's conversion rules.
-    return ca == Cls::DATETIME && cb == Cls::DATETIME;
+    // Temporal columns against their own kind: a literal or another kind
+    // would need MariaDB's conversion rules.
+    return ca == cb && temporal(ca);
 }
 
 bool Gen::orderable(Item* it) {
     const Cls c = cls(it);
-    if (numeric(c) || c == Cls::DATETIME) return true;
+    if (numeric(c) || temporal(c)) return true;
     return c == Cls::STR && str_cmp_safe(it);
 }
 

@@ -1,4 +1,3 @@
--- known-diff-file: types: TIMESTAMP stored as session wall-clock time, not UTC
 SET time_zone = '+00:00';
 CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP NULL) ENGINE={E};
 INSERT INTO t VALUES (1, '2020-01-01 00:00:00');

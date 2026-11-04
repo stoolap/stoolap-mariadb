@@ -375,6 +375,7 @@ std::string rewrite_table_names(const std::string& sql,
 bool collect_bound_params(THD* thd, std::vector<StoolapValue>& out,
                           std::vector<std::string>& storage);
 bool item_uses_ci_string(Item* item);
+bool field_not_as_written(const Field* f);
 bool item_uses_decimal_field(Item* item);
 
 // Forward decl: defined later. Walks every TABLE_LIST::on_expr (and
@@ -525,16 +526,16 @@ bool can_direct_modify(THD* thd) {
         }
         // DECIMAL targets: stoolap stores DECIMAL as TEXT. Assignments
         // pass a numeric param that rounds through float before write,
-        // dropping scale. The row-pump path is faithful because
-        // Field::store on the DECIMAL receives the value at full precision.
+        // dropping scale. Encoded targets would store the value as
+        // written. The row-pump path is faithful: it writes through
+        // Field::store and extract_field.
         List_iterator<Item> tit(sel->item_list);
         Item* tgt;
         while ((tgt = tit++)) {
             if (!tgt) continue;
             if (tgt->type() == Item::FIELD_ITEM) {
                 auto* fi = static_cast<Item_field*>(tgt);
-                if (fi->field &&
-                    fi->field->real_type() == MYSQL_TYPE_NEWDECIMAL) {
+                if (fi->field && field_not_as_written(fi->field)) {
                     return false;
                 }
             }
@@ -870,12 +871,19 @@ bool item_uses_ci_string(Item* item) {
     }
 }
 
-// True if `item` references a DECIMAL column. Stoolap stores DECIMAL
-// as TEXT, so a pushed predicate against a numeric literal silently
-// misses ('1.50' vs 1.50). Bare projection is safe; not gated by
-// trust_binary_strings (type mismatch, not collation).
+// True if `item` references a column stoolap does not hold as MariaDB's
+// own value: DECIMAL (TEXT, so '1.50' misses 1.50) and every encoded
+// type (stoolap_types.h: dates and times, ENUM / SET, binary and
+// non-utf8 strings), which statement text would compare as written.
+// Bare projection is safe; not gated by trust_binary_strings (type
+// mismatch, not collation).
 bool item_uses_decimal_field(Item* item);
 bool select_lex_uses_decimal_field(SELECT_LEX* sel, bool include_projection);
+
+bool field_not_as_written(const Field* f) {
+    return f->real_type() == MYSQL_TYPE_NEWDECIMAL ||
+           stoolap_mariadb::field_enc(f) != stoolap_mariadb::Enc::PLAIN;
+}
 
 bool item_uses_decimal_field(Item* item) {
     if (!item) return false;
@@ -883,7 +891,7 @@ bool item_uses_decimal_field(Item* item) {
         case Item::FIELD_ITEM: {
             auto* fi = static_cast<Item_field*>(item);
             Field* f = fi->field;
-            return f && f->real_type() == MYSQL_TYPE_NEWDECIMAL;
+            return f && field_not_as_written(f);
         }
         case Item::FUNC_ITEM:
         case Item::SUM_FUNC_ITEM: {

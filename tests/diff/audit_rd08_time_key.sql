@@ -1,4 +1,3 @@
--- known-diff-file: read path: TIME keys stored as TEXT give wrong ranges and MAX
 CREATE TABLE t (id INT PRIMARY KEY, tm TIME NOT NULL, KEY ktm (tm)) ENGINE={E};
 INSERT INTO t VALUES (1,'23:00:00'),(2,'100:00:00'),(3,'-01:00:00'),(4,'05:00:00');
 CREATE TABLE i (k INT PRIMARY KEY) ENGINE=InnoDB;

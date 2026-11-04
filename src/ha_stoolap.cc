@@ -582,7 +582,20 @@ std::string quote_ident(std::string_view s) {
     return out;
 }
 
+// Column type in stoolap; the value encodings are in stoolap_types.h.
 const char* stoolap_type_for(const Field* f) {
+    using stoolap_mariadb::Enc;
+    switch (stoolap_mariadb::field_enc(f)) {
+        case Enc::PACKED_TIME:
+        case Enc::UTC_MICROS:
+        case Enc::INDEX:
+            return "INTEGER";
+        case Enc::HEX:
+        case Enc::TO_UTF8:
+            return "TEXT";
+        case Enc::PLAIN:
+            break;
+    }
     switch (f->real_type()) {
         case MYSQL_TYPE_TINY:
         case MYSQL_TYPE_SHORT:
@@ -599,22 +612,11 @@ const char* stoolap_type_for(const Field* f) {
         case MYSQL_TYPE_VAR_STRING:
         case MYSQL_TYPE_STRING:
         case MYSQL_TYPE_NEWDECIMAL:  // round-trip via decimal string
-        case MYSQL_TYPE_DATE:        // YYYY-MM-DD as text
-        case MYSQL_TYPE_NEWDATE:
-        case MYSQL_TYPE_TIME:  // HH:MM:SS[.ffffff] as text
-        case MYSQL_TYPE_TIME2:
-        case MYSQL_TYPE_ENUM:       // val_str() gives the label
-        case MYSQL_TYPE_SET:        // val_str() gives "a,b,c"
-        case MYSQL_TYPE_TINY_BLOB:  // TEXT family stored as BLOB type
-        case MYSQL_TYPE_BLOB:       // ditto
+        case MYSQL_TYPE_TINY_BLOB:   // TEXT family stored as BLOB type
+        case MYSQL_TYPE_BLOB:        // ditto
         case MYSQL_TYPE_MEDIUM_BLOB:
         case MYSQL_TYPE_LONG_BLOB:
             return "TEXT";
-        case MYSQL_TYPE_DATETIME:
-        case MYSQL_TYPE_DATETIME2:
-        case MYSQL_TYPE_TIMESTAMP:
-        case MYSQL_TYPE_TIMESTAMP2:
-            return "TIMESTAMP";
         default:
             return nullptr;
     }
@@ -865,10 +867,9 @@ std::string ci_string_unique_part(TABLE* form) {
             case MYSQL_TYPE_BLOB:
             case MYSQL_TYPE_MEDIUM_BLOB:
             case MYSQL_TYPE_LONG_BLOB:
-            case MYSQL_TYPE_ENUM:
-            case MYSQL_TYPE_SET:
                 break;
             default:
+                // ENUM / SET are stored as their index / mask.
                 return false;
         }
         CHARSET_INFO* cs = f->charset();
@@ -1334,6 +1335,8 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
         v.value_type = STOOLAP_TYPE_NULL;
         return true;
     }
+    if (stoolap_mariadb::field_enc(f) != stoolap_mariadb::Enc::PLAIN)
+        return stoolap_mariadb::encode_field(f, v, text_holder);
     switch (f->real_type()) {
         case MYSQL_TYPE_TINY:
         case MYSQL_TYPE_SHORT:
@@ -1364,18 +1367,12 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
         case MYSQL_TYPE_VAR_STRING:
         case MYSQL_TYPE_STRING:
         case MYSQL_TYPE_NEWDECIMAL:
-        case MYSQL_TYPE_DATE:
-        case MYSQL_TYPE_NEWDATE:
-        case MYSQL_TYPE_TIME:
-        case MYSQL_TYPE_TIME2:
-        case MYSQL_TYPE_ENUM:
-        case MYSQL_TYPE_SET:
         case MYSQL_TYPE_TINY_BLOB:
         case MYSQL_TYPE_BLOB:
         case MYSQL_TYPE_MEDIUM_BLOB:
         case MYSQL_TYPE_LONG_BLOB: {
-            // DECIMAL: val_str() formats as the canonical decimal string
-            // (e.g. "123.450"), preserving precision through stoolap TEXT.
+            // utf8 / ascii text as is. DECIMAL: val_str() formats the
+            // canonical decimal string (e.g. "123.450"), keeping precision.
             char tmp[256];
             String tmp_str(tmp, sizeof(tmp), f->charset());
             String* s = f->val_str(&tmp_str);
@@ -1383,44 +1380,6 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
             v.value_type = STOOLAP_TYPE_TEXT;
             v.v.text.ptr = text_holder.data();
             v.v.text.len = static_cast<int64_t>(text_holder.size());
-            return true;
-        }
-        case MYSQL_TYPE_DATETIME:
-        case MYSQL_TYPE_DATETIME2:
-        case MYSQL_TYPE_TIMESTAMP:
-        case MYSQL_TYPE_TIMESTAMP2: {
-            // get_timestamp() works only for TIMESTAMP fields (which store
-            // Unix seconds); DATETIME fields store packed Y/M/D h:m:s.us.
-            // get_date() works for both — it returns parsed components.
-            MYSQL_TIME mt;
-            std::memset(&mt, 0, sizeof(mt));
-            f->get_date(&mt, date_mode_t(0));
-            struct tm tm_;
-            std::memset(&tm_, 0, sizeof(tm_));
-            tm_.tm_year = static_cast<int>(mt.year) - 1900;
-            tm_.tm_mon = static_cast<int>(mt.month) - 1;
-            tm_.tm_mday = static_cast<int>(mt.day);
-            tm_.tm_hour = static_cast<int>(mt.hour);
-            tm_.tm_min = static_cast<int>(mt.minute);
-            tm_.tm_sec = static_cast<int>(mt.second);
-            time_t secs = timegm(&tm_);
-            // Stoolap stores TIMESTAMP as int64 nanoseconds since epoch,
-            // which can only represent ~1678..2262. Reject dates outside
-            // that range explicitly to avoid silent overflow corruption
-            // (e.g. 9999-12-31 wrapping to 1816-03-30).
-            constexpr int64_t kMaxSecs = INT64_MAX / 1000000000LL;
-            constexpr int64_t kMinSecs = INT64_MIN / 1000000000LL;
-            const int64_t s64 = static_cast<int64_t>(secs);
-            if (s64 > kMaxSecs || s64 < kMinSecs) {
-                sql_print_error(
-                    "stoolap: DATETIME '%04u-%02u-%02u %02u:%02u:%02u' is "
-                    "outside the representable range (~1678-2262)",
-                    mt.year, mt.month, mt.day, mt.hour, mt.minute, mt.second);
-                return false;
-            }
-            v.value_type = STOOLAP_TYPE_TIMESTAMP;
-            v.v.timestamp_nanos = s64 * 1000000000LL +
-                                  static_cast<int64_t>(mt.second_part) * 1000LL;
             return true;
         }
         default:
@@ -2273,6 +2232,7 @@ int ha_stoolap::rnd_next(uchar* buf) {
             }
             f->set_notnull();
         }
+        const int32_t c = static_cast<int32_t>(col);
         switch (f->real_type()) {
             case MYSQL_TYPE_TINY:
             case MYSQL_TYPE_SHORT:
@@ -2281,65 +2241,39 @@ int ha_stoolap::rnd_next(uchar* buf) {
             case MYSQL_TYPE_INT24:
             case MYSQL_TYPE_YEAR:
             case MYSQL_TYPE_BIT:
-                // Preserve UNSIGNED_FLAG: without it, INT UNSIGNED > INT32_MAX
-                // stores as negative i64 and BIGINT UNSIGNED > INT64_MAX
-                // silently corrupts. write_row already refuses BIGINT
-                // UNSIGNED > INT64_MAX, so the round-trip is faithful.
-                f->store(stoolap_rows_column_int64(scan_.get(),
-                                                   static_cast<int32_t>(col)),
-                         /*unsigned=*/f->is_unsigned());
+            case MYSQL_TYPE_DATE:
+            case MYSQL_TYPE_NEWDATE:
+            case MYSQL_TYPE_TIME:
+            case MYSQL_TYPE_TIME2:
+            case MYSQL_TYPE_DATETIME:
+            case MYSQL_TYPE_DATETIME2:
+            case MYSQL_TYPE_TIMESTAMP:
+            case MYSQL_TYPE_TIMESTAMP2:
+            case MYSQL_TYPE_ENUM:
+            case MYSQL_TYPE_SET:
+                // INTEGER columns; store_int decodes by the field's type.
+                stoolap_mariadb::store_int(
+                    f, stoolap_rows_column_int64(scan_.get(), c));
                 break;
             case MYSQL_TYPE_FLOAT:
             case MYSQL_TYPE_DOUBLE:
-                f->store(stoolap_rows_column_double(scan_.get(),
-                                                    static_cast<int32_t>(col)));
+                f->store(stoolap_rows_column_double(scan_.get(), c));
                 break;
             case MYSQL_TYPE_VARCHAR:
             case MYSQL_TYPE_VAR_STRING:
             case MYSQL_TYPE_STRING:
             case MYSQL_TYPE_NEWDECIMAL:
-            case MYSQL_TYPE_DATE:
-            case MYSQL_TYPE_NEWDATE:
-            case MYSQL_TYPE_TIME:
-            case MYSQL_TYPE_TIME2:
-            case MYSQL_TYPE_ENUM:
-            case MYSQL_TYPE_SET:
             case MYSQL_TYPE_TINY_BLOB:
             case MYSQL_TYPE_BLOB:
             case MYSQL_TYPE_MEDIUM_BLOB:
             case MYSQL_TYPE_LONG_BLOB: {
                 int64_t len = 0;
-                const char* s = stoolap_rows_column_text(
-                    scan_.get(), static_cast<int32_t>(col), &len);
+                const char* s = stoolap_rows_column_text(scan_.get(), c, &len);
                 if (s) {
-                    f->store(s, static_cast<uint>(len), f->charset());
+                    stoolap_mariadb::store_text(f, s, static_cast<size_t>(len));
                 } else if (f->maybe_null()) {
                     f->set_null();
                 }
-                break;
-            }
-            case MYSQL_TYPE_DATETIME:
-            case MYSQL_TYPE_DATETIME2:
-            case MYSQL_TYPE_TIMESTAMP:
-            case MYSQL_TYPE_TIMESTAMP2: {
-                int64_t nanos = stoolap_rows_column_timestamp(
-                    scan_.get(), static_cast<int32_t>(col));
-                int64_t secs = nanos / 1000000000LL;
-                int64_t us = (nanos % 1000000000LL) / 1000LL;
-                if (us < 0) {
-                    us += 1000000;
-                    secs--;
-                }
-                struct tm tm_;
-                time_t t = static_cast<time_t>(secs);
-                gmtime_r(&t, &tm_);
-                char tbuf[40];
-                int n = std::snprintf(tbuf, sizeof(tbuf),
-                                      "%04d-%02d-%02d %02d:%02d:%02d.%06lld",
-                                      tm_.tm_year + 1900, tm_.tm_mon + 1,
-                                      tm_.tm_mday, tm_.tm_hour, tm_.tm_min,
-                                      tm_.tm_sec, static_cast<long long>(us));
-                f->store(tbuf, static_cast<uint>(n), &my_charset_bin);
                 break;
             }
             default:

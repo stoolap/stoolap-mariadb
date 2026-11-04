@@ -175,8 +175,9 @@ the statement is left to MariaDB:
   A leg's own ORDER BY / LIMIT is not pushed.
 - Comparisons, GROUP BY, ORDER BY, DISTINCT and MIN / MAX push only for
   types that compare the same way in both engines: integers, doubles,
-  DATETIME, and strings under a binary NO PAD collation (or any collation
-  with `stoolap_trust_binary_strings = 1`).
+  DATE / DATETIME / TIME / TIMESTAMP (each against its own kind; DATE and
+  DATETIME together), and utf8 strings under a binary NO PAD collation
+  (or any collation with `stoolap_trust_binary_strings = 1`).
 - Integer `/`, DECIMAL arithmetic, `LENGTH`, `ROUND`, `SUBSTRING`, CAST,
   `TRIM`, `UPPER` / `LOWER`, `WITH TIES`, `SQL_CALC_FOUND_ROWS`,
   non-boolean WHERE operands and other constructs without an exact
@@ -198,10 +199,11 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 | ---------------------------------------------- | ------ |
 | `CREATE TABLE` with all numeric types          | Yes    |
 | `CREATE TABLE` with VARCHAR/CHAR/TEXT          | Yes    |
-| `CREATE TABLE` with DATE / TIME / DATETIME / TIMESTAMP | Yes (DATETIME ~1678-2262) |
+| `CREATE TABLE` with DATE / TIME / DATETIME / TIMESTAMP | Yes (full ranges, zero dates; see below) |
 | `CREATE TABLE` with DECIMAL                    | Yes (round-tripped via TEXT) |
-| `CREATE TABLE` with ENUM / SET                 | Yes (label / member-joined) |
-| `CREATE TABLE` with BLOB / VARBINARY           | Partial (UTF-8 only)        |
+| `CREATE TABLE` with ENUM / SET                 | Yes (index / bit mask; UNIQUE allowed) |
+| `CREATE TABLE` with BINARY / VARBINARY / BLOB  | Yes (any bytes) |
+| Character sets other than utf8 (latin1, ...)   | Yes (stored as utf8mb4) |
 | `CREATE TABLE` with JSON                       | Yes (LONGTEXT route)        |
 | `DROP TABLE` / `RENAME TABLE` / `TRUNCATE`     | Yes |
 | `CREATE INDEX` (single or multi-column)        | Yes |
@@ -285,16 +287,27 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 | Write-write conflict                           | `ER_LOCK_DEADLOCK 1213` (40001) |
 | Conflict at COMMIT                             | `ER_ERROR_DURING_COMMIT 1180` |
 
+### Value storage
+
+Each column is stored so that stoolap's comparisons and order match
+MariaDB's (`src/stoolap_types.h`):
+
+| MariaDB type | Stoolap column | Value |
+| --- | --- | --- |
+| DATE, DATETIME, TIME | INTEGER | MariaDB's `pack_time()` value: years 0000-9999, zero and partial dates, negative and >99 h times; a DATE is the DATETIME at midnight |
+| TIMESTAMP | INTEGER | UTC microseconds since the epoch, independent of `time_zone` |
+| ENUM / SET | INTEGER | the index / bit mask MariaDB sorts by |
+| BINARY / VARBINARY / BLOB | TEXT | uppercase hex of the bytes (stoolap TEXT is UTF-8; its BLOB type holds vectors) |
+| text in latin1 etc. | TEXT | converted to utf8mb4 |
+| DECIMAL | TEXT | the decimal string |
+| integers, doubles, utf8 text | INTEGER / FLOAT / TEXT | as is |
+
+Direct UPDATE / DELETE forward the statement text, so they decline any
+statement that touches a DECIMAL or encoded column; the row pump runs
+it. Tables created by an older build must be re-created.
+
 ## Known limitations
 
-- **`DATETIME` is bounded to roughly 1678..2262.** Stoolap stores
-  timestamps as i64 nanoseconds; out-of-range values (`9999-12-31`)
-  return `HA_ERR_UNSUPPORTED` rather than corrupt silently.
-- **`BLOB` / `VARBINARY` silently drop non-UTF-8 bytes.** Stoolap's
-  `BLOB` type is reserved for vector columns, so we route the MariaDB
-  BLOB family through Stoolap `TEXT`. Binary content with bytes that
-  aren't valid UTF-8 (e.g. `UNHEX('FF00FF00')`) round-trips as `NULL`.
-  ASCII / UTF-8-clean text in BLOB columns works.
 - **`rnd_pos` over BLOB/TEXT tables**: any plan that takes the
   filesort + rowid-sort path (e.g. `UPDATE ... ORDER BY n LIMIT 2`)
   fails loudly with a clear error rather than corrupting the row,
