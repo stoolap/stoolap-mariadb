@@ -313,11 +313,12 @@ it. Tables created by an older build must be re-created.
 
 ## Known limitations
 
-- **Rows read through SQL have no row id.** The handler reads, writes
-  and re-reads rows directly, by stoolap's row id, except the ordered
-  reads `index_first` / `index_last` / `read_range_first`, which still
-  run SQL. A row they return is updated or deleted by its PRIMARY KEY
-  (refused on a table without one), and re-read by position from its
+- **Ordered reads on a table without a PRIMARY KEY.** The handler
+  reads, writes and re-reads rows directly, by stoolap's row id, except
+  the ordered reads `index_first` / `index_last` / `read_range_first`,
+  which still run SQL. A row they return is named by its PRIMARY KEY,
+  which is its row id; on a table without one it cannot be updated or
+  deleted through the row pump, and is re-read by position from its
   record bytes, which is refused on a BLOB/TEXT table (the record's
   BLOB pointer would be stale).
 - **Composite `PRIMARY KEY` / `UNIQUE` / `FOREIGN KEY` are refused at
