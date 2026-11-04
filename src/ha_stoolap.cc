@@ -1891,28 +1891,23 @@ int ha_stoolap::analyze(THD* /*thd*/, HA_CHECK_OPT* /*opt*/) {
 
 const COND* ha_stoolap::cond_push(const COND* cond) {
     if (!cond) return nullptr;
-    THD* thd = ha_thd();
-    if (!thd) return cond;
-
-    // Accept (return null) only when the engine will actually filter:
-    // the direct-DML path forwards thd->query() with WHERE intact and
-    // stoolap re-evaluates. Returning null on a shape that ends up
-    // per-row would silently mass-mutate the table.
-    if (stoolap_pushdown::can_direct_modify(thd)) {
-        Item* it = const_cast<Item*>(static_cast<const Item*>(cond));
-        const bool trust_bin = stoolap_thd_trust_binary_strings(thd);
-        if (trust_bin || stoolap_pushdown::item_safe_for_byte_comparison(it)) {
-            return nullptr;  // accepted; route to direct path
-        }
-    }
-    // SELECT (row pump) still needs a real cond->SQL translator -- TBD.
+    // Taken for a direct UPDATE / DELETE: direct_*_rows_init then decides
+    // whether it runs in stoolap. If not, MariaDB's row loop still tests
+    // the condition per row (SQL_SELECT::skip_record), so accepting it
+    // here never widens the statement. SELECT keeps its condition.
+    if (stoolap_pushdown::can_direct_modify(ha_thd())) return nullptr;
     return cond;
 }
 
-int ha_stoolap::direct_update_rows_init(List<Item>* /*update_fields*/) {
+int ha_stoolap::direct_update_rows_init(List<Item>* update_fields) {
     // Non-zero falls back to per-row update_row(); never error here.
-    return stoolap_pushdown::can_direct_modify(ha_thd()) ? 0
-                                                         : HA_ERR_WRONG_COMMAND;
+    direct_sql_.clear();
+    return stoolap_pushdown::plan_direct_modify(
+               ha_thd(), table,
+               const_cast<Item*>(static_cast<const Item*>(pushed_cond)),
+               update_fields, &direct_sql_)
+               ? 0
+               : HA_ERR_WRONG_COMMAND;
 }
 
 int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
@@ -1925,7 +1920,8 @@ int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
     }
     ha_rows affected = 0;
     unsigned ek = MAX_KEY;
-    int rc = stoolap_pushdown::try_direct_modify(ha_thd(), &affected, &ek);
+    int rc = stoolap_pushdown::run_direct_modify(ha_thd(), direct_sql_,
+                                                 &affected, &ek);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;
@@ -1934,14 +1930,20 @@ int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
         return rc;
     }
     if (update_rows) *update_rows = affected;
-    // No found-but-unchanged tracking; report found == affected.
+    // Without CLIENT_FOUND_ROWS only changed rows were updated; with it
+    // MariaDB reports found rows, which are the rows stoolap updated.
     if (found_rows) *found_rows = affected;
     return 0;
 }
 
 int ha_stoolap::direct_delete_rows_init() {
-    return stoolap_pushdown::can_direct_modify(ha_thd()) ? 0
-                                                         : HA_ERR_WRONG_COMMAND;
+    direct_sql_.clear();
+    return stoolap_pushdown::plan_direct_modify(
+               ha_thd(), table,
+               const_cast<Item*>(static_cast<const Item*>(pushed_cond)),
+               nullptr, &direct_sql_)
+               ? 0
+               : HA_ERR_WRONG_COMMAND;
 }
 
 int ha_stoolap::direct_delete_rows(ha_rows* delete_rows) {
@@ -1952,7 +1954,8 @@ int ha_stoolap::direct_delete_rows(ha_rows* delete_rows) {
     }
     ha_rows affected = 0;
     unsigned ek = MAX_KEY;
-    int rc = stoolap_pushdown::try_direct_modify(ha_thd(), &affected, &ek);
+    int rc = stoolap_pushdown::run_direct_modify(ha_thd(), direct_sql_,
+                                                 &affected, &ek);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;
@@ -1980,7 +1983,8 @@ int ha_stoolap::pre_direct_update_rows_init(List<Item>* fields) {
 int ha_stoolap::pre_direct_update_rows() {
     ha_rows affected = 0;
     unsigned ek = MAX_KEY;
-    int rc = stoolap_pushdown::try_direct_modify(ha_thd(), &affected, &ek);
+    int rc = stoolap_pushdown::run_direct_modify(ha_thd(), direct_sql_,
+                                                 &affected, &ek);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;
@@ -2000,7 +2004,8 @@ int ha_stoolap::pre_direct_delete_rows_init() {
 int ha_stoolap::pre_direct_delete_rows() {
     ha_rows affected = 0;
     unsigned ek = MAX_KEY;
-    int rc = stoolap_pushdown::try_direct_modify(ha_thd(), &affected, &ek);
+    int rc = stoolap_pushdown::run_direct_modify(ha_thd(), direct_sql_,
+                                                 &affected, &ek);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;

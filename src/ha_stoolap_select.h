@@ -22,18 +22,26 @@ class select_handler;
 class derived_handler;
 class Item;
 struct TABLE_LIST;
+struct TABLE;
+template <class T>
+class List;
+
+#include <string>
 
 extern handlerton* stoolap_hton;
 
 namespace stoolap_pushdown {
 
-// 0 + *affected on success; HA_ERR_WRONG_COMMAND signals fall-back to
-// the per-row update_row/delete_row path.
-int try_direct_modify(THD* thd, ha_rows* affected,
-                      unsigned* errkey_out = nullptr);
-
-// Eligibility predicate; same checks try_direct_modify runs internally.
+// Direct UPDATE / DELETE. can_direct_modify: the statement's shape
+// allows it. plan_direct_modify: its SQL, generated from the Item tree
+// (cond: the WHERE MariaDB pushed; fields: the SET targets), when every
+// expression translates and every row fits; false sends the statement to
+// the row pump. run_direct_modify: 0 + *affected, or the mapped error.
 bool can_direct_modify(THD* thd);
+bool plan_direct_modify(THD* thd, TABLE* table, Item* cond, List<Item>* fields,
+                        std::string* sql);
+int run_direct_modify(THD* thd, const std::string& sql, ha_rows* affected,
+                      unsigned* errkey_out = nullptr);
 
 // Pushdown factories. Wired in stoolap_init_func; NULL is a clean
 // fall-through to row-pump for ineligible plans.
@@ -43,9 +51,5 @@ select_handler* create_stoolap_unit_handler(THD* thd,
                                             SELECT_LEX_UNIT* sel_unit);
 // Partial pushdown: the outer mixes engines, the derived is all-stoolap.
 derived_handler* create_stoolap_derived_handler(THD* thd, TABLE_LIST* derived);
-
-// True when the Item tree only references columns where stoolap and
-// MariaDB compare byte-wise. trust_binary_strings opts out.
-bool item_safe_for_byte_comparison(Item* item);
 
 }  // namespace stoolap_pushdown

@@ -13,6 +13,10 @@
 #include <string>
 
 class THD;
+class Item;
+struct TABLE;
+template <class T>
+class List;
 class st_select_lex;
 class st_select_lex_unit;
 
@@ -33,5 +37,18 @@ bool gen_select(THD* thd, st_select_lex* sel, std::string* out,
 // handlers run it. Result columns come out in order, named c0, c1, ...
 bool gen_unit(THD* thd, st_select_lex_unit* unit, std::string* out,
               std::string* why);
+
+// Direct UPDATE / DELETE of `table` (the statement's only table) with
+// the WHERE MariaDB pushed (`cond`, null for none). For UPDATE, `fields`
+// and `values` are the SET list; with `changed_only` only rows whose
+// value changes are updated, so stoolap's count is MariaDB's "changed".
+// *guard, when not empty, is a query that returns a row if some row
+// would need MariaDB's own conversion (out of range, too long, NULL into
+// NOT NULL): then the statement must not run directly.
+bool gen_update(THD* thd, TABLE* table, Item* cond, List<Item>& fields,
+                List<Item>& values, bool changed_only, std::string* out,
+                std::string* guard, std::string* why);
+bool gen_delete(THD* thd, TABLE* table, Item* cond, std::string* out,
+                std::string* why);
 
 }  // namespace stoolap_sqlgen

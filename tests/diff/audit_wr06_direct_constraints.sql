@@ -1,4 +1,3 @@
--- known-diff-file: direct UPDATE: no range / length / CHECK / NOT NULL errnos
 CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n TINYINT NOT NULL, s VARCHAR(3) COLLATE utf8mb4_bin, c INT, CHECK (c > 0)) ENGINE={E};
 INSERT INTO t VALUES (1, 100, 'abc', 5);
 UPDATE t SET n = n + 100 WHERE id = 1;

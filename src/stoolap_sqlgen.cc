@@ -41,6 +41,7 @@
 #include "stoolap_thd_inspect.h"
 
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstring>
 #include <string_view>
@@ -94,6 +95,16 @@ public:
     std::string out;
     const char* why = nullptr;
     SELECT_LEX* top = nullptr;  // the statement's own SELECT
+
+    // Direct UPDATE / DELETE: the target table, written by its own name
+    // (stoolap's UPDATE takes no alias), and for UPDATE the SQL of each
+    // column assigned so far, read by later SET values (MariaDB assigns
+    // left to right; stoolap reads the old row).
+    bool dml_target(TABLE* table);
+    bool update(TABLE* table, Item* cond, List<Item>& fields,
+                List<Item>& values, bool changed_only, std::string* guard);
+    bool remove(TABLE* table, Item* cond);
+    std::unordered_map<const Field*, std::string> assigned_;
 
     // Set for the SELECT of an EXISTS, whose select list is never read.
     bool exists_list_ = false;
@@ -149,6 +160,10 @@ private:
     bool temporal_literal(Item* col, Item* k, const Type_handler* h,
                           std::string* lit);
     bool compare(Item_func* f, Item** a, const char* op);
+    bool compare_pair(Item* a, Item* b, const char* op, const Type_handler* h,
+                      const CHARSET_INFO* cs);
+    bool multiple_equal(Item_equal* eq);
+    bool assignment(Field* f, Item* v, std::string* guard);
     bool args_csv(Item** args, uint n);
 
     Cls cls(Item* it);
@@ -789,6 +804,13 @@ bool Gen::literal(Item* it) {
 
 bool Gen::field(Item_field* f) {
     if (!f->field || !f->field->table) return fail("unbound field");
+    if (!assigned_.empty()) {
+        auto v = assigned_.find(f->field);
+        if (v != assigned_.end()) {
+            out += v->second;
+            return true;
+        }
+    }
     const TABLE_LIST* tl = f->field->table->pos_in_table_list;
     auto a = alias_.find(tl);
     if (a == alias_.end()) return fail("field of unknown table");
@@ -889,26 +911,56 @@ bool Gen::temporal_literal(Item* col, Item* k, const Type_handler* h,
 bool Gen::compare(Item_func* f, Item** a, const char* op) {
     // =, <>, <, <=, >, >= and <=> are all Item_bool_rowready_func2.
     auto* bf = static_cast<Item_bool_func2*>(f);
+    return compare_pair(a[0], a[1], op, bf->compare_type_handler(),
+                        bf->compare_collation());
+}
+
+// a op b under a comparison of type h in collation cs.
+bool Gen::compare_pair(Item* a, Item* b, const char* op, const Type_handler* h,
+                       const CHARSET_INFO* cs) {
     std::string lit;
-    if (temporal_literal(a[0], a[1], bf->compare_type_handler(), &lit)) {
+    if (temporal_literal(a, b, h, &lit)) {
         out.push_back('(');
-        if (!expr(a[0])) return false;
+        if (!expr(a)) return false;
         out += op;
         out += lit;
         out.push_back(')');
         return true;
     }
-    if (temporal_literal(a[1], a[0], bf->compare_type_handler(), &lit)) {
+    if (temporal_literal(b, a, h, &lit)) {
         out.push_back('(');
         out += lit;
         out += op;
-        if (!expr(a[1])) return false;
+        if (!expr(b)) return false;
         out.push_back(')');
         return true;
     }
-    if (!comparable(a[0], a[1], bf->compare_collation()))
-        return fail("comparison");
-    return binop(a[0], op, a[1]);
+    if (!comparable(a, b, cs)) return fail("comparison");
+    return binop(a, op, b);
+}
+
+// Item_equal(c, f1, f2, ...): a multiple equality the optimizer built
+// from "f1 = c AND f2 = f1 ...". Written as f_i = c (or f_i = f1).
+bool Gen::multiple_equal(Item_equal* eq) {
+    Item* c = eq->get_const();
+    Item_equal_fields_iterator it(*eq);
+    Item* first = nullptr;
+    bool any = false;
+    out.push_back('(');
+    for (Item* f; (f = it++);) {
+        if (!c && !first) {
+            first = f;
+            continue;
+        }
+        if (any) out += " AND ";
+        any = true;
+        if (!compare_pair(f, c ? c : first, " = ", eq->compare_type_handler(),
+                          eq->compare_collation()))
+            return false;
+    }
+    if (!any) return fail("multiple equality");
+    out.push_back(')');
+    return true;
 }
 
 bool Gen::binop(Item* a, const char* op, Item* b) {
@@ -1050,6 +1102,8 @@ bool Gen::func(Item_func* f) {
             out.push_back(')');
             return true;
         }
+        case Item_func::MULT_EQUAL_FUNC:
+            return multiple_equal(static_cast<Item_equal*>(f));
         case Item_func::IN_OPTIMIZER_FUNC:
             return in_optimizer(static_cast<Item_in_optimizer*>(f));
         case Item_func::NEG_FUNC:
@@ -1417,6 +1471,193 @@ bool Gen::order_list(SQL_I_List<ORDER>* lst, bool directions) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Direct UPDATE / DELETE
+// ---------------------------------------------------------------------------
+
+bool Gen::dml_target(TABLE* table) {
+    if (!table || !table->s || !table->pos_in_table_list)
+        return fail("DML table");
+    const size_t start = out.size();
+    ident(stoolap_table_name(table->s));
+    alias_[table->pos_in_table_list] = out.substr(start);
+    out.resize(start);
+    return true;
+}
+
+// `f = v` as MariaDB would store it: only when stoolap stores the same
+// value. A constant is checked here; anything else adds a predicate to
+// *guard that every updated row must meet (range, length, NOT NULL), or
+// MariaDB's own conversion (with its error or warning) must run instead.
+// The value SQL is appended to out.
+bool Gen::assignment(Field* f, Item* v, std::string* guard) {
+    if (stoolap_mariadb::field_enc(f) != stoolap_mariadb::Enc::PLAIN)
+        return fail("SET of an encoded column");
+    const bool not_null = !f->real_maybe_null();
+    const bool is_null = v->type() == Item::NULL_ITEM;
+    if (is_null) {
+        if (not_null) return fail("SET NULL on NOT NULL");
+        out += "NULL";
+        return true;
+    }
+    const bool constant = v->basic_const_item();
+    std::string val;
+    std::string own;
+    own.swap(out);
+    auto restore = [&](bool ok) {
+        val.swap(out);
+        out.swap(own);
+        out += val;
+        return ok;
+    };
+    auto add_guard = [&](const std::string& g) {
+        if (!guard->empty()) *guard += " AND ";
+        *guard += g;
+    };
+    const Cls vc = cls(v);
+    switch (f->real_type()) {
+        case MYSQL_TYPE_TINY:
+        case MYSQL_TYPE_SHORT:
+        case MYSQL_TYPE_INT24:
+        case MYSQL_TYPE_LONG:
+        case MYSQL_TYPE_LONGLONG: {
+            if (vc != Cls::INT) return restore(fail("SET integer value type"));
+            const uint bits = f->real_type() == MYSQL_TYPE_TINY    ? 8
+                              : f->real_type() == MYSQL_TYPE_SHORT ? 16
+                              : f->real_type() == MYSQL_TYPE_INT24 ? 24
+                              : f->real_type() == MYSQL_TYPE_LONG  ? 32
+                                                                   : 64;
+            if (bits == 64 && f->is_unsigned())
+                return restore(fail("SET BIGINT UNSIGNED"));
+            const long long lo = f->is_unsigned() ? 0
+                                 : bits == 64
+                                     ? std::numeric_limits<long long>::min()
+                                     : -(1LL << (bits - 1));
+            const long long hi = bits == 64
+                                     ? std::numeric_limits<long long>::max()
+                                 : f->is_unsigned() ? (1LL << bits) - 1
+                                                    : (1LL << (bits - 1)) - 1;
+            if (!expr(v)) return restore(false);
+            if (constant) {
+                const long long x = v->val_int();
+                if (v->is_null() ? not_null : x < lo || x > hi)
+                    return restore(fail("SET integer out of range"));
+            } else if (bits < 64) {
+                add_guard("(" + out + ") BETWEEN " + std::to_string(lo) +
+                          " AND " + std::to_string(hi));
+            }
+            // A 64-bit overflow is an error in both engines.
+            break;
+        }
+        case MYSQL_TYPE_DOUBLE:
+            if (!numeric(vc)) return restore(fail("SET double value type"));
+            if (!branch(v, Cls::REAL)) return restore(false);
+            break;
+        case MYSQL_TYPE_VARCHAR:
+        case MYSQL_TYPE_VAR_STRING:
+        case MYSQL_TYPE_STRING: {
+            // Same character set: MariaDB converts nothing.
+            if (vc != Cls::STR ||
+                !my_charset_same(v->collation.collation, f->charset()))
+                return restore(fail("SET string value type"));
+            if (!expr(v)) return restore(false);
+            const uint32 max_chars = f->char_length();
+            if (constant) {
+                char buf[256];
+                String tmp(buf, sizeof(buf), &my_charset_bin);
+                const String* str = v->val_str(&tmp);
+                if (!str || str->numchars() > max_chars)
+                    return restore(fail("SET string too long"));
+            } else {
+                add_guard("LENGTH(" + out +
+                          ") <= " + std::to_string(max_chars));
+            }
+            break;
+        }
+        default:
+            return restore(fail("SET column type"));
+    }
+    if (not_null && !constant && v->maybe_null())
+        add_guard("(" + out + ") IS NOT NULL");
+    return restore(true);
+}
+
+bool Gen::update(TABLE* table, Item* cond, List<Item>& fields,
+                 List<Item>& values, bool changed_only, std::string* guard) {
+    if (!dml_target(table)) return false;
+    // MariaDB applies these itself: CHECK constraints, ON UPDATE
+    // CURRENT_TIMESTAMP and other update defaults.
+    if (table->check_constraints) return fail("CHECK constraint");
+    if (table->s->has_update_default_function) return fail("ON UPDATE default");
+    const std::string name = alias_[table->pos_in_table_list];
+
+    std::string where;
+    if (cond) {
+        if (!condition(cond)) return false;
+        where.swap(out);
+    }
+
+    std::vector<std::pair<Field*, std::string>> sets;
+    List_iterator_fast<Item> fi(fields), vi(values);
+    for (Item *fit, *vit; (fit = fi++) && (vit = vi++);) {
+        Item* r = fit->real_item();
+        if (r->type() != Item::FIELD_ITEM) return fail("SET target");
+        Field* f = static_cast<Item_field*>(r)->field;
+        if (!f || f->table != table) return fail("SET target table");
+        if (assigned_.count(f)) return fail("column set twice");
+        if (!assignment(f, vit, guard)) return false;
+        std::string val;
+        val.swap(out);
+        assigned_[f] = "(" + val + ")";
+        sets.emplace_back(f, std::move(val));
+    }
+    if (sets.empty()) return fail("empty SET");
+
+    out = "UPDATE " + name + " SET ";
+    std::string changed;
+    for (size_t i = 0; i < sets.size(); ++i) {
+        Field* f = sets[i].first;
+        if (i) out += ", ";
+        const size_t at = out.size();
+        ident(std::string_view(f->field_name.str, f->field_name.length));
+        const std::string col = out.substr(at);
+        out += " = " + sets[i].second;
+        if (changed_only) {
+            changed += i ? " AND " : "";
+            changed += name + "." + col + " IS NOT DISTINCT FROM (" +
+                       sets[i].second + ")";
+        }
+    }
+    std::string filter = where;
+    if (changed_only) {
+        // Only rows whose value changes, which MariaDB counts as updated
+        // (and leaves alone).
+        filter = (where.empty() ? "" : "(" + where + ") AND ") + "NOT (" +
+                 changed + ")";
+    }
+    if (!filter.empty()) out += " WHERE " + filter;
+    if (!guard->empty()) {
+        *guard = "SELECT 1 FROM " + name +
+                 (where.empty() ? std::string(" WHERE ")
+                                : " WHERE (" + where + ") AND ") +
+                 "NOT (" + *guard + ") LIMIT 1";
+    }
+    return true;
+}
+
+bool Gen::remove(TABLE* table, Item* cond) {
+    if (!dml_target(table)) return false;
+    const std::string name = alias_[table->pos_in_table_list];
+    std::string where;
+    if (cond) {
+        if (!condition(cond)) return false;
+        where.swap(out);
+    }
+    out = "DELETE FROM " + name;
+    if (!where.empty()) out += " WHERE " + where;
+    return true;
+}
+
 }  // namespace
 
 bool gen_select(THD* thd, st_select_lex* sel, std::string* out,
@@ -1435,6 +1676,30 @@ bool gen_unit(THD* thd, st_select_lex_unit* unit, std::string* out,
               std::string* why) {
     Gen g(thd);
     if (!g.unit(unit, nullptr)) {
+        if (why) *why = g.why ? g.why : "unknown";
+        return false;
+    }
+    *out = std::move(g.out);
+    return true;
+}
+
+bool gen_update(THD* thd, TABLE* table, Item* cond, List<Item>& fields,
+                List<Item>& values, bool changed_only, std::string* out,
+                std::string* guard, std::string* why) {
+    Gen g(thd);
+    guard->clear();
+    if (!g.update(table, cond, fields, values, changed_only, guard)) {
+        if (why) *why = g.why ? g.why : "unknown";
+        return false;
+    }
+    *out = std::move(g.out);
+    return true;
+}
+
+bool gen_delete(THD* thd, TABLE* table, Item* cond, std::string* out,
+                std::string* why) {
+    Gen g(thd);
+    if (!g.remove(table, cond)) {
         if (why) *why = g.why ? g.why : "unknown";
         return false;
     }

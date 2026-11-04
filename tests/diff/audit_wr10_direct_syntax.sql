@@ -1,4 +1,3 @@
--- known-diff-file: direct DML: aliases, qualified SET columns and LOW_PRIORITY / IGNORE / QUICK fail to parse
 CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT) ENGINE={E};
 INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 4);
 UPDATE t AS x SET x.v = 10 WHERE x.id = 1;

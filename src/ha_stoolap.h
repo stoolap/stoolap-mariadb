@@ -204,6 +204,8 @@ private:
     // pre_direct_*_rows ran the modify and stashed the count.
     bool direct_modify_in_pre_ = false;
     ha_rows direct_modify_affected_pre_ = 0;
+    // The direct UPDATE / DELETE planned by direct_*_rows_init.
+    std::string direct_sql_;
 
     // Field index -> stoolap result-cell position, or -1 if unprojected.
     std::vector<int> scan_proj_;

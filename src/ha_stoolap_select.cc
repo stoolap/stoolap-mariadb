@@ -125,358 +125,14 @@ bool every_table_is_stoolap(SELECT_LEX* sel_lex, bool& has_any_table) {
     return every_table_is_stoolap_impl(sel_lex, has_any_table);
 }
 
-/** Stoolap-side flat name for a (db, tbl) pair. Mirrors
- *  ha_stoolap.cc::stoolap_table_from_path: escapes `_` -> `_0` and
- *  emits `_1` between db and tbl, so distinct (db, tbl) pairs never
- *  flatten to the same backing name. CREATE-time names produced by
- *  the path mapper and DML-time names produced here must agree
- *  byte-for-byte; tests verify both end up addressing the same
- *  stoolap table. */
-std::string stoolap_name_for(const char* db, const char* tbl) {
-    auto append_escaped = [](std::string& out, const char* s) {
-        if (!s) return;
-        for (const char* p = s; *p; ++p) {
-            if (*p == '_')
-                out.append("_0");
-            else if (*p == '/')
-                out.append("_1");
-            else
-                out.push_back(*p);
-        }
-    };
-    std::string out;
-    if (db && *db) {
-        append_escaped(out, db);
-        out.append("_1");
-    }
-    append_escaped(out, tbl);
-    return out;
-}
-
-struct LeafName {
-    std::string db;
-    std::string tbl;
-    std::string stoolap;
-};
-
-void collect_leaf_names(SELECT_LEX* sel_lex, std::vector<LeafName>& out) {
-    if (!sel_lex) return;
-    for (TABLE_LIST* tl = sel_lex->get_table_list(); tl; tl = tl->next_local) {
-        if (tl->derived) {
-            // Recurse into the derived's inner SELECTs so the rewriter
-            // sees every base stoolap table that appears in the SQL
-            // text -- including the ones nested inside derived tables
-            // when the whole query pushes as a single plan.
-            for (SELECT_LEX* inner = tl->derived->first_select(); inner;
-                 inner = inner->next_select()) {
-                collect_leaf_names(inner, out);
-            }
-            continue;
-        }
-        if (!tl->table) continue;
-        if (!tl->table->file || tl->table->file->ht != stoolap_hton) continue;
-        const char* db = tl->db.str ? tl->db.str : "";
-        const char* tbl = tl->table_name.str ? tl->table_name.str : "";
-        out.push_back(
-            {std::string(db), std::string(tbl), stoolap_name_for(db, tbl)});
-    }
-    // Subqueries: walk inner units. Without this the rewriter misses
-    // tables referenced inside EXISTS/IN/scalar subqueries, and the
-    // SQL we hand stoolap leaves those names un-rewritten -- which
-    // surfaces as "table or view 'X' not found" from the engine.
-    for (SELECT_LEX_UNIT* u = sel_lex->first_inner_unit(); u;
-         u = u->next_unit()) {
-        for (SELECT_LEX* sub = u->first_select(); sub;
-             sub = sub->next_select()) {
-            collect_leaf_names(sub, out);
-        }
-    }
-}
-
-bool is_ident_char(unsigned char c) {
-    return std::isalnum(c) || c == '_' || c == '$';
-}
-
-/** Skip past a SQL string / quoted-identifier literal starting at `start`,
- *  returning the index one past the closing delimiter. Handles doubled-
- *  delimiter escapes and C-style backslash escapes. */
-size_t skip_string_literal(const std::string& s, size_t start) {
-    const char delim = s[start];
-    size_t i = start + 1;
-    while (i < s.size()) {
-        const char c = s[i];
-        if (c == '\\' && i + 1 < s.size()) {
-            i += 2;
-            continue;
-        }
-        if (c == delim) {
-            if (i + 1 < s.size() && s[i + 1] == delim) {
-                i += 2;
-                continue;
-            }
-            return i + 1;
-        }
-        ++i;
-    }
-    return s.size();
-}
-
-/** Word-boundary identifier replacement that skips literal regions. The
- *  `.` exclusion on the left side prevents mangling the table half of a
- *  qualified `db.tbl` reference when iterating a different leaf. */
-void replace_ident_word(std::string& s, std::string_view from,
-                        std::string_view to) {
-    if (from.empty()) return;
-    size_t i = 0;
-    while (i < s.size()) {
-        const char c = s[i];
-        if (c == '\'' || c == '"' || c == '`') {
-            i = skip_string_literal(s, i);
-            continue;
-        }
-        if (c != from[0]) {
-            ++i;
-            continue;
-        }
-        if (s.compare(i, from.size(), from) != 0) {
-            ++i;
-            continue;
-        }
-
-        const bool ok_left =
-            (i == 0) || (!is_ident_char(static_cast<unsigned char>(s[i - 1])) &&
-                         s[i - 1] != '.');
-        const size_t end = i + from.size();
-        const bool ok_right =
-            (end >= s.size()) ||
-            !is_ident_char(static_cast<unsigned char>(s[end]));
-        if (ok_left && ok_right) {
-            s.replace(i, from.size(), to);
-            i += to.size();
-        } else {
-            i += from.size();
-        }
-    }
-}
-
-/** Replace every occurrence of `from` with `to`, skipping single-quoted,
- *  double-quoted and backticked string / identifier literals so a
- *  backticked table-name pattern (e.g. "`t`") doesn't mangle a SQL
- *  literal that happens to contain the same byte sequence (e.g.
- *  `UPDATE t SET note='use `t` here'`).
- *
- *  Note: backticked literals (`...`) are MySQL-style quoted identifiers
- *  rather than string literals, but treating them as opaque regions is
- *  fine here. A backticked table reference like `t` IS itself such a
- *  region, so any nested occurrence we skip past was already part of
- *  an identifier we'd not want to rewrite. */
-void replace_all_literal_aware(std::string& s, std::string_view from,
-                               std::string_view to) {
-    if (from.empty()) return;
-    const char first = from[0];
-    size_t i = 0;
-    while (i < s.size()) {
-        const char c = s[i];
-        if (c == '\'' || c == '"') {
-            // Inside a string literal -- skip whole literal, then keep
-            // scanning. Without this guard, replace_all would mangle
-            // SQL string contents (silent data corruption on direct DML).
-            i = skip_string_literal(s, i);
-            continue;
-        }
-        // A backticked identifier we encounter mid-scan that happens NOT
-        // to match `from` (e.g. a different table's backticked name) is
-        // an opaque region too: skip it so we don't half-match into its
-        // interior. The caller has already issued targeted replacements
-        // for known backticked forms before invoking this helper.
-        if (c == '`' && first != '`') {
-            i = skip_string_literal(s, i);
-            continue;
-        }
-        if (c != first || s.compare(i, from.size(), from) != 0) {
-            ++i;
-            continue;
-        }
-        s.replace(i, from.size(), to);
-        i += to.size();
-    }
-}
-
-/**
- * Rewrite a MariaDB-flavoured UPDATE/DELETE so every reference to a stoolap
- * base table picks up the stoolap-flat name. Covers every MariaDB qualified
- * identifier syntax:
- *
- *   `db`.`tbl`   ->   "db__tbl"
- *   db.tbl       ->   db__tbl
- *   `db`.tbl     ->   "db__tbl"   (mixed: quoted db, bare tbl)
- *   db.`tbl`     ->   "db__tbl"   (mixed: bare db, quoted tbl)
- *   `tbl`        ->   "db__tbl"   (only when the bare name is unambiguous)
- *   tbl          ->   db__tbl     (same condition; word-boundary aware)
- *
- * Phase order matters: every qualified form runs first so a later bare pass
- * can't consume the table half of a qualified ref. The two mixed-quote
- * variants are common enough -- MariaDB users sometimes quote one half but
- * not the other -- that omitting them dropped direct-DML to a stoolap parse
- * error like "expected SET after <db>, got '.'".
- */
-std::string rewrite_table_names(const std::string& sql,
-                                const std::vector<LeafName>& leaves,
-                                const char* current_db) {
-    if (leaves.empty()) return sql;
-    std::string out = sql;
-    const std::string cur_db = current_db ? current_db : "";
-
-    for (const LeafName& l : leaves) {
-        const std::string quoted = std::string("\"") + l.stoolap + "\"";
-        const std::string bt_qual = "`" + l.db + "`.`" + l.tbl + "`";
-        const std::string bt_db_qual = "`" + l.db + "`." + l.tbl;
-        const std::string bt_tb_qual = l.db + ".`" + l.tbl + "`";
-        // Backticked-both first; the mixed forms are stricter substrings
-        // of all-bare so they need their own pass before bare-bare runs.
-        replace_all_literal_aware(out, bt_qual, quoted);
-        replace_all_literal_aware(out, bt_db_qual, quoted);
-        replace_all_literal_aware(out, bt_tb_qual, quoted);
-        const std::string bare_qual = l.db + "." + l.tbl;
-        replace_ident_word(out, bare_qual, l.stoolap);
-    }
-
-    // Bare-form rewrites only fire when the bare name is unambiguous
-    // (single distinct database among all leaves with that table name)
-    // and the leaf is in the current database.
-    std::unordered_map<std::string, int> tbl_distinct_dbs;
-    {
-        std::unordered_map<std::string, std::unordered_map<std::string, int>>
-            seen;
-        for (const LeafName& l : leaves)
-            seen[l.tbl][l.db]++;
-        for (const auto& kv : seen)
-            tbl_distinct_dbs[kv.first] = kv.second.size();
-    }
-    std::unordered_map<std::string, int> done;
-    for (const LeafName& l : leaves) {
-        if (tbl_distinct_dbs[l.tbl] != 1) continue;
-        if (l.db != cur_db) continue;
-        if (done[l.stoolap]++) continue;
-
-        const std::string quoted = std::string("\"") + l.stoolap + "\"";
-        const std::string bt_bare = "`" + l.tbl + "`";
-        replace_all_literal_aware(out, bt_bare, quoted);
-        replace_ident_word(out, l.tbl, l.stoolap);
-    }
-    return out;
-}
-
-// Forward decl: collect_bound_params is defined in the next anonymous
-// namespace block alongside the SELECT pushdown helpers, but
-// try_direct_modify (in stoolap_pushdown below) needs to call it. Multiple
-// anonymous namespace blocks in one TU collapse to the same namespace,
-// so a forward decl here resolves cleanly.
-bool collect_bound_params(THD* thd, std::vector<StoolapValue>& out,
-                          std::vector<std::string>& storage);
-bool item_uses_ci_string(Item* item);
-bool field_not_as_written(const Field* f);
-bool item_uses_decimal_field(Item* item);
-
-// Forward decl: defined later. Walks every TABLE_LIST::on_expr (and
-// the prep / sj variants) in a FROM chain plus every nested-join
-// branch, returning true on the first predicate hit.
-using ItemPred = bool (*)(Item*);
-bool any_on_expr_matches_chain(TABLE_LIST* head, ItemPred pred);
-
 }  // namespace
 
 namespace stoolap_pushdown {
 
-// True if any leaf the rewriter touches has a column sharing its bare
-// table name. The text-based rewriter's word-boundary replace would
-// mangle that column token. Mirrors collect_leaf_names's walk.
-bool any_leaf_has_shadow_column(SELECT_LEX* sel_lex);
-
-void collect_leaf_table_names(SELECT_LEX* sel_lex,
-                              std::vector<std::string>& names) {
-    if (!sel_lex) return;
-    for (TABLE_LIST* tl = sel_lex->get_table_list(); tl; tl = tl->next_local) {
-        if (tl->derived) {
-            for (SELECT_LEX* inner = tl->derived->first_select(); inner;
-                 inner = inner->next_select()) {
-                collect_leaf_table_names(inner, names);
-            }
-            continue;
-        }
-        if (tl->table_name.str && tl->table_name.length > 0) {
-            names.emplace_back(tl->table_name.str, tl->table_name.length);
-        }
-    }
-    for (SELECT_LEX_UNIT* u = sel_lex->first_inner_unit(); u;
-         u = u->next_unit()) {
-        for (SELECT_LEX* sub = u->first_select(); sub;
-             sub = sub->next_select()) {
-            collect_leaf_table_names(sub, names);
-        }
-    }
-}
-
-bool any_leaf_table_name_collides_with_any_column(
-    SELECT_LEX* sel_lex, const std::vector<std::string>& all_names);
-
-bool any_leaf_table_name_collides_with_any_column_one(
-    TABLE_LIST* tl, const std::vector<std::string>& all_names) {
-    if (!tl || !tl->table || !tl->table->s) return false;
-    TABLE* t = tl->table;
-    for (uint i = 0; i < t->s->fields; ++i) {
-        Field* f = t->field[i];
-        if (!f) continue;
-        const size_t flen = f->field_name.length;
-        const char* fstr = f->field_name.str;
-        for (const std::string& tname : all_names) {
-            if (tname.size() == flen &&
-                strncasecmp(tname.c_str(), fstr, flen) == 0) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool any_leaf_table_name_collides_with_any_column(
-    SELECT_LEX* sel_lex, const std::vector<std::string>& all_names) {
-    if (!sel_lex) return false;
-    for (TABLE_LIST* tl = sel_lex->get_table_list(); tl; tl = tl->next_local) {
-        if (tl->derived) {
-            for (SELECT_LEX* inner = tl->derived->first_select(); inner;
-                 inner = inner->next_select()) {
-                if (any_leaf_table_name_collides_with_any_column(inner,
-                                                                 all_names))
-                    return true;
-            }
-            continue;
-        }
-        if (any_leaf_table_name_collides_with_any_column_one(tl, all_names))
-            return true;
-    }
-    for (SELECT_LEX_UNIT* u = sel_lex->first_inner_unit(); u;
-         u = u->next_unit()) {
-        for (SELECT_LEX* sub = u->first_select(); sub;
-             sub = sub->next_select()) {
-            if (any_leaf_table_name_collides_with_any_column(sub, all_names))
-                return true;
-        }
-    }
-    return false;
-}
-
-// Cross-leaf shadow: another leaf's table name can collide with this
-// leaf's column. UPDATE u SET o=o+1 WHERE EXISTS(SELECT 1 FROM o ...)
-// has outer leaf `u` with column `o` and subquery leaf `o` -- bare `o`
-// in SET gets rewritten to table `o`'s flat form, mangling the column.
-bool any_leaf_has_shadow_column(SELECT_LEX* sel_lex) {
-    std::vector<std::string> all_names;
-    collect_leaf_table_names(sel_lex, all_names);
-    if (all_names.empty()) return false;
-    return any_leaf_table_name_collides_with_any_column(sel_lex, all_names);
-}
-
+// Statement shapes the direct path can take: a single-table UPDATE or
+// DELETE without ORDER BY / LIMIT, outside triggers and stored routines,
+// over stoolap tables only. Whether its expressions translate is
+// plan_direct_modify's call (stoolap_sqlgen).
 bool can_direct_modify(THD* thd) {
     if (!thd) return false;
     if (thd->stmt_arena && thd->stmt_arena->is_stmt_prepare()) return false;
@@ -495,75 +151,65 @@ bool can_direct_modify(THD* thd) {
         return false;  // ORDER BY / LIMIT
     if (sel->uncacheable & UNCACHEABLE_SIDEEFFECT) return false;
 
-    // True if `root` references a ci-string or DECIMAL field. Both
-    // would miscompare against stoolap's bytewise/TEXT storage.
-    auto items_unsafe_for_pushdown = [&](Item* root) {
-        if (!root) return false;
-        const bool ci_unsafe =
-            !stoolap_thd_trust_binary_strings(thd) && item_uses_ci_string(root);
-        // DECIMAL bail is unconditional (type mismatch, not collation).
-        const bool decimal_unsafe = item_uses_decimal_field(root);
-        return ci_unsafe || decimal_unsafe;
-    };
-
-    if (items_unsafe_for_pushdown(sel->where)) return false;
-    // Single-table UPDATE may still carry a semi-join-lifted on_expr.
-    if (any_on_expr_matches_chain(sel->get_table_list(), item_uses_ci_string) &&
-        !stoolap_thd_trust_binary_strings(thd))
-        return false;
-    if (any_on_expr_matches_chain(sel->get_table_list(),
-                                  item_uses_decimal_field))
-        return false;
-
-    if (cmd == SQLCOM_UPDATE) {
-        // SET RHS expressions live in lex->value_list. A scalar subquery
-        // like SET n = (SELECT COUNT(*) FROM o WHERE status='completed')
-        // would route to stoolap and bytewise-compare against 'COMPLETED'.
-        List_iterator<Item> it(thd->lex->value_list);
-        Item* expr;
-        while ((expr = it++)) {
-            if (items_unsafe_for_pushdown(expr)) return false;
-        }
-        // DECIMAL targets: stoolap stores DECIMAL as TEXT. Assignments
-        // pass a numeric param that rounds through float before write,
-        // dropping scale. Encoded targets would store the value as
-        // written. The row-pump path is faithful: it writes through
-        // Field::store and extract_field.
-        List_iterator<Item> tit(sel->item_list);
-        Item* tgt;
-        while ((tgt = tit++)) {
-            if (!tgt) continue;
-            if (tgt->type() == Item::FIELD_ITEM) {
-                auto* fi = static_cast<Item_field*>(tgt);
-                if (fi->field && field_not_as_written(fi->field)) {
-                    return false;
-                }
-            }
-        }
-    }
-
     bool any = false;
     if (!every_table_is_stoolap(sel, any)) return false;
-    if (!any) return false;
-
-    // Decline if any leaf has a shadow column; the text-based rewriter
-    // would mangle SET/WHERE tokens that share a table name. Row-pump
-    // handles those via per-row callbacks.
-    if (any_leaf_has_shadow_column(sel)) return false;
-    return true;
+    return any;
 }
 
-int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
-    if (!can_direct_modify(thd)) return HA_ERR_WRONG_COMMAND;
+bool plan_direct_modify(THD* thd, TABLE* table, Item* cond, List<Item>* fields,
+                        std::string* sql) {
+    if (!can_direct_modify(thd) || !table) return false;
+    std::string guard, why;
+    bool ok;
+    if (thd->lex->sql_command == SQLCOM_UPDATE) {
+        if (!fields) return false;
+        // Without CLIENT_FOUND_ROWS the client is told the rows changed,
+        // so only those are updated (and counted).
+        const bool changed_only =
+            !(thd->client_capabilities & CLIENT_FOUND_ROWS);
+        ok = stoolap_sqlgen::gen_update(thd, table, cond, *fields,
+                                        thd->lex->value_list, changed_only, sql,
+                                        &guard, &why);
+    } else {
+        ok = stoolap_sqlgen::gen_delete(thd, table, cond, sql, &why);
+    }
+    if (!ok) {
+        if (stoolap_thd_explain_pushdown(thd))
+            sql_print_information("stoolap[explain]: no direct DML: %s",
+                                  why.c_str());
+        return false;
+    }
+    if (guard.empty()) return true;
 
-    SELECT_LEX* sel = thd->lex->first_select_lex();
-    std::string raw(thd->query(), thd->query_length());
-    if (raw.empty()) return HA_ERR_WRONG_COMMAND;
+    // Some SET value is not a constant: a row it would not fit (out of
+    // range, too long, NULL into NOT NULL) needs MariaDB's conversion,
+    // with its error or warning, so the row pump runs the statement.
+    auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
+        thd_get_ha_data(thd, stoolap_hton));
+    if (!ctx) {
+        ctx = new stoolap_mariadb::ThdContext(&g_engine);
+        thd_set_ha_data(thd, stoolap_hton, ctx);
+    }
+    StoolapDB* db = ctx->db();
+    if (!db || register_trx(thd) != 0) return false;
+    StoolapRows* rows = nullptr;
+    const int rc = ctx->has_tx()
+                       ? stoolap_tx_query(ctx->tx(), guard.c_str(), &rows)
+                       : stoolap_query(db, guard.c_str(), &rows);
+    if (rc != STOOLAP_OK || !rows) return false;
+    const bool misfit = stoolap_rows_next(rows) == STOOLAP_ROW;
+    stoolap_rows_close(rows);
+    if (misfit && stoolap_thd_explain_pushdown(thd))
+        sql_print_information(
+            "stoolap[explain]: no direct DML: a row "
+            "needs MariaDB's conversion: %s",
+            guard.c_str());
+    return !misfit;
+}
 
-    std::vector<LeafName> leaves;
-    collect_leaf_names(sel, leaves);
-    std::string sql = rewrite_table_names(raw, leaves, thd->db.str);
-
+int run_direct_modify(THD* thd, const std::string& sql, ha_rows* affected,
+                      unsigned* errkey_out) {
+    if (sql.empty()) return HA_ERR_WRONG_COMMAND;
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
         thd_get_ha_data(thd, stoolap_hton));
     if (!ctx) {
@@ -572,33 +218,12 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
     }
     StoolapDB* db = ctx->db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
-
-    // Bind any prepared-statement parameters: server-side EXECUTE of
-    // UPDATE/DELETE keeps `?` placeholders in thd->query(), with the
-    // bound values in LEX::param_list. Without this binding step
-    // stoolap would see the placeholders as literal `?` tokens and
-    // reject the statement (or worse, target the wrong rows on a
-    // looser parser). Plain (non-prepared) DML has param_list empty
-    // so this collapses to the no-params path.
-    std::vector<StoolapValue> params;
-    std::vector<std::string> param_storage;
-    if (!collect_bound_params(thd, params, param_storage)) {
-        return HA_ERR_WRONG_COMMAND;  // unsupported param type -> per-row fallback
-    }
+    if (register_trx(thd) != 0) return HA_ERR_INTERNAL_ERROR;
 
     int64_t rows_aff = 0;
-    int rc;
-    if (params.empty()) {
-        rc = ctx->has_tx() ? stoolap_tx_exec(ctx->tx(), sql.c_str(), &rows_aff)
-                           : stoolap_exec(db, sql.c_str(), &rows_aff);
-    } else {
-        const StoolapValue* pv = params.data();
-        const int32_t pn = static_cast<int32_t>(params.size());
-        rc = ctx->has_tx()
-                 ? stoolap_tx_exec_params(ctx->tx(), sql.c_str(), pv, pn,
-                                          &rows_aff)
-                 : stoolap_exec_params(db, sql.c_str(), pv, pn, &rows_aff);
-    }
+    const int rc = ctx->has_tx()
+                       ? stoolap_tx_exec(ctx->tx(), sql.c_str(), &rows_aff)
+                       : stoolap_exec(db, sql.c_str(), &rows_aff);
     if (rc != STOOLAP_OK) {
         StoolapErrorView verr =
             ctx->has_tx() ? fetch_tx_error(ctx->tx()) : fetch_db_error(db);
@@ -656,419 +281,6 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
 
 namespace {
 
-// True if `item` references a ci-string field in a compare-sensitive
-// position. Recurses into Item_func/sum/cond/ref/subselect; subquery
-// recursion is required so EXISTS(...WHERE s='completed'...) doesn't
-// byte-match 'COMPLETED' under MariaDB's ci semantics.
-bool item_uses_ci_string(Item* item);
-bool order_list_uses_ci_string(SQL_I_List<ORDER>& lst);
-bool select_lex_pushdown_uses_ci(SELECT_LEX* sel, bool include_projection);
-
-// Walk every ON-expression (on_expr, prep_on_expr, sj_on_expr) reachable
-// from `sel`'s FROM list, recursing into nested joins. Used by both ci
-// and DECIMAL guards: a JOIN ON predicate over those types miscompares.
-bool any_on_expr_matches(List<TABLE_LIST>* join_list, ItemPred pred);
-
-bool any_on_expr_matches_chain(TABLE_LIST* head, ItemPred pred) {
-    for (TABLE_LIST* tl = head; tl; tl = tl->next_local) {
-        if (tl->on_expr && pred(tl->on_expr)) return true;
-        if (tl->prep_on_expr && pred(tl->prep_on_expr)) return true;
-        if (tl->sj_on_expr && pred(tl->sj_on_expr)) return true;
-        if (tl->nested_join &&
-            any_on_expr_matches(&tl->nested_join->join_list, pred)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool any_on_expr_matches(List<TABLE_LIST>* join_list, ItemPred pred) {
-    if (!join_list) return false;
-    List_iterator<TABLE_LIST> it(*join_list);
-    TABLE_LIST* tl;
-    while ((tl = it++)) {
-        if (tl->on_expr && pred(tl->on_expr)) return true;
-        if (tl->prep_on_expr && pred(tl->prep_on_expr)) return true;
-        if (tl->sj_on_expr && pred(tl->sj_on_expr)) return true;
-        if (tl->nested_join &&
-            any_on_expr_matches(&tl->nested_join->join_list, pred)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// True when a multi-leg unit would compare ci-string projections
-// byte-wise on stoolap: UNION DISTINCT / INTERSECT / EXCEPT dedup,
-// tail-level ORDER/GROUP, or any per-leg compare-sensitive clause.
-bool unit_pushdown_uses_ci(SELECT_LEX_UNIT* unit) {
-    if (!unit) return false;
-    SELECT_LEX* first = unit->first_select();
-    if (!first) return false;
-    const bool multi_leg = (first->next_select() != nullptr);
-
-    for (SELECT_LEX* sel = first; sel; sel = sel->next_select()) {
-        if (select_lex_pushdown_uses_ci(sel, /*include_projection=*/true))
-            return true;
-    }
-    if (!multi_leg) return false;
-
-    const bool dedups_at_unit = (unit->union_distinct != nullptr) || [&]() {
-        for (SELECT_LEX* sel = first; sel; sel = sel->next_select()) {
-            const enum sub_select_type lk = sel->get_linkage();
-            if (lk == INTERSECT_TYPE || lk == EXCEPT_TYPE) return true;
-        }
-        return false;
-    }();
-
-    SELECT_LEX* gp = unit->global_parameters();
-    const bool tail_uses_ci =
-        gp && (order_list_uses_ci_string(gp->order_list) ||
-               order_list_uses_ci_string(gp->group_list));
-
-    if (!dedups_at_unit && !tail_uses_ci) return false;
-
-    // Some leg projects something that the dedup / tail compare will see.
-    // Bare FIELD_ITEM is the case the per-leg projection walker
-    // intentionally skipped; check it here.
-    for (SELECT_LEX* sel = first; sel; sel = sel->next_select()) {
-        List_iterator<Item> it(sel->item_list);
-        Item* pi;
-        while ((pi = it++)) {
-            if (pi && item_uses_ci_string(pi)) return true;
-        }
-    }
-    return false;
-}
-
-// ci-string check for whole-query pushdown. Recurses into derived
-// TABLE_LISTs so their inner WHERE/HAVING/etc. are inspected too.
-// `include_projection` is false for EXISTS bodies (their projection
-// is semantically ignored).
-bool select_lex_pushdown_uses_ci(SELECT_LEX* sel,
-                                 bool include_projection = true) {
-    if (!sel) return false;
-    // Compare-sensitive clauses of THIS select.
-    if (sel->where && item_uses_ci_string(sel->where)) return true;
-    if (sel->having && item_uses_ci_string(sel->having)) return true;
-    if (order_list_uses_ci_string(sel->order_list)) return true;
-    if (order_list_uses_ci_string(sel->group_list)) return true;
-    // JOIN ON compares like WHERE does in the engine.
-    if (any_on_expr_matches_chain(sel->get_table_list(), item_uses_ci_string)) {
-        return true;
-    }
-    if (include_projection) {
-        // Bare field refs and Item_ref-to-bare-field are byte-safe
-        // (bytes flow to the client unchanged). EXCEPT under SELECT
-        // DISTINCT, which dedups projected bytes positionally and
-        // would byte-split 'COMPLETED' from 'completed'.
-        const bool distinct_dedups = (sel->options & SELECT_DISTINCT) != 0;
-        auto strip_to_bare_field = [](Item* it) -> Item* {
-            for (int hops = 0; it && hops < 8; ++hops) {
-                if (it->type() == Item::FIELD_ITEM) return it;
-                if (it->type() != Item::REF_ITEM) return nullptr;
-                auto* r = static_cast<Item_ref*>(it);
-                if (!r->ref || !*r->ref) return nullptr;
-                it = *r->ref;
-            }
-            return nullptr;
-        };
-        List_iterator<Item> it(sel->item_list);
-        Item* pi;
-        while ((pi = it++)) {
-            if (!pi) continue;
-            if (Item* bare = strip_to_bare_field(pi)) {
-                if (distinct_dedups && item_uses_ci_string(bare)) return true;
-                continue;
-            }
-            if (item_uses_ci_string(pi)) return true;
-        }
-    }
-    // Derived clauses run inside the pushed plan; same protection.
-    for (TABLE_LIST* tl = sel->get_table_list(); tl; tl = tl->next_local) {
-        if (!tl->derived) continue;
-        // Multi-leg derived units inherit set-op semantics (dedup +
-        // tail ORDER compare projection bytes); use unit-level check.
-        if (tl->derived->first_select() &&
-            tl->derived->first_select()->next_select()) {
-            if (unit_pushdown_uses_ci(tl->derived)) return true;
-        } else {
-            for (SELECT_LEX* inner = tl->derived->first_select(); inner;
-                 inner = inner->next_select()) {
-                if (select_lex_pushdown_uses_ci(inner, include_projection))
-                    return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool item_uses_ci_string(Item* item) {
-    if (!item) return false;
-    switch (item->type()) {
-        case Item::FIELD_ITEM: {
-            auto* fi = static_cast<Item_field*>(item);
-            Field* f = fi->field;
-            if (!f || !f->has_charset()) return false;
-            CHARSET_INFO* cs = f->charset();
-            return cs && !(cs->state & MY_CS_BINSORT);
-        }
-        case Item::FUNC_ITEM:
-        case Item::SUM_FUNC_ITEM: {
-            auto* fs = static_cast<Item_func_or_sum*>(item);
-            const uint n = fs->argument_count();
-            for (uint i = 0; i < n; ++i) {
-                if (item_uses_ci_string(fs->arguments()[i])) return true;
-            }
-            return false;
-        }
-        case Item::COND_ITEM: {
-            auto* cond = static_cast<Item_cond*>(item);
-            List_iterator<Item> it(*cond->argument_list());
-            Item* sub;
-            while ((sub = it++)) {
-                if (item_uses_ci_string(sub)) return true;
-            }
-            return false;
-        }
-        case Item::REF_ITEM: {
-            auto* ref = static_cast<Item_ref*>(item);
-            if (ref->ref && *ref->ref) {
-                return item_uses_ci_string(*ref->ref);
-            }
-            return false;
-        }
-        case Item::SUBSELECT_ITEM: {
-            auto* ss = static_cast<Item_subselect*>(item);
-            SELECT_LEX_UNIT* u = ss->unit;
-            if (!u) return false;
-            // EXISTS ignores its projection; IN/scalar/ALL/ANY consume it
-            // and need full inspection including bare ci fields.
-            const bool exists_only =
-                ss->substype() == Item_subselect::EXISTS_SUBS;
-            for (SELECT_LEX* sel = u->first_select(); sel;
-                 sel = sel->next_select()) {
-                if (select_lex_pushdown_uses_ci(
-                        sel, /*include_projection=*/!exists_only))
-                    return true;
-                if (exists_only) continue;
-                // Stricter than outer projection: an outer bytewise
-                // compare on the consumed result needs us to bail even
-                // on bare ci fields here.
-                List_iterator<Item> it(sel->item_list);
-                Item* proj;
-                while ((proj = it++)) {
-                    if (proj && proj->type() == Item::FIELD_ITEM &&
-                        item_uses_ci_string(proj)) {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }
-        default:
-            return false;
-    }
-}
-
-// True if `item` references a column stoolap does not hold as MariaDB's
-// own value: DECIMAL (TEXT, so '1.50' misses 1.50) and every encoded
-// type (stoolap_types.h: dates and times, ENUM / SET, binary and
-// non-utf8 strings), which statement text would compare as written.
-// Bare projection is safe; not gated by trust_binary_strings (type
-// mismatch, not collation).
-bool item_uses_decimal_field(Item* item);
-bool select_lex_uses_decimal_field(SELECT_LEX* sel, bool include_projection);
-
-bool field_not_as_written(const Field* f) {
-    return f->real_type() == MYSQL_TYPE_NEWDECIMAL ||
-           stoolap_mariadb::field_enc(f) != stoolap_mariadb::Enc::PLAIN;
-}
-
-bool item_uses_decimal_field(Item* item) {
-    if (!item) return false;
-    switch (item->type()) {
-        case Item::FIELD_ITEM: {
-            auto* fi = static_cast<Item_field*>(item);
-            Field* f = fi->field;
-            return f && field_not_as_written(f);
-        }
-        case Item::FUNC_ITEM:
-        case Item::SUM_FUNC_ITEM: {
-            auto* fs = static_cast<Item_func_or_sum*>(item);
-            const uint n = fs->argument_count();
-            for (uint i = 0; i < n; ++i) {
-                if (item_uses_decimal_field(fs->arguments()[i])) return true;
-            }
-            return false;
-        }
-        case Item::COND_ITEM: {
-            auto* cond = static_cast<Item_cond*>(item);
-            List_iterator<Item> it(*cond->argument_list());
-            Item* sub;
-            while ((sub = it++)) {
-                if (item_uses_decimal_field(sub)) return true;
-            }
-            return false;
-        }
-        case Item::REF_ITEM: {
-            auto* ref = static_cast<Item_ref*>(item);
-            if (ref->ref && *ref->ref) {
-                return item_uses_decimal_field(*ref->ref);
-            }
-            return false;
-        }
-        case Item::SUBSELECT_ITEM: {
-            auto* ss = static_cast<Item_subselect*>(item);
-            SELECT_LEX_UNIT* u = ss->unit;
-            if (!u) return false;
-            const bool exists_only =
-                ss->substype() == Item_subselect::EXISTS_SUBS;
-            for (SELECT_LEX* sel = u->first_select(); sel;
-                 sel = sel->next_select()) {
-                if (select_lex_uses_decimal_field(
-                        sel, /*include_projection=*/!exists_only))
-                    return true;
-                if (exists_only) continue;
-                // Stricter than outer pushdown: scalar / IN / ALL / ANY
-                // subqueries return rows that the outer compares against.
-                // A bare DECIMAL field projected from those would be
-                // compared bytewise (stoolap-side) against a numeric
-                // literal at the outer level.
-                List_iterator<Item> it(sel->item_list);
-                Item* proj;
-                while ((proj = it++)) {
-                    if (proj && proj->type() == Item::FIELD_ITEM &&
-                        item_uses_decimal_field(proj)) {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }
-        default:
-            return false;
-    }
-}
-
-bool order_list_uses_decimal(SQL_I_List<ORDER>& lst) {
-    for (ORDER* o = lst.first; o; o = o->next) {
-        if (o->item && *o->item && item_uses_decimal_field(*o->item))
-            return true;
-    }
-    return false;
-}
-
-bool select_lex_uses_decimal_field(SELECT_LEX* sel,
-                                   bool include_projection = true) {
-    if (!sel) return false;
-    if (sel->where && item_uses_decimal_field(sel->where)) return true;
-    if (sel->having && item_uses_decimal_field(sel->having)) return true;
-    if (order_list_uses_decimal(sel->order_list)) return true;
-    if (order_list_uses_decimal(sel->group_list)) return true;
-    // JOIN ON predicates: stoolap stores DECIMAL as TEXT, so a JOIN
-    // ON DECIMAL compare is the same hazard as WHERE.
-    if (any_on_expr_matches_chain(sel->get_table_list(),
-                                  item_uses_decimal_field)) {
-        return true;
-    }
-    if (include_projection) {
-        List_iterator<Item> it(sel->item_list);
-        Item* pi;
-        while ((pi = it++)) {
-            if (!pi) continue;
-            if (pi->type() == Item::FIELD_ITEM) continue;
-            if (item_uses_decimal_field(pi)) return true;
-        }
-    }
-    for (TABLE_LIST* tl = sel->get_table_list(); tl; tl = tl->next_local) {
-        if (!tl->derived) continue;
-        for (SELECT_LEX* inner = tl->derived->first_select(); inner;
-             inner = inner->next_select()) {
-            if (select_lex_uses_decimal_field(inner, include_projection))
-                return true;
-        }
-    }
-    return false;
-}
-
-bool order_list_uses_ci_string(SQL_I_List<ORDER>& lst) {
-    for (ORDER* o = lst.first; o; o = o->next) {
-        if (o->item && *o->item && item_uses_ci_string(*o->item)) return true;
-    }
-    return false;
-}
-
-// Reuses the direct-DML identifier rewriter.
-// `storage` owns string copies so StoolapValue.text.ptr stays valid
-// for the duration of the stoolap call. PREPARE phase is filtered out
-// upstream (factory bails on is_stmt_prepare).
-bool collect_bound_params(THD* thd, std::vector<StoolapValue>& out,
-                          std::vector<std::string>& storage) {
-    if (!thd || !thd->lex) return true;
-    List_iterator<Item_param> it(thd->lex->param_list);
-    Item_param* p;
-    storage.reserve(thd->lex->param_list.elements);
-    while ((p = it++)) {
-        StoolapValue v{};
-        if (p->null_value) {
-            v.value_type = STOOLAP_TYPE_NULL;
-            out.push_back(v);
-            continue;
-        }
-        switch (p->result_type()) {
-            case INT_RESULT:
-                v.value_type = STOOLAP_TYPE_INTEGER;
-                v.v.integer = p->val_int();
-                break;
-            case REAL_RESULT:
-                v.value_type = STOOLAP_TYPE_FLOAT;
-                v.v.float64 = p->val_real();
-                break;
-            case DECIMAL_RESULT: {
-                // Bind DECIMAL as TEXT, never FLOAT: val_real() rounds
-                // through double, losing low-order digits above 2^53.
-                String tmp;
-                String* s = p->val_str(&tmp);
-                if (!s || p->null_value) {
-                    v.value_type = STOOLAP_TYPE_NULL;
-                    break;
-                }
-                storage.emplace_back(s->ptr(), s->length());
-                const std::string& held = storage.back();
-                v.value_type = STOOLAP_TYPE_TEXT;
-                v.v.text.ptr = held.data();
-                v.v.text.len = static_cast<int64_t>(held.size());
-                break;
-            }
-            case STRING_RESULT: {
-                String tmp;
-                String* s = p->val_str(&tmp);
-                if (!s || p->null_value) {
-                    v.value_type = STOOLAP_TYPE_NULL;
-                    break;
-                }
-                storage.emplace_back(s->ptr(), s->length());
-                const std::string& held = storage.back();
-                v.value_type = STOOLAP_TYPE_TEXT;
-                v.v.text.ptr = held.data();
-                v.v.text.len = static_cast<int64_t>(held.size());
-                break;
-            }
-            case ROW_RESULT:
-            case TIME_RESULT:
-            default:
-                return false;
-        }
-        out.push_back(v);
-    }
-    return true;
-}
-
-// false -> factory returns NULL -> MariaDB falls back to row pump.
-// semantic_guards: the ci / DECIMAL / placeholder checks the text-based
-// unit and derived paths rely on. The single-SELECT path passes false:
-// stoolap_sqlgen makes those decisions per expression.
 // Statement-level conditions for running a SELECT (or a set-operation
 // leg, or a derived table's SELECT) in stoolap. Whether its expressions
 // mean the same there is stoolap_sqlgen's call.
@@ -1535,10 +747,6 @@ derived_handler* create_stoolap_derived_handler(THD* thd, TABLE_LIST* derived) {
                                                      std::memory_order_relaxed);
     return new ha_stoolap_derived_handler(thd, std::move(sql),
                                           std::move(packed));
-}
-
-bool item_safe_for_byte_comparison(Item* item) {
-    return !item_uses_ci_string(item);
 }
 
 }  // namespace stoolap_pushdown

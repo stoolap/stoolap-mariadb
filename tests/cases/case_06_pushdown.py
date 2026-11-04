@@ -363,7 +363,10 @@ INSERT INTO pdc VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
     h.assert_scalar("WHERE UPDATE skipped row 2", "SELECT n FROM pdc WHERE id = 2", "2")
     h.assert_scalar("WHERE DELETE id=5 result",   "SELECT COUNT(*) FROM pdc WHERE id = 5", "0")
 
-    h.section("Direct DML declines when a column shares the table name")
+    # Direct DML is generated from the Item tree: every name is quoted and
+    # qualified, so a column named like a table is no hazard (the old
+    # text rewriter declined these).
+    h.section("Direct DML when a column shares a table name")
     h.exec_script(f"""
 CREATE TABLE shadow (id INT NOT NULL PRIMARY KEY, shadow INT NOT NULL) ENGINE={h.engine};
 INSERT INTO shadow VALUES (1, 100), (2, 200), (3, 300);
@@ -371,10 +374,10 @@ INSERT INTO shadow VALUES (1, 100), (2, 200), (3, 300);
     before = _direct_hits(h)
     h.run_client(f"USE {h.db}; UPDATE shadow SET shadow = 999 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
-    if after == before:
-        h._pass("UPDATE column-name=table-name avoided direct path")
+    if after > before:
+        h._pass("UPDATE column-name=table-name takes direct path")
     else:
-        h._fail(f"UPDATE column-name=table-name took direct path (delta={after - before})")
+        h._fail("UPDATE column-name=table-name did not take direct path")
     h.assert_scalar("UPDATE column=table applied",
                     "SELECT shadow FROM shadow WHERE id = 1", "999")
     h.assert_scalar("UPDATE skipped other rows",
@@ -387,10 +390,10 @@ INSERT INTO shdw VALUES (1, 11), (2, 22);
     before = _direct_hits(h)
     h.run_client(f"USE {h.db}; UPDATE shdw SET SHDW = 77 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
-    if after == before:
-        h._pass("case-insensitive column=table also avoids direct path")
+    if after > before:
+        h._pass("case-insensitive column=table takes direct path")
     else:
-        h._fail("case-insensitive column=table took direct path")
+        h._fail("case-insensitive column=table did not take direct path")
     h.assert_scalar("ci column=table UPDATE applied",
                     "SELECT SHDW FROM shdw WHERE id = 1", "77")
 
@@ -420,36 +423,24 @@ UPDATE shadow_outer SET n = 999 WHERE EXISTS (
     WHERE shadow_inner.uid = shadow_outer.id AND shadow_inner = 1)""",
                  use_db=False)
     after = _direct_hits(h)
-    if after == before:
-        h._pass("EXISTS-subquery shadow leaf avoided direct path")
+    if after > before:
+        h._pass("EXISTS-subquery shadow leaf takes direct path")
     else:
-        h._fail(f"EXISTS-subquery shadow leaf took direct path (delta={after - before})")
+        h._fail("EXISTS-subquery shadow leaf did not take direct path")
     h.assert_scalar("EXISTS-subquery shadow UPDATE applied (id=1)",
                     "SELECT n FROM shadow_outer WHERE id = 1", "999")
     h.assert_scalar("EXISTS-subquery shadow other rows untouched",
                     "SELECT n FROM shadow_outer WHERE id = 2", "20")
 
-    before = _direct_hits(h)
     h.run_client(f"""
 USE {h.db};
 UPDATE shadow_outer SET n = 555 WHERE id IN (
     SELECT uid FROM shadow_inner WHERE shadow_inner = 2)""", use_db=False)
-    after = _direct_hits(h)
-    if after == before:
-        h._pass("IN-subquery shadow leaf avoided direct path")
-    else:
-        h._fail("IN-subquery shadow leaf took direct path")
     h.assert_scalar("IN-subquery shadow UPDATE applied (id=2)",
                     "SELECT n FROM shadow_outer WHERE id = 2", "555")
 
-    # Cross-leaf shadow: outer leaf's column matches a SUBQUERY leaf's
-    # table name. The text rewriter rewrites every word-boundary
-    # occurrence of every leaf table name, so the bare `o` in
-    # `SET o = o + 1` gets mangled to the flat form of subquery table
-    # `o`. Original guard only checked own-leaf shadow (leaf `u` has
-    # column `u`?) and missed cross-leaf collisions; verify both that
-    # direct path is declined AND that the row-pump fallback applied
-    # the UPDATE correctly.
+    # Cross-leaf shadow: the outer table's column `o` shares the name of
+    # the subquery's table `o`, which the old text rewriter mangled.
     h.exec_script(f"""
 CREATE TABLE x_outer (id INT NOT NULL PRIMARY KEY, o INT NOT NULL) ENGINE={h.engine};
 CREATE TABLE o (id INT NOT NULL PRIMARY KEY, n INT NOT NULL) ENGINE={h.engine};
@@ -462,23 +453,19 @@ USE {h.db};
 UPDATE x_outer SET o = o + 1 WHERE EXISTS (
     SELECT 1 FROM o WHERE o.id = x_outer.id)""", use_db=False)
     after = _direct_hits(h)
-    if after == before:
-        h._pass("cross-leaf shadow (outer col == subquery table) avoided direct")
+    if after > before:
+        h._pass("cross-leaf shadow (outer col == subquery table) takes direct")
     else:
-        h._fail(f"cross-leaf shadow took direct path (delta={after - before})")
+        h._fail("cross-leaf shadow did not take direct path")
     h.assert_scalar("cross-leaf shadow UPDATE id=1 applied",
                     "SELECT o FROM x_outer WHERE id = 1", "101")
     h.assert_scalar("cross-leaf shadow UPDATE id=2 applied",
                     "SELECT o FROM x_outer WHERE id = 2", "201")
 
     h.section("Mixed-quote db.tbl direct DML")
-    # rewrite_table_names handles `db`.`tbl`, db.tbl, but used to miss
-    # `db`.tbl and db.`tbl`. Direct DML accepted those statements,
-    # left the table reference unrewritten, and stoolap returned a
-    # parse error like "expected SET after <db>, got '.'" instead of
-    # falling back to the row-pump path. Verify all four quoting
-    # combos run cleanly when the target db differs from the
-    # session's current db.
+    # Every quoting of db.tbl, with the target db other than the
+    # session's, updates the right table (the old text rewriter missed
+    # `db`.tbl and db.`tbl`).
     h.exec_script(f"""
 CREATE DATABASE IF NOT EXISTS mixq_other;
 CREATE TABLE mixq_other.q (id INT PRIMARY KEY, n INT) ENGINE={h.engine};
