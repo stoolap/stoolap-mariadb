@@ -230,13 +230,15 @@ INSERT INTO sdv_o VALUES (1, 'COMPLETED'), (2, 'pending');
     else:
         h._fail("trust_binary_strings=1 should push EXISTS-derived")
 
-    h.section("Shadow column (column shares table name) bails SELECT pushdown")
+    # Generated SQL quotes and aliases every name, so a column named like
+    # its table is no hazard (direct DML's text rewriter still bails).
+    h.section("Shadow column (column shares table name) pushes")
     h.exec_script(f"""
 CREATE TABLE shsel (id INT NOT NULL PRIMARY KEY, shsel INT NOT NULL) ENGINE={h.engine};
 INSERT INTO shsel VALUES (1, 100), (2, 200);
 """)
-    h.assert_not_pushed("SELECT col-named-as-table bails", "SELECT shsel FROM shsel WHERE id = 1")
-    h.assert_scalar("row pump returns column value",
+    h.assert_pushed("SELECT col-named-as-table pushes", "SELECT shsel FROM shsel WHERE id = 1")
+    h.assert_scalar("pushed SELECT returns the column value",
                     "SELECT shsel FROM shsel WHERE id = 1", "100")
     h.assert_pushed("non-shadow schema still pushes",
                     "SELECT id FROM users WHERE id = 1")
@@ -789,17 +791,20 @@ INSERT INTO pp_orders VALUES (10,1,100),(20,1,200),(30,2,300),(40,3,400);
 PREPARE pe FROM 'EXPLAIN SELECT u.id FROM pp_users u JOIN (SELECT uid FROM pp_orders WHERE amt > ?) d ON d.uid = u.id WHERE u.role = ? ORDER BY u.id';
 SET @amt = 150, @role = 'admin';
 EXECUTE pe USING @amt, @role;""")
+    # The derived SQL is generated per EXECUTE with the bound values.
     if "PUSHED DERIVED" in out:
-        h._fail("prepared derived still pushed (param-binding hazard)")
+        h._pass("prepared derived pushed")
     else:
-        h._pass("prepared derived bailed to row pump")
+        h._fail("prepared derived not pushed", f"explain: {out}")
 
     rc, out = h.run_client("""
 PREPARE pp FROM 'SELECT u.id FROM pp_users u JOIN (SELECT uid FROM pp_orders WHERE amt > ?) d ON d.uid = u.id WHERE u.role = ? ORDER BY u.id';
 SET @amt = 150, @role = 'admin';
+EXECUTE pp USING @amt, @role;
+SET @amt = 350;
 EXECUTE pp USING @amt, @role;""")
     rows = ",".join(line.strip() for line in out.splitlines() if line.strip())
-    h.assert_eq("prepared derived row pump correctness", "1,3", rows)
+    h.assert_eq("prepared derived, re-executed with new values", "1,3,3", rows)
 
     h.section("Prepared-statement pushdown (binary protocol)")
     expected_range = h.sql("SELECT COUNT(*) FROM users WHERE age >= 30 AND age <= 40")

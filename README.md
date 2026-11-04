@@ -104,9 +104,10 @@ src/
   ha_stoolap.{h,cc}         handler subclass: row-pump, indexes, DDL,
                             cond_push, direct DML, status / system vars.
   ha_stoolap_select.{h,cc}  select_handler / derived_handler / unit
-                            pushdown factories. ci-collation guard
-                            (unit / derived). Identifier rewriting.
-  stoolap_sqlgen.{h,cc}     SELECT pushdown SQL generated from
+                            pushdown factories; direct DML guards and
+                            identifier rewriting.
+  stoolap_sqlgen.{h,cc}     Pushdown SQL (SELECT, UNION / INTERSECT /
+                            EXCEPT, derived tables) generated from
                             MariaDB's prepared Item tree.
   stoolap_bridge.{h,cc}     C++ smart-pointer wrappers around the
                             Stoolap C ABI (DbPtr, TxPtr, RowsPtr,
@@ -155,11 +156,11 @@ The plugin implements three of MariaDB's pushdown contracts:
 | `pre_direct_*`     | Direct UPDATE / DELETE        | Forwards `thd->query()` verbatim to     |
 |                    |                               | Stoolap with leaf-name rewriting.       |
 
-A single SELECT is not forwarded as text. `stoolap_sqlgen` writes the
-stoolap SQL from MariaDB's prepared Item tree (the select_handler is
-created after `JOIN::prepare()`, before any optimizer rewrite), so each
-construct is translated to its stoolap equivalent or the statement is
-left to MariaDB:
+Pushed queries are not forwarded as text. `stoolap_sqlgen` writes the
+stoolap SQL from MariaDB's prepared Item tree (the select, unit and
+derived handlers are created after prepare, before any optimizer
+rewrite), so each construct is translated to its stoolap equivalent or
+the statement is left to MariaDB:
 - NULL ordering is explicit (`ASC NULLS FIRST` / `DESC NULLS LAST`),
   `<=>` becomes `IS NOT DISTINCT FROM`, literals are always single-quoted,
   and an EXECUTE's placeholders are written as their bound values.
@@ -167,6 +168,11 @@ left to MariaDB:
   branch of a DOUBLE `IF` / `CASE` / `COALESCE` is cast to FLOAT, a
   GROUP BY without ORDER BY is ordered by its keys as MariaDB does, and
   an EXISTS subquery without aggregates selects `1`.
+- UNION / INTERSECT / EXCEPT [ALL] keep their written order (both
+  engines apply INTERSECT first); an integer leg of a DOUBLE result
+  column is cast to FLOAT, and a deduplicating operation pushes only
+  when every result column compares the same way in both engines.
+  A leg's own ORDER BY / LIMIT is not pushed.
 - Comparisons, GROUP BY, ORDER BY, DISTINCT and MIN / MAX push only for
   types that compare the same way in both engines: integers, doubles,
   DATETIME, and strings under a binary NO PAD collation (or any collation
@@ -175,19 +181,8 @@ left to MariaDB:
   `TRIM`, `UPPER` / `LOWER`, `WITH TIES`, `SQL_CALC_FOUND_ROWS`,
   non-boolean WHERE operands and other constructs without an exact
   stoolap equivalent are not pushed.
-With `SET stoolap_explain_pushdown = 1` the error log names why a SELECT
+With `SET stoolap_explain_pushdown = 1` the error log names why a query
 was not pushed (`stoolap[explain]: not pushed: <reason>`).
-
-The unit and derived handlers still forward statement text with
-rewritten table names, guarded as follows. The ci-collation guard
-recursively walks WHERE/HAVING/ORDER/GROUP, the
-SELECT list (skipping bare field refs that don't compare), every
-derived TABLE_LIST entry, and every Item_subselect (with EXISTS_SUBS
-treated specially: its SELECT-list is semantically ignored). When any
-ci-collated column appears in a compare-sensitive surface, pushdown
-bails to the row pump so MariaDB applies its own case-insensitive
-compare. `SET stoolap_trust_binary_strings = 1` opts out and pushes
-anyway.
 
 When pushdown succeeds, Stoolap returns rows via `stoolap_rows_fetch_all`
 into a packed binary buffer that the plugin parses in-process; no FFI
@@ -246,7 +241,7 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 | ---------------------------------------------- | ------ |
 | Whole SELECT pushdown                          | Yes (constructs with an exact stoolap translation) |
 | Derived-table pushdown                         | Yes |
-| UNION / UNION ALL pushdown                     | Yes (single-engine units) |
+| UNION / INTERSECT / EXCEPT [ALL] pushdown      | Yes (single-engine units) |
 | Cross-engine derived (Stoolap inside InnoDB)   | Yes |
 | Aggregation: COUNT, SUM, MIN, MAX, AVG         | Yes (engine-side) |
 | GROUP BY, HAVING                               | Yes |
