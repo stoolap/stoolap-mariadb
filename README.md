@@ -183,13 +183,14 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 | `CREATE TABLE` with BLOB / VARBINARY           | Partial (UTF-8 only)        |
 | `CREATE TABLE` with JSON                       | Yes (LONGTEXT route)        |
 | `DROP TABLE` / `RENAME TABLE` / `TRUNCATE`     | Yes |
-| `CREATE INDEX` (single-column)                 | Yes |
-| `KEY (a, b)` composite (uses leading column)   | Partial |
+| `CREATE INDEX` (single or multi-column)        | Yes |
+| `KEY (a, b)` composite                         | Yes (one stoolap index over all parts) |
 | `PRIMARY KEY` (single-column inline)           | Yes |
-| `PRIMARY KEY (a, b)` composite                 | Refused at CREATE (Stoolap only enforces single-column) |
+| `PRIMARY KEY (a, b)` composite                 | Yes (enforced as a NOT NULL composite unique index) |
 | `UNIQUE` constraints (single-column)           | Yes |
-| `UNIQUE (a, b)` composite                      | Refused at CREATE |
+| `UNIQUE (a, b)` composite                      | Yes |
 | `PRIMARY KEY` / `UNIQUE` on ci-collated VARCHAR | Refused at CREATE (use `_bin` collation or drop the constraint) |
+| `PRIMARY KEY` / `UNIQUE` over a column prefix (`a(3)`) | Refused at CREATE (stoolap enforces whole-column uniqueness) |
 | `FOREIGN KEY` (single-column inline)           | Yes (RESTRICT, CASCADE) |
 | Multi-column FK / self-referencing FK          | Refused at CREATE with a client-visible error |
 | `AUTO_INCREMENT`                               | Yes (cross-connection cache invalidates on TRUNCATE/DROP/RENAME) |
@@ -533,7 +534,7 @@ numerics), strings, numerics, concurrency, DDL surface, scale
 (50K rows vs InnoDB), error message parity, transactional
 visibility / isolation (`REPEATABLE READ` snapshot stability,
 `READ COMMITTED` post-commit visibility), unsupported-DDL
-rejection (composite PK/UNIQUE/FK, direct UPDATE/DELETE error
+rejection (composite / self-referencing FK, direct UPDATE/DELETE error
 mapping to ER_DUP_ENTRY 1062 / ER_NO_REFERENCED_ROW_2 1452),
 error-class round-trip (every known stoolap error class reaches the
 client with the right MariaDB errno; drift counters stay at

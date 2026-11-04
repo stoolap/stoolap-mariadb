@@ -28,9 +28,10 @@ tests/
     case_14_scale.py                 50K/120K row loads, parity vs InnoDB
     case_15_error_messages.py        error-message plumbing
     case_16_tx_isolation.py          REPEATABLE READ snapshot, READ COMMITTED post-commit visibility, CONSISTENT SNAPSHOT
-    case_17_unsupported_ddl.py       composite PK/UNIQUE/FK refused at CREATE; direct UPDATE 1062/1452 strict errno
+    case_17_unsupported_ddl.py       prefix PK/UNIQUE and composite/self-ref FK refused at CREATE; direct UPDATE 1062/1452 strict errno
     case_18_error_mapping.py         every stoolap error class round-trips to the right MariaDB errno; drift counters stay at baseline
     case_19_savepoints.py            SAVEPOINT / RELEASE / ROLLBACK TO, nested + reused names, unknown-name error
+    case_20_composite_keys.py        composite PRIMARY KEY / UNIQUE: dup key names, ODKU / REPLACE, row-pump DML, mixed-engine probe, ALTER ADD UNIQUE
 ```
 
 ## Requirements

@@ -6,29 +6,35 @@ must map to MariaDB's specific error codes, not the generic 1296."""
 
 
 def run(h):
-    h.section("Composite PRIMARY KEY refused")
-    h.assert_err("composite PK rejected at CREATE",
-                 f"""CREATE TABLE comp_pk (
-                       a INT NOT NULL, b INT NOT NULL,
-                       PRIMARY KEY (a, b)) ENGINE={h.engine}""",
-                 r"composite PRIMARY KEY")
-    # Confirm the table really wasn't created.
-    h.assert_scalar("composite PK table not present",
-                    "SELECT COUNT(*) FROM information_schema.tables "
-                    f"WHERE table_schema = '{h.db}' AND table_name = 'comp_pk'",
-                    "0")
-
-    h.section("Composite UNIQUE refused")
-    h.assert_err("composite UNIQUE rejected at CREATE",
-                 f"""CREATE TABLE comp_uq (
-                       id INT NOT NULL PRIMARY KEY,
-                       a INT NOT NULL, b INT NOT NULL,
-                       UNIQUE KEY uq_ab (a, b)) ENGINE={h.engine}""",
-                 r"composite UNIQUE")
-    h.assert_scalar("composite UNIQUE table not present",
-                    "SELECT COUNT(*) FROM information_schema.tables "
-                    f"WHERE table_schema = '{h.db}' AND table_name = 'comp_uq'",
-                    "0")
+    h.section("PRIMARY KEY / UNIQUE over a column prefix refused")
+    # Stoolap would enforce uniqueness on the whole column, so UNIQUE
+    # (a(3), b) would accept ('abc1', 1) and ('abc2', 1), which collide
+    # on the declared prefix. Refuse rather than weaken the constraint.
+    for name, ddl in (
+        ("prefix_uq_comp",
+         "id INT NOT NULL PRIMARY KEY, a VARCHAR(20) COLLATE utf8mb4_bin, "
+         "b INT, UNIQUE KEY uq (a(3), b)"),
+        ("prefix_uq",
+         "id INT NOT NULL PRIMARY KEY, a VARCHAR(20) COLLATE utf8mb4_bin, "
+         "UNIQUE KEY uq (a(3))"),
+        ("prefix_pk",
+         "a VARCHAR(20) COLLATE utf8mb4_bin NOT NULL, b INT NOT NULL, "
+         "PRIMARY KEY (a(3), b)"),
+    ):
+        h.assert_err(f"{name} rejected at CREATE",
+                     f"CREATE TABLE {name} ({ddl}) ENGINE={h.engine}",
+                     r"column prefix")
+        h.assert_scalar(f"{name} table not present",
+                        "SELECT COUNT(*) FROM information_schema.tables "
+                        f"WHERE table_schema = '{h.db}' "
+                        f"AND table_name = '{name}'", "0")
+    h.exec_script(f"""
+CREATE TABLE prefix_alter (id INT NOT NULL PRIMARY KEY,
+                           a VARCHAR(20) COLLATE utf8mb4_bin) ENGINE={h.engine};
+""")
+    h.assert_err("ALTER ADD UNIQUE over a prefix rejected",
+                 "ALTER TABLE prefix_alter ADD UNIQUE KEY uq (a(3))",
+                 r"column prefix")
 
     h.section("Composite FOREIGN KEY refused")
     h.exec_script(f"""
