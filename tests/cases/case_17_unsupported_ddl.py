@@ -6,30 +6,6 @@ must map to MariaDB's specific error codes, not the generic 1296."""
 
 
 def run(h):
-    h.section("Composite PRIMARY KEY refused")
-    h.assert_err("composite PK rejected at CREATE",
-                 f"""CREATE TABLE comp_pk (
-                       a INT NOT NULL, b INT NOT NULL,
-                       PRIMARY KEY (a, b)) ENGINE={h.engine}""",
-                 r"composite PRIMARY KEY")
-    # Confirm the table really wasn't created.
-    h.assert_scalar("composite PK table not present",
-                    "SELECT COUNT(*) FROM information_schema.tables "
-                    f"WHERE table_schema = '{h.db}' AND table_name = 'comp_pk'",
-                    "0")
-
-    h.section("Composite UNIQUE refused")
-    h.assert_err("composite UNIQUE rejected at CREATE",
-                 f"""CREATE TABLE comp_uq (
-                       id INT NOT NULL PRIMARY KEY,
-                       a INT NOT NULL, b INT NOT NULL,
-                       UNIQUE KEY uq_ab (a, b)) ENGINE={h.engine}""",
-                 r"composite UNIQUE")
-    h.assert_scalar("composite UNIQUE table not present",
-                    "SELECT COUNT(*) FROM information_schema.tables "
-                    f"WHERE table_schema = '{h.db}' AND table_name = 'comp_uq'",
-                    "0")
-
     h.section("Composite FOREIGN KEY refused")
     h.exec_script(f"""
 CREATE TABLE pp (a INT NOT NULL, b INT NOT NULL,

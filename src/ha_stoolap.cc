@@ -317,9 +317,17 @@ StoolapErrorView fetch_error_via(stoolap_mariadb::ThdContext* ctx,
     return fetch_db_error(d);
 }
 
-// MariaDB key build_create_sql emitted as the n-th table-level
-// UNIQUE (n counts non-PK HA_NOSAME keys in key order), or MAX_KEY.
+// MariaDB key behind stoolap's n-th table-level unique constraint, or
+// MAX_KEY. Stoolap numbers CREATE TABLE's table-level PRIMARY KEY / UNIQUE
+// clauses in order, and build_create_sql emits a composite PRIMARY KEY
+// first, then each non-PK unique key in key order. A single-column PRIMARY
+// KEY is inline and takes no number.
 uint unique_key_by_ordinal(TABLE_SHARE* share, uint n) {
+    if (share->primary_key < share->keys &&
+        share->key_info[share->primary_key].user_defined_key_parts > 1) {
+        if (n == 0) return share->primary_key;
+        --n;
+    }
     for (uint i = 0; i < share->keys; ++i) {
         if (i == share->primary_key) continue;
         if (!(share->key_info[i].flags & HA_NOSAME)) continue;
@@ -328,14 +336,25 @@ uint unique_key_by_ordinal(TABLE_SHARE* share, uint n) {
     return MAX_KEY;
 }
 
+// The key's columns as stoolap lists them in a UNIQUE error: "a, b".
+std::string key_column_list(const KEY& k) {
+    std::string out;
+    for (uint i = 0; i < k.user_defined_key_parts; ++i) {
+        const Field* f = k.key_part[i].field;
+        if (!f) return std::string();
+        if (i) out += ", ";
+        out.append(f->field_name.str, f->field_name.length);
+    }
+    return out;
+}
+
 // PK dup -> primary key; UNIQUE dup -> the key stoolap reports in
 // "unique constraint failed for index unique_<table>_<n> on column C
-// with value V". Stoolap names the n-th table-level UNIQUE of CREATE
-// TABLE unique_<table>_<n>, so n pins the key exactly; C must also be
-// that key's whole column name. Table and column names are unquoted and
-// may contain the separators, so every " on column " is tried until one
-// satisfies both. Composite UNIQUE is refused at CREATE, so key_part[0]
-// is the column.
+// with value V" (C is "a, b" for a composite key; a composite PRIMARY KEY
+// reports this way too). n pins the key exactly (unique_key_by_ordinal);
+// C must also be that key's whole column list. Table and column names are
+// unquoted and may contain the separators, so every " on column " is
+// tried until one satisfies both.
 uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
     if (!share) return 0;
     std::string_view m(v.message);
@@ -357,14 +376,12 @@ uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
                 n = n * 10 + (m[i] - '0');
             const uint key = unique_key_by_ordinal(share, n);
             if (key == MAX_KEY) continue;
-            const Field* f = share->key_info[key].key_part[0].field;
-            if (!f) continue;
-            const std::string_view name(f->field_name.str,
-                                        f->field_name.length);
+            const std::string cols = key_column_list(share->key_info[key]);
+            if (cols.empty()) continue;
             const std::string_view rest = m.substr(at + kCol.size());
-            if (rest.size() >= name.size() + kVal.size() &&
-                rest.compare(0, name.size(), name) == 0 &&
-                rest.compare(name.size(), kVal.size(), kVal) == 0) {
+            if (rest.size() >= cols.size() + kVal.size() &&
+                rest.compare(0, cols.size(), cols) == 0 &&
+                rest.compare(cols.size(), kVal.size(), kVal) == 0) {
                 return key;
             }
         }
@@ -885,41 +902,29 @@ std::string build_create_sql(const std::string& table_name, TABLE* form,
         return std::string();
     }
 
-    // Single-column PK gets emitted inline. Multi-column PK is refused
-    // because stoolap only enforces the column-level PRIMARY KEY form;
-    // table-level (a, b) parses but doesn't enforce uniqueness.
+    // A single-column PRIMARY KEY is emitted inline; a composite one goes
+    // first among the table-level constraints, which stoolap enforces as a
+    // NOT NULL unique index (numbering: see unique_key_by_ordinal).
     int pk_col = -1;
+    const KEY* composite_pk = nullptr;
     if (form->s->primary_key < form->s->keys) {
-        KEY& pk = form->key_info[form->s->primary_key];
+        const KEY& pk = form->key_info[form->s->primary_key];
         if (pk.user_defined_key_parts == 1) {
             pk_col = static_cast<int>(pk.key_part[0].field->field_index);
         } else {
-            my_printf_error(ER_GET_ERRMSG,
-                            "stoolap: composite PRIMARY KEY (%u columns) is "
-                            "not supported -- stoolap only enforces "
-                            "single-column primary keys. Drop the constraint "
-                            "or pick a single column.",
-                            MYF(0), pk.user_defined_key_parts);
-            return std::string();
+            composite_pk = &pk;
         }
     }
-    // Same story for table-level UNIQUE: composite UNIQUE parses but isn't
-    // enforced by stoolap.
-    for (uint i = 0; i < form->s->keys; ++i) {
-        if (static_cast<uint>(i) == form->s->primary_key) continue;
-        KEY& k = form->key_info[i];
-        if (!(k.flags & HA_NOSAME)) continue;
-        if (k.user_defined_key_parts > 1) {
-            my_printf_error(ER_GET_ERRMSG,
-                            "stoolap: composite UNIQUE key '%s' (%u columns) "
-                            "is not supported -- stoolap only enforces "
-                            "single-column UNIQUE constraints. Drop the "
-                            "constraint or split it into single-column ones.",
-                            MYF(0), k.name.str ? k.name.str : "(unnamed)",
-                            k.user_defined_key_parts);
-            return std::string();
+    auto append_key_columns = [](std::string& out, const KEY& k) {
+        out.push_back('(');
+        for (uint j = 0; j < k.user_defined_key_parts; ++j) {
+            if (j) out += ", ";
+            const Field* f = k.key_part[j].field;
+            out += quote_ident(
+                std::string_view(f->field_name.str, f->field_name.length));
         }
-    }
+        out.push_back(')');
+    };
 
     std::string sql = "CREATE TABLE ";
     if (if_not_exists) sql += "IF NOT EXISTS ";
@@ -943,18 +948,16 @@ std::string build_create_sql(const std::string& table_name, TABLE* form,
         if (static_cast<int>(i) == pk_col) sql += " PRIMARY KEY";
         if (f->flags & AUTO_INCREMENT_FLAG) sql += " AUTO_INCREMENT";
     }
+    if (composite_pk) {
+        sql += ", PRIMARY KEY ";
+        append_key_columns(sql, *composite_pk);
+    }
     for (uint i = 0; i < form->s->keys; ++i) {
         if (static_cast<uint>(i) == form->s->primary_key) continue;
         KEY& k = form->key_info[i];
         if (!(k.flags & HA_NOSAME)) continue;  // skip non-unique
-        sql += ", UNIQUE (";
-        for (uint j = 0; j < k.user_defined_key_parts; ++j) {
-            if (j) sql += ", ";
-            Field* f = k.key_part[j].field;
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-        }
-        sql.push_back(')');
+        sql += ", UNIQUE ";
+        append_key_columns(sql, k);
     }
     // FOREIGN KEY clauses aren't in form->key_info — MariaDB strips them when
     // the engine doesn't claim FK support. Recover them by scanning the
@@ -1377,44 +1380,49 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
 
 /**
  * Build a WHERE clause that uniquely identifies a row in `table->record[0]`
- * (after move_fields has been applied). When the table has a single-column
- * PRIMARY KEY this emits `WHERE pk = $N` — much faster than
- * compare-every-column on stoolap's side because stoolap can use its PK
- * index instead of a full scan. Falls back to the all-columns form when
- * there's no usable PK.
+ * (after move_fields has been applied): `WHERE pk1 = $N [AND pk2 = $M ...]`
+ * over every PRIMARY KEY part, so stoolap can use its PK (or composite PK)
+ * index instead of a full scan. Refuses tables without a PRIMARY KEY.
  *
- * Returns true on success; false if any column type is unsupported.
+ * Returns true on success; false if a column type is unsupported or the
+ * table has no usable PRIMARY KEY (an error is raised for the latter).
  */
 bool append_where_for_row(std::string& sql, TABLE* table,
                           std::vector<StoolapValue>& params,
                           std::vector<std::string>& text_holders,
                           int& next_param) {
-    // Fast path: single-column PK with a non-NULL value. Use only the
-    // table->field[] view so the field pointers definitely match the
-    // already-applied move_fields offset (the KEY_PART_INFO::field alias
-    // can point to a separate copy in some MariaDB internal paths).
+    // Use only the table->field[] view so the field pointers definitely
+    // match the already-applied move_fields offset (the KEY_PART_INFO::field
+    // alias can point to a separate copy in some MariaDB internal paths).
     TABLE_SHARE* share = table ? table->s : nullptr;
     if (share && share->primary_key < share->keys && share->key_info) {
-        KEY& pk = share->key_info[share->primary_key];
-        if (pk.user_defined_key_parts == 1 && pk.key_part) {
-            uint pk_idx = pk.key_part[0].fieldnr;
-            if (pk_idx > 0) --pk_idx;  // fieldnr is 1-based
-            if (pk_idx < share->fields) {
-                Field* pkf = table->field[pk_idx];
-                if (pkf && !pkf->is_null()) {
-                    sql += " WHERE ";
-                    sql += quote_ident(std::string_view(
-                        pkf->field_name.str, pkf->field_name.length));
-                    sql += " = $";
-                    sql += std::to_string(next_param++);
-                    StoolapValue v{};
-                    text_holders.emplace_back();
-                    if (!extract_field(pkf, v, text_holders.back()))
-                        return false;
-                    params.push_back(v);
-                    return true;
-                }
+        const KEY& pk = share->key_info[share->primary_key];
+        std::vector<Field*> parts;
+        for (uint i = 0; pk.key_part && i < pk.user_defined_key_parts; ++i) {
+            uint idx = pk.key_part[i].fieldnr;
+            if (idx > 0) --idx;  // fieldnr is 1-based
+            Field* f = idx < share->fields ? table->field[idx] : nullptr;
+            if (!f || f->is_null()) {
+                parts.clear();
+                break;
             }
+            parts.push_back(f);
+        }
+        if (!parts.empty()) {
+            sql += " WHERE ";
+            for (size_t i = 0; i < parts.size(); ++i) {
+                Field* f = parts[i];
+                if (i) sql += " AND ";
+                sql += quote_ident(
+                    std::string_view(f->field_name.str, f->field_name.length));
+                sql += " = $";
+                sql += std::to_string(next_param++);
+                StoolapValue v{};
+                text_holders.emplace_back();
+                if (!extract_field(f, v, text_holders.back())) return false;
+                params.push_back(v);
+            }
+            return true;
         }
     }
 
@@ -1422,16 +1430,15 @@ bool append_where_for_row(std::string& sql, TABLE* table,
     // UPDATE/DELETE callback would over-mutate every dup. Stoolap has no
     // rowid for tiebreaking and its UPDATE/DELETE grammar has no LIMIT,
     // so no byte-side fix exists. Direct DML (cond_push) still works.
-    my_printf_error(
-        ER_GET_ERRMSG,
-        "stoolap: row-pump UPDATE/DELETE on a table without a "
-        "single-column PRIMARY KEY is unsupported. Stoolap has no "
-        "stable row-id, so MariaDB's filesort+LIMIT path could "
-        "over-mutate byte-identical duplicates. Add a single-column "
-        "PRIMARY KEY, or rewrite the statement so the WHERE clause "
-        "alone selects the rows (no ORDER BY/LIMIT) -- direct DML "
-        "then handles it as one engine-side UPDATE/DELETE.",
-        MYF(0));
+    my_printf_error(ER_GET_ERRMSG,
+                    "stoolap: row-pump UPDATE/DELETE on a table without a "
+                    "PRIMARY KEY is unsupported. Stoolap has no "
+                    "stable row-id, so MariaDB's filesort+LIMIT path could "
+                    "over-mutate byte-identical duplicates. Add a "
+                    "PRIMARY KEY, or rewrite the statement so the WHERE clause "
+                    "alone selects the rows (no ORDER BY/LIMIT) -- direct DML "
+                    "then handles it as one engine-side UPDATE/DELETE.",
+                    MYF(0));
     return false;
 }
 
