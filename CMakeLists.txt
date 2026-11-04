@@ -46,7 +46,10 @@ set(RUST_STATICLIB
     "${RUST_TARGET_DIR}/release/${CMAKE_STATIC_LIBRARY_PREFIX}stoolap_mariadb${CMAKE_STATIC_LIBRARY_SUFFIX}")
 set(CARGO_ARGS build --release --manifest-path "${CMAKE_SOURCE_DIR}/rust/Cargo.toml"
     --target-dir "${RUST_TARGET_DIR}")
-if(DEFINED STOOLAP_DIR)
+# A PATH cache entry: a relative -DSTOOLAP_DIR becomes absolute against
+# the directory cmake ran in, not rust/ where cargo runs.
+set(STOOLAP_DIR "" CACHE PATH "Local stoolap checkout to build against")
+if(STOOLAP_DIR)
     message(STATUS "stoolap: local checkout ${STOOLAP_DIR}")
     list(APPEND CARGO_ARGS --config
         "patch.'https://github.com/stoolap/stoolap'.stoolap.path='${STOOLAP_DIR}'")
