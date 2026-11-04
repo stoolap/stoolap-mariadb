@@ -32,8 +32,11 @@ SELECT x FROM a UNION SELECT f FROM b ORDER BY 1;
 SELECT x / 4e0 FROM a UNION ALL SELECT f FROM b ORDER BY 1;
 SELECT s FROM a UNION ALL SELECT NULL FROM b ORDER BY 1;
 -- Left to MariaDB: ci dedup, mixed families, DECIMAL, a leg's own LIMIT.
-SELECT c FROM a UNION SELECT c FROM b ORDER BY 1;
-SELECT c FROM a UNION ALL SELECT c FROM b ORDER BY 1;
+-- ('Q' and 'q' are one value under the ci collation: which spelling a
+-- dedup keeps, or how ORDER BY places them, depends on the read order,
+-- so these compare counts or unordered rows.)
+SELECT COUNT(*) FROM (SELECT c FROM a UNION SELECT c FROM b) d;
+SELECT c FROM a UNION ALL SELECT c FROM b;
 SELECT x FROM a UNION SELECT s FROM b ORDER BY 1;
 SELECT x FROM a UNION SELECT 0.5 FROM b ORDER BY 1;
 (SELECT x FROM a ORDER BY x DESC LIMIT 1) UNION (SELECT x FROM b ORDER BY x LIMIT 1) ORDER BY 1;
@@ -51,7 +54,7 @@ SELECT k.label, d.x FROM k JOIN (SELECT x FROM a UNION SELECT x FROM b) d ON d.x
 SELECT k.label, d.x FROM k JOIN (SELECT x FROM a INTERSECT SELECT x FROM b) d ON d.x = k.id ORDER BY k.id;
 SELECT k.label, d.x FROM k JOIN (SELECT x FROM a GROUP BY x LIMIT 2) d ON d.x = k.id ORDER BY k.id;
 SELECT k.label, d.x FROM k JOIN (SELECT x FROM a UNION ALL SELECT x FROM b ORDER BY x DESC LIMIT 3) d ON d.x = k.id ORDER BY k.id, d.x;
-SELECT k.label, d.c FROM k JOIN (SELECT id, c FROM a UNION SELECT id, c FROM b) d ON d.id = k.id ORDER BY k.id, d.c;
+SELECT k.label, COUNT(*) FROM k JOIN (SELECT id, c FROM a UNION SELECT id, c FROM b) d ON d.id = k.id GROUP BY k.label;
 SELECT k.label, d.v FROM k JOIN (SELECT id, CONCAT(s, '!') AS v FROM a) d ON d.id = k.id ORDER BY k.id;
 SELECT k.id FROM k WHERE k.id IN (SELECT x FROM a UNION SELECT x FROM b) ORDER BY k.id;
 -- A DISTINCT leg dedups its own values before the result's DOUBLE type
