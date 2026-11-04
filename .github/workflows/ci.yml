@@ -14,7 +14,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PINNED_STOOLAP_VERSION: v0.4.0
   MARIADB_VERSION: '11.4'
 
 jobs:
@@ -46,30 +45,21 @@ jobs:
     needs: format
     strategy:
       fail-fast: false
-      # Until upstream cuts a release that contains every FFI symbol the
-      # plugin uses (currently `stoolap_stmt_exec_batch` is in `main`
-      # only; the latest release v0.4.0 doesn't have it), the `pinned`
-      # row would fail to build. Run only `main` for now; restore the
-      # `pinned` row by adding back a v0.4.1+ entry once upstream ships
-      # one. Tracked in docs/upstream/stoolap_ffi_issue.md.
-      #
-      # The bucket-A FFI work that PRs A/B/C consume (typed errors,
-      # stoolap_table_count, savepoints) currently lives on stoolap's
-      # `read-only-trait-split` branch, not yet merged to main. Track
-      # that branch until it lands; once stoolap merges, flip back to
-      # `main` here. version_label stays "main" so the artifact name /
-      # cache key shape don't churn for downstream jobs.
+      # The plugin uses FFI calls newer than the last release (v0.4.x
+      # lacks stoolap_stmt_exec_batch and the *_all one-call queries),
+      # so track stoolap `main` until v0.5.0 is tagged, then add a
+      # pinned v0.5.0 row next to it.
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             lib: libstoolap.so
-            stoolap_version: read-only-trait-split
+            stoolap_version: main
             version_label: main
           - os: macos-latest
             target: aarch64-apple-darwin
             lib: libstoolap.dylib
-            stoolap_version: read-only-trait-split
+            stoolap_version: main
             version_label: main
     runs-on: ${{ matrix.os }}
     steps:

@@ -6,7 +6,9 @@ on:
   workflow_dispatch:
 
 env:
-  STOOLAP_VERSION: v0.4.0
+  # Track stoolap main until v0.5.0 is tagged (v0.4.x lacks FFI calls the
+  # plugin uses); then pin the tag here.
+  STOOLAP_VERSION: main
   MARIADB_VERSION: '11.4'
 
 jobs:
