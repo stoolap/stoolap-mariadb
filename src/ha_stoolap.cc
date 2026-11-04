@@ -2985,28 +2985,46 @@ bool ha_stoolap::range_in_bounds() {
 // first row past the end can be trusted. Stoolap returns candidates
 // bounded only by the leading key part when that part is safe, and
 // read_range_next keeps the rows inside both bounds by MariaDB's own
-// comparison, reading to the end. With `sorted`, rows come in the order
-// of the safe leading parts (MariaDB orders no further on such a key:
-// index_flags offers no order past them).
+// comparison, reading to the end. With `sorted`, rows come in key order
+// over the safe parts, skipping an unsafe one only where the range holds
+// it constant (MariaDB relies on no order past it otherwise: index_flags
+// offers none).
 int ha_stoolap::read_range_filtered(const key_range* start_key,
                                     const key_range* end_key, bool sorted) {
     KEY& ki = table->key_info[active_index];
+    const bool trust_bin = stoolap_thd_trust_binary_strings(ha_thd());
+    // Ordered and compared by stoolap as by MariaDB: not a prefix, PAD
+    // SPACE or ci string (key_part_needs_filter), nor one index_flags
+    // offers no order on.
     auto part_safe = [&](uint i) {
-        Field* f = ki.key_part[i].field;
-        return index_flags(active_index, i, false) & HA_READ_ORDER &&
-               !(ki.key_part[i].key_part_flag & HA_PART_KEY_SEG) && f;
+        return ki.key_part[i].field &&
+               (index_flags(active_index, i, false) & HA_READ_ORDER) &&
+               !key_part_needs_filter(ki.key_part[i], trust_bin);
     };
-    uint safe_lead = 0;
-    while (safe_lead < ki.user_defined_key_parts && part_safe(safe_lead))
-        ++safe_lead;
+    // Leading parts every row of the range shares: the bounds agree on
+    // them, byte for byte.
+    uint const_prefix = 0;
+    if (start_key && end_key) {
+        uint off = 0;
+        while (const_prefix < ki.user_defined_key_parts &&
+               (start_key->keypart_map & end_key->keypart_map &
+                (key_part_map(1) << const_prefix))) {
+            const uint len = ki.key_part[const_prefix].store_length;
+            if (std::memcmp(start_key->key + off, end_key->key + off, len))
+                break;
+            off += len;
+            ++const_prefix;
+        }
+    }
 
     std::string sql = "SELECT " + build_scan_columns() + " FROM ";
     sql += quote_ident(stoolap_table_);
     std::vector<StoolapValue> params;
     std::deque<std::string> holders;
-    if (safe_lead > 0) {
+    if (part_safe(0)) {
         // Every row of the range has its first part between the bounds'
-        // first parts (inclusive, whatever the flags).
+        // first parts (inclusive, whatever the flags); NULLs sort first,
+        // so an upper bound keeps them.
         Field* f = ki.key_part[0].field;
         const std::string col = quote_ident(
             std::string_view(f->field_name.str, f->field_name.length));
@@ -3024,18 +3042,28 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
                               extract_field(f, v, holders.back());
             move_fields(table, -d);
             if (!bind) continue;
-            sql += params.empty() ? " WHERE " : " AND ";
+            sql += params.empty() ? " WHERE (" : " AND (";
             sql += col;
             sql += r == start_key ? " >= $" : " <= $";
             params.push_back(v);
             sql += std::to_string(params.size());
+            if (r == end_key && f->real_maybe_null())
+                sql += " OR " + col + " IS NULL";
+            sql.push_back(')');
         }
     }
-    if (sorted && safe_lead > 0) {
-        sql += " ORDER BY ";
-        for (uint i = 0; i < safe_lead; ++i) {
+    if (sorted) {
+        // The key's order as far as stoolap can give it: safe parts, and
+        // past an unsafe part only when the range holds it constant.
+        bool first = true;
+        for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
+            if (!part_safe(i)) {
+                if (i < const_prefix) continue;
+                break;
+            }
             Field* f = ki.key_part[i].field;
-            if (i) sql += ", ";
+            sql += first ? " ORDER BY " : ", ";
+            first = false;
             sql += quote_ident(
                 std::string_view(f->field_name.str, f->field_name.length));
             sql += " NULLS FIRST";
