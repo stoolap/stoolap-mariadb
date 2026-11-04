@@ -159,9 +159,7 @@ private:
         scan_buf_cols_ = 0;
         scan_buf_rows_left_ = 0;
         scan_buf_cell_to_field_.clear();
-        ci_collation_filter_active_ = false;
-        ci_collation_key_info_ = nullptr;
-        ci_collation_nparts_ = 0;
+        key_filter_active_ = false;
     }
 
     std::string stoolap_table_;
@@ -178,13 +176,13 @@ private:
     // Sticky from index_init: false lets index_read_map skip ORDER BY.
     bool index_sorted_ = false;
 
-    // index_read_map sets these when any bound key part is ci-string
-    // and trust_binary_strings is off. index_next ci-compares EVERY
-    // bound part via Field::cmp; comparing only the leading would let
-    // KEY(s, n) joins emit wrong-`n` rows.
-    bool ci_collation_filter_active_ = false;
-    KEY* ci_collation_key_info_ = nullptr;
-    uint ci_collation_nparts_ = 0;
+    // index_read_map sets these for an exact lookup on a key part stoolap
+    // cannot compare as MariaDB does (see key_part_needs_filter): those
+    // parts stay out of the engine WHERE, and index_next keeps only rows
+    // whose key key_cmp() matches against this copy of the search key.
+    bool key_filter_active_ = false;
+    KEY* key_filter_key_ = nullptr;
+    std::vector<uchar> key_filter_buf_;
 
     // BLOB/TEXT present? rnd_pos refuses (BLOB in-record bytes are
     // (len, ptr); ptr references prior-rnd_next's value-store).
@@ -210,13 +208,14 @@ private:
         int find_flag = -1;
         uint nparts = 0;
         uint32_t null_mask = 0;
-        bool ci = false;
+        uint32_t filter_mask = 0;
         bool order = false;
         std::vector<uint32_t> cols;
         bool operator==(const IndexReadShape& o) const {
             return index == o.index && find_flag == o.find_flag &&
                    nparts == o.nparts && null_mask == o.null_mask &&
-                   ci == o.ci && order == o.order && cols == o.cols;
+                   filter_mask == o.filter_mask && order == o.order &&
+                   cols == o.cols;
         }
     };
     IndexReadShape ir_shape_;
@@ -254,3 +253,7 @@ private:
     void apply_count_delta(int64_t delta);
     void set_count_exact(uint64_t value);
 };
+
+// Stoolap name of the table behind `share`, derived from its path the
+// same way create() and open() derive it.
+std::string stoolap_table_name(const TABLE_SHARE* share);

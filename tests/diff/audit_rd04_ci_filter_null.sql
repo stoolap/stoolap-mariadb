@@ -1,4 +1,3 @@
--- known-diff-file: read path: the ci ref filter ignores NULL on both sides
 CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(10) COLLATE utf8mb4_general_ci NULL, KEY ks (s)) ENGINE={E};
 INSERT INTO t VALUES (1,'abc'),(2,NULL),(3,'');
 CREATE TABLE i (k INT PRIMARY KEY, s VARCHAR(10) COLLATE utf8mb4_general_ci NULL) ENGINE=InnoDB;

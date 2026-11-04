@@ -190,7 +190,11 @@ INSERT INTO exo VALUES (1,1,'X'),(2,2,'y');
     h.assert_not_pushed("IN with LOWER(s) projection still bails",
                         "SELECT COUNT(*) FROM exu WHERE 'x' IN "
                         "(SELECT LOWER(s) FROM exo WHERE exo.uid = exu.id)")
-    h.assert_not_pushed("scalar subq with LOWER(s) projection still bails",
+    # The ci column is only projected (no comparison), so it pushes.
+    h.assert_pushed("scalar subq with ci s projection pushes",
+                    "SELECT id, (SELECT s FROM exo WHERE exo.uid = exu.id LIMIT 1) FROM exu")
+    # LOWER cases by the collation (Turkish i), which stoolap does not.
+    h.assert_not_pushed("scalar subq with LOWER(s) projection bails",
                         "SELECT id, (SELECT LOWER(s) FROM exo WHERE exo.uid = exu.id LIMIT 1) FROM exu")
 
     h.section("ci-collation guard recurses into derived nested inside subqueries")
@@ -852,7 +856,9 @@ DEALLOCATE PREPARE pd;""")
     h.assert_eq("DECIMAL param matches BIGINT > 2^53",
                 "9007199254740993", out.strip().splitlines()[-1])
 
-    h.section("Prepared placeholders in projection bail to row pump")
+    # The pushed SQL is generated from the Item tree, where an EXECUTE's
+    # placeholders are bound values, so they are written as literals.
+    h.section("Prepared placeholders in projection and ORDER BY push")
     h.exec_script(f"""
 CREATE TABLE prsel (id INT NOT NULL PRIMARY KEY, n INT) ENGINE={h.engine};
 INSERT INTO prsel VALUES (1, 10), (2, 20);
@@ -863,9 +869,9 @@ SET @v = 'hello', @id = 1;
 EXECUTE pp1 USING @v, @id;
 DEALLOCATE PREPARE pp1;""")
     if "PUSHED SELECT" in out:
-        h._fail("projection placeholder still pushed (NULL hazard)")
+        h._pass("projection placeholder pushed")
     else:
-        h._pass("projection placeholder bailed to row pump")
+        h._fail("projection placeholder not pushed", f"explain: {out}")
 
     rc, out = h.run_client("""
 PREPARE pp2 FROM 'SELECT ? AS lit, id FROM prsel WHERE id = ?';
@@ -881,9 +887,16 @@ SET @x = 100;
 EXECUTE pp3 USING @x;
 DEALLOCATE PREPARE pp3;""")
     if "PUSHED SELECT" in out:
-        h._fail("ORDER BY expr placeholder still pushed")
+        h._pass("ORDER BY expr placeholder pushed")
     else:
-        h._pass("ORDER BY expr placeholder bailed")
+        h._fail("ORDER BY expr placeholder not pushed", f"explain: {out}")
+    rc, out = h.run_client("""
+PREPARE pp3r FROM 'SELECT id FROM prsel ORDER BY n * ?';
+SET @x = -1;
+EXECUTE pp3r USING @x;
+DEALLOCATE PREPARE pp3r;""")
+    h.assert_eq("ORDER BY expr placeholder orders by the bound value",
+                "2,1", ",".join(l.strip() for l in out.splitlines() if l.strip()))
 
     rc, out = h.run_client("""
 PREPARE pp4 FROM 'EXPLAIN SELECT id, n FROM prsel WHERE id = ?';

@@ -104,8 +104,10 @@ src/
   ha_stoolap.{h,cc}         handler subclass: row-pump, indexes, DDL,
                             cond_push, direct DML, status / system vars.
   ha_stoolap_select.{h,cc}  select_handler / derived_handler / unit
-                            pushdown factories. ci-collation guard.
-                            Adaptive projection. Identifier rewriting.
+                            pushdown factories. ci-collation guard
+                            (unit / derived). Identifier rewriting.
+  stoolap_sqlgen.{h,cc}     SELECT pushdown SQL generated from
+                            MariaDB's prepared Item tree.
   stoolap_bridge.{h,cc}     C++ smart-pointer wrappers around the
                             Stoolap C ABI (DbPtr, TxPtr, RowsPtr,
                             StmtPtr, StoolapBuffer). Process-wide
@@ -138,9 +140,8 @@ The plugin implements three of MariaDB's pushdown contracts:
 | Contract           | Surface                       | What we push                            |
 | ------------------ | ----------------------------- | --------------------------------------- |
 | `select_handler`   | Whole-query SELECT pushdown   | Single-SELECT plans where every leaf is |
-|                    |                               | a Stoolap table and the WHERE/HAVING/   |
-|                    |                               | ORDER/GROUP/projection pass the         |
-|                    |                               | ci-collation guard.                     |
+|                    |                               | a Stoolap table and every expression    |
+|                    |                               | translates (see below).                 |
 | `derived_handler`  | Derived-table pushdown        | A FROM-clause subquery materialised on  |
 |                    |                               | Stoolap so MariaDB sees the result as a |
 |                    |                               | regular table (hybrid stoolap+InnoDB    |
@@ -154,7 +155,32 @@ The plugin implements three of MariaDB's pushdown contracts:
 | `pre_direct_*`     | Direct UPDATE / DELETE        | Forwards `thd->query()` verbatim to     |
 |                    |                               | Stoolap with leaf-name rewriting.       |
 
-The ci-collation guard recursively walks WHERE/HAVING/ORDER/GROUP, the
+A single SELECT is not forwarded as text. `stoolap_sqlgen` writes the
+stoolap SQL from MariaDB's prepared Item tree (the select_handler is
+created after `JOIN::prepare()`, before any optimizer rewrite), so each
+construct is translated to its stoolap equivalent or the statement is
+left to MariaDB:
+- NULL ordering is explicit (`ASC NULLS FIRST` / `DESC NULLS LAST`),
+  `<=>` becomes `IS NOT DISTINCT FROM`, literals are always single-quoted,
+  and an EXECUTE's placeholders are written as their bound values.
+- `CONCAT` becomes `||` (NULL if any argument is NULL), an integer
+  branch of a DOUBLE `IF` / `CASE` / `COALESCE` is cast to FLOAT, a
+  GROUP BY without ORDER BY is ordered by its keys as MariaDB does, and
+  an EXISTS subquery without aggregates selects `1`.
+- Comparisons, GROUP BY, ORDER BY, DISTINCT and MIN / MAX push only for
+  types that compare the same way in both engines: integers, doubles,
+  DATETIME, and strings under a binary NO PAD collation (or any collation
+  with `stoolap_trust_binary_strings = 1`).
+- Integer `/`, DECIMAL arithmetic, `LENGTH`, `ROUND`, `SUBSTRING`, CAST,
+  `TRIM`, `UPPER` / `LOWER`, `WITH TIES`, `SQL_CALC_FOUND_ROWS`,
+  non-boolean WHERE operands and other constructs without an exact
+  stoolap equivalent are not pushed.
+With `SET stoolap_explain_pushdown = 1` the error log names why a SELECT
+was not pushed (`stoolap[explain]: not pushed: <reason>`).
+
+The unit and derived handlers still forward statement text with
+rewritten table names, guarded as follows. The ci-collation guard
+recursively walks WHERE/HAVING/ORDER/GROUP, the
 SELECT list (skipping bare field refs that don't compare), every
 derived TABLE_LIST entry, and every Item_subselect (with EXISTS_SUBS
 treated specially: its SELECT-list is semantically ignored). When any
@@ -218,7 +244,7 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 
 | Feature                                        | Status |
 | ---------------------------------------------- | ------ |
-| Whole SELECT pushdown                          | Yes (subject to ci-collation guard) |
+| Whole SELECT pushdown                          | Yes (constructs with an exact stoolap translation) |
 | Derived-table pushdown                         | Yes |
 | UNION / UNION ALL pushdown                     | Yes (single-engine units) |
 | Cross-engine derived (Stoolap inside InnoDB)   | Yes |
@@ -227,7 +253,7 @@ LIMIT, falling back to the streaming cursor for early-exit plans.
 | Window functions (ROW_NUMBER, RANK, LAG, ...)  | Yes |
 | Frame clauses (`ROWS BETWEEN`)                 | Yes |
 | CTE / recursive CTE                            | Yes |
-| Subqueries: scalar / EXISTS / IN / NOT EXISTS  | Yes (ci guard recurses into derivations) |
+| Subqueries: scalar / EXISTS / IN / NOT EXISTS  | Yes |
 | Joins: INNER, LEFT, RIGHT, FULL OUTER          | Yes |
 | CROSS JOIN                                     | Yes |
 | Self-join                                      | Yes |

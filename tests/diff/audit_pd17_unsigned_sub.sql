@@ -1,4 +1,3 @@
--- known-diff-file: pushdown: BIGINT UNSIGNED underflow wraps instead of raising 1690
 CREATE TABLE t (id INT PRIMARY KEY, u BIGINT UNSIGNED) ENGINE={E};
 INSERT INTO t VALUES (1,0);
 SELECT id, u - 1 FROM t ORDER BY id;
