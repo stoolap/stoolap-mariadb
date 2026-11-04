@@ -1,0 +1,21 @@
+[package]
+name = "stoolap_mariadb"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The MariaDB plugin's native interface to the stoolap engine"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# Tracks stoolap main; Cargo.lock records the commit a build used.
+stoolap = { git = "https://github.com/stoolap/stoolap", branch = "main", default-features = false, features = ["parallel", "jemalloc"] }
+
+rustc-hash = "1.1"
+chrono = "0.4"
+serde_json = "1.0"
+
+[profile.release]
+debug = 1
