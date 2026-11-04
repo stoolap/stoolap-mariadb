@@ -2370,12 +2370,38 @@ void ha_stoolap::position(const uchar* record) {
     std::memcpy(ref, record, ref_length);
 }
 
+// Whether an exact-lookup key part must be filtered by MariaDB rather
+// than bound as an equality in stoolap's WHERE: stoolap compares bytes
+// and whole values, so it misses rows MariaDB's key matches when the part
+// covers a column prefix (a(3) binds 'abc' for 'abc1'), uses a ci
+// collation (case / accent folding) or a PAD SPACE one ('_bin': 'a' and
+// 'a ' are equal). stoolap_trust_binary_strings accepts byte semantics
+// for the collation cases. Binary strings compare bytewise in both.
+static bool key_part_needs_filter(const KEY_PART_INFO& kp, bool trust_bin) {
+    if (kp.key_part_flag & HA_PART_KEY_SEG) return true;
+    const Field* f = kp.field;
+    if (!f) return true;
+    switch (f->real_type()) {
+        case MYSQL_TYPE_VARCHAR:
+        case MYSQL_TYPE_VAR_STRING:
+        case MYSQL_TYPE_STRING:
+        case MYSQL_TYPE_TINY_BLOB:
+        case MYSQL_TYPE_BLOB:
+        case MYSQL_TYPE_MEDIUM_BLOB:
+        case MYSQL_TYPE_LONG_BLOB: {
+            const CHARSET_INFO* cs = f->charset();
+            if (!cs || cs == &my_charset_bin || trust_bin) return false;
+            return !(cs->state & MY_CS_BINSORT) || !(cs->state & MY_CS_NOPAD);
+        }
+        default:
+            return false;
+    }
+}
+
 int ha_stoolap::index_init(uint keynr, bool sorted) {
     active_index = keynr;
     index_sorted_ = sorted;
-    ci_collation_filter_active_ = false;
-    ci_collation_key_info_ = nullptr;
-    ci_collation_nparts_ = 0;
+    key_filter_active_ = false;
     // rnd_next prefers scan_buf_ over scan_; clear so a leftover buffer
     // from a prior rnd_init doesn't shadow this index stream.
     reset_scan_state();
@@ -2384,9 +2410,7 @@ int ha_stoolap::index_init(uint keynr, bool sorted) {
 
 int ha_stoolap::index_end() {
     active_index = MAX_KEY;
-    ci_collation_filter_active_ = false;
-    ci_collation_key_info_ = nullptr;
-    ci_collation_nparts_ = 0;
+    key_filter_active_ = false;
     reset_scan_state();
     return 0;
 }
@@ -2448,48 +2472,22 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     ir_params_.clear();
     ir_text_.resize(nparts);
 
-    // ci-string ref: MariaDB's ci collations case+accent fold; stoolap
-    // compares bytes. Drop the engine-side WHERE, pull all rows in index
-    // order, and ci-filter each row in index_next via Field::cmp (the
-    // real CHARSET_INFO comparator). Join ref drops the residual filter
-    // and IN-list ref re-applies the IN per value, so we can't rely on
-    // "Using where". stoolap_trust_binary_strings opts out.
-    auto field_needs_ci_fold = [](Field* f) -> bool {
-        if (!f) return false;
-        switch (f->real_type()) {
-            case MYSQL_TYPE_VARCHAR:
-            case MYSQL_TYPE_VAR_STRING:
-            case MYSQL_TYPE_STRING:
-            case MYSQL_TYPE_TINY_BLOB:
-            case MYSQL_TYPE_BLOB:
-            case MYSQL_TYPE_MEDIUM_BLOB:
-            case MYSQL_TYPE_LONG_BLOB: {
-                CHARSET_INFO* cs = f->charset();
-                return cs && !(cs->state & MY_CS_BINSORT);
-            }
-            default:
-                return false;
-        }
-    };
+    // Exact-lookup parts stoolap cannot test as MariaDB does stay out of
+    // the engine WHERE; index_next filters them (see key_part_needs_filter).
     const bool trust_bin = stoolap_thd_trust_binary_strings(ha_thd());
-    // Trigger ci fallback for ANY bound ci part: KEY(n, s) on (INT, ci
-    // VARCHAR) ref-binds both, and the bytewise predicate on `s` would
-    // miss accent-equivalent rows. index_next ci-compares every bound part.
-    bool any_ci_part = false;
-    if (!trust_bin && find_flag == HA_READ_KEY_EXACT) {
+    uint32_t filter_mask = 0;
+    if (find_flag == HA_READ_KEY_EXACT) {
         for (uint i = 0; i < nparts; ++i) {
-            if (field_needs_ci_fold(key_info.key_part[i].field)) {
-                any_ci_part = true;
-                break;
-            }
+            if (key_part_needs_filter(key_info.key_part[i], trust_bin))
+                filter_mask |= uint32_t(1) << i;
         }
     }
-    const bool ci_collation_lookup = any_ci_part;
 
     // Bind the key values; the SQL text depends only on the shape below.
     uint32_t null_mask = 0;
-    if (!ci_collation_lookup) {
+    {
         for (uint i = 0; i < nparts; ++i) {
+            if (filter_mask & (uint32_t(1) << i)) continue;
             Field* f = key_info.key_part[i].field;
             if (f->is_null()) {
                 // NULL with range op = no rows; equality uses IS NULL.
@@ -2525,20 +2523,22 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     shape.find_flag = static_cast<int>(find_flag);
     shape.nparts = nparts;
     shape.null_mask = null_mask;
-    shape.ci = ci_collation_lookup;
+    shape.filter_mask = filter_mask;
     shape.order = need_order;
     shape.cols = projection_words();
 
     if (!(shape == ir_shape_)) {
         std::string sql = "SELECT " + build_scan_columns() + " FROM ";
         sql += quote_ident(stoolap_table_);
-        if (!ci_collation_lookup) {
-            // ci lookups: index_next does the work, no engine WHERE.
-            sql += " WHERE ";
+        {
+            // Filtered parts are left to index_next.
             int next_param = 1;
+            bool first = true;
             for (uint i = 0; i < nparts; ++i) {
+                if (filter_mask & (uint32_t(1) << i)) continue;
                 Field* f = key_info.key_part[i].field;
-                if (i) sql += " AND ";
+                sql += first ? " WHERE " : " AND ";
+                first = false;
                 sql += quote_ident(
                     std::string_view(f->field_name.str, f->field_name.length));
                 if (null_mask & (uint32_t(1) << i)) {
@@ -2579,47 +2579,27 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     }
     scan_.reset(rows);
 
-    if (ci_collation_lookup) {
-        // Search-key bytes are in table->record[1] from key_restore.
-        // index_next will Field::cmp every bound part per row.
-        ci_collation_filter_active_ = true;
-        ci_collation_key_info_ = &key_info;
-        ci_collation_nparts_ = nparts;
+    if (filter_mask) {
+        key_filter_active_ = true;
+        key_filter_key_ = &key_info;
+        key_filter_buf_.assign(key, key + klen);
     }
     int next_rc = index_next(buf);
     return (next_rc == HA_ERR_END_OF_FILE) ? HA_ERR_KEY_NOT_FOUND : next_rc;
 }
 
 int ha_stoolap::index_next(uchar* buf) {
-    if (!ci_collation_filter_active_) return rnd_next(buf);
-    const KEY* ki = ci_collation_key_info_;
-    const uint np = ci_collation_nparts_;
-    if (!ki || np == 0) {
-        return rnd_next(buf);
-    }
+    if (!key_filter_active_ || !key_filter_key_) return rnd_next(buf);
+    // key_cmp() reads the fields at record[0]; point them at buf.
+    const my_ptrdiff_t off = static_cast<my_ptrdiff_t>(buf - table->record[0]);
     while (true) {
         int r = rnd_next(buf);
         if (r != 0) return r;
-        // Every bound key part must ci-equal the search key. Each
-        // Field::cmp dispatches to that field's collation: ci VARCHAR
-        // uses utf8mb4_general_ci's strnncollsp (case + accent fold),
-        // INT/BIGINT/DATETIME/etc. use byte-equality. Bail on the
-        // first mismatch so composite indexes like KEY(s, n) reject
-        // rows where `n` differs even when `s` ci-matches.
-        bool all_match = true;
-        for (uint i = 0; i < np; ++i) {
-            Field* f = ki->key_part[i].field;
-            if (!f) {
-                all_match = false;
-                break;
-            }
-            const my_ptrdiff_t off = f->ptr - table->record[0];
-            if (f->cmp(table->record[1] + off) != 0) {
-                all_match = false;
-                break;
-            }
-        }
-        if (all_match) return 0;
+        if (off) move_fields(table, off);
+        const int c = key_cmp(key_filter_key_->key_part, key_filter_buf_.data(),
+                              static_cast<uint>(key_filter_buf_.size()));
+        if (off) move_fields(table, -off);
+        if (c == 0) return 0;
     }
 }
 
