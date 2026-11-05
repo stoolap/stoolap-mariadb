@@ -145,6 +145,12 @@ INSERT INTO sp VALUES (1);
                 f"CREATE TABLE sx (x$FOREIGN INT) ENGINE={h.engine}")
     h.assert_ok("a table named foreign is not a clause",
                 f"CREATE TABLE {h.db}.foreign (id INT) ENGINE={h.engine}")
+    # MariaDB's lexer skips comments between tokens (this connector sends
+    # them; the mariadb client strips them).
+    h.cur.execute("CREATE TABLE sk (pid INT, FOREIGN /* a */ KEY (pid) -- b\n "
+                  f"REFERENCES sp (id)) ENGINE={h.engine}")
+    h.assert_err("an FK with comments between its tokens is enforced",
+                 "INSERT INTO sk VALUES (99)", r"foreign key constraint fails")
     h.assert_ok("a comment naming FOREIGN KEY is not a clause",
                 "CREATE TABLE sm (pid INT /* FOREIGN KEY later */, "
                 f"x INT) ENGINE={h.engine}")

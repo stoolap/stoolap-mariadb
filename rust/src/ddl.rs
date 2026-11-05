@@ -188,9 +188,42 @@ fn is_word(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
+/// The comment at `p` and its end, as MariaDB's lexer skips them between
+/// tokens: /* ... */ (not /*! ... */ or /*M! ... */, whose text it runs),
+/// # and -- to the end of the line
+fn comment_end(s: &[u8], p: usize) -> Option<usize> {
+    let rest = &s[p..];
+    if rest.starts_with(b"/*") && !rest.starts_with(b"/*!") && !rest.starts_with(b"/*M!") {
+        return Some(
+            s[p + 2..]
+                .windows(2)
+                .position(|w| w == b"*/")
+                .map_or(s.len(), |at| p + 2 + at + 2),
+        );
+    }
+    if rest.starts_with(b"#")
+        || (rest.starts_with(b"--") && rest.get(2).is_none_or(|c| c.is_ascii_whitespace()))
+    {
+        return Some(
+            s[p..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(s.len(), |at| p + at + 1),
+        );
+    }
+    None
+}
+
+/// Past the white space and comments at `p`
 fn skip_ws(s: &[u8], mut p: usize) -> usize {
-    while p < s.len() && s[p].is_ascii_whitespace() {
-        p += 1;
+    while p < s.len() {
+        if s[p].is_ascii_whitespace() {
+            p += 1;
+        } else if let Some(end) = comment_end(s, p) {
+            p = end;
+        } else {
+            break;
+        }
     }
     p
 }
@@ -336,10 +369,15 @@ fn foreign_key(
             while end > action && s[end - 1].is_ascii_whitespace() {
                 end -= 1;
             }
+            // Rebuilt from its words: a comment between them stays out of
+            // stoolap's SQL
             if !actions.is_empty() {
                 actions.push(b' ');
             }
-            actions.extend_from_slice(&s[p..end]);
+            actions.extend_from_slice(b"ON ");
+            actions.extend_from_slice(&s[kw..after_event]);
+            actions.push(b' ');
+            actions.extend_from_slice(&s[action..end]);
             p = skip_ws(s, end);
         }
         Some((child, parent_db, parent_table, parent_columns, actions, p))
@@ -434,23 +472,8 @@ fn foreign_key(
 fn foreign_keys(s: &[u8], db: &str, table: &str, out: &mut String) -> Result<()> {
     let mut i = 0;
     while i < s.len() {
-        let rest = &s[i..];
-        // Comments, except /*! ... */ and /*M! ... */, whose text MariaDB
-        // runs
-        if rest.starts_with(b"/*") && !rest.starts_with(b"/*!") && !rest.starts_with(b"/*M!") {
-            i = s[i + 2..]
-                .windows(2)
-                .position(|w| w == b"*/")
-                .map_or(s.len(), |at| i + 2 + at + 2);
-            continue;
-        }
-        if rest.starts_with(b"#")
-            || (rest.starts_with(b"--") && rest.get(2).is_none_or(|c| c.is_ascii_whitespace()))
-        {
-            i = s[i..]
-                .iter()
-                .position(|&c| c == b'\n')
-                .map_or(s.len(), |at| i + at + 1);
+        if let Some(end) = comment_end(s, i) {
+            i = end;
             continue;
         }
         match s[i] {
@@ -555,6 +578,15 @@ mod tests {
         ] {
             assert_eq!(fks(sql, "d_1c").unwrap(), "", "{sql}");
         }
+        // Comments between the tokens of a clause, as MariaDB's lexer skips them
+        assert_eq!(
+            fks(
+                "CREATE TABLE c (pid INT, FOREIGN /* a */ KEY # b\n (pid) -- c\n REFERENCES /*d*/ p (id) ON /* e */ DELETE CASCADE)",
+                "d_1c"
+            )
+            .unwrap(),
+            ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id) ON DELETE CASCADE"
+        );
         // So is the current database's
         let mut out = String::new();
         assert!(foreign_keys(
