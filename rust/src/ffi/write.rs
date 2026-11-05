@@ -6,11 +6,13 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-//! Direct write FFI. Each call writes in the open transaction, or else in
-//! the statement's own (see `stoolap_end_statement`), and returns
-//! `STOOLAP_FALLBACK` for a table a foreign key names: the caller writes
-//! those through SQL, where stoolap's executor checks the keys.
+//! Write FFI: rows read straight from the plugin's record buffers. Each
+//! call writes in the open transaction, or else in the statement's own (see
+//! `stoolap_end_statement`). A table a foreign key names is written through
+//! SQL instead (`crate::sql_write`), where stoolap's executor checks the
+//! keys, as is a row named by its primary key rather than its row id.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::panic;
@@ -22,34 +24,43 @@ use super::read::table_name;
 use super::types::StoolapDB;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 use crate::record::{read_value, read_values, same_in, EncodeFn, RecordIn, StoolapField};
-use crate::write;
+use crate::session::Session;
+use crate::{sql_write, write};
 
-pub const STOOLAP_FALLBACK: i32 = 2;
-
-/// Runs `f` on `table`'s write handle, storing the count in `affected`
-unsafe fn on_write_table(
+/// Runs `direct` on `table`'s write handle, or `sql` when a foreign key
+/// names the table or the row is named `by_key`, storing the count in
+/// `affected`
+unsafe fn write_through(
     db: *mut StoolapDB,
     table: *const c_char,
     affected: *mut i64,
     what: &str,
-    f: impl FnOnce(&mut dyn Table) -> Result<i64>,
+    by_key: bool,
+    direct: impl FnOnce(&mut dyn Table) -> Result<i64>,
+    sql: impl FnOnce(&Session, &str) -> Result<i64>,
 ) -> i32 {
     let Some(handle) = db.as_mut() else {
         return STOOLAP_ERROR;
     };
     handle.last_error = None;
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| -> Result<i64> {
         let name = table_name(table)?;
-        handle.session.with_write_table(name, f)
+        let session = &handle.session;
+        if by_key {
+            return sql(session, name);
+        }
+        match session.with_write_table(name, direct)? {
+            Some(n) => Ok(n),
+            None => sql(session, name),
+        }
     }));
     match result {
-        Ok(Ok(Some(n))) => {
+        Ok(Ok(n)) => {
             if !affected.is_null() {
                 *affected = n;
             }
             STOOLAP_OK
         }
-        Ok(Ok(None)) => STOOLAP_FALLBACK,
         Ok(Err(e)) => {
             handle.set_error(&e.to_string());
             STOOLAP_ERROR
@@ -59,24 +70,6 @@ unsafe fn on_write_table(
             STOOLAP_ERROR
         }
     }
-}
-
-/// Deletes row `row_id`; `affected` gets 0 when the row is gone.
-///
-/// # Safety
-///
-/// `db` must be a valid `StoolapDB`, `table` a NUL-terminated UTF-8
-/// string. `affected` may be NULL.
-#[no_mangle]
-pub unsafe extern "C" fn stoolap_delete_row(
-    db: *mut StoolapDB,
-    table: *const c_char,
-    row_id: i64,
-    affected: *mut i64,
-) -> i32 {
-    on_write_table(db, table, affected, "stoolap_delete_row", |t| {
-        write::delete(t, row_id)
-    })
 }
 
 unsafe fn field_slice<'a>(fields: *const StoolapField, n: i32) -> Result<&'a [StoolapField]> {
@@ -103,8 +96,31 @@ unsafe fn row_values(fields: &[StoolapField], src: &RecordIn) -> Result<Vec<Valu
     read_values(fields, src)
 }
 
-/// 1 when a foreign key names `table`, whose writes return
-/// `STOOLAP_FALLBACK`; 0 when they go direct; `STOOLAP_ERROR` on error.
+/// `fields`' column names and their values in `src`
+unsafe fn named(
+    session: &Session,
+    table: &str,
+    fields: &[StoolapField],
+    src: &RecordIn,
+) -> Result<Vec<(String, Value)>> {
+    let names = session.column_names(table)?;
+    fields
+        .iter()
+        .map(|f| {
+            let name = names
+                .get(f.column as usize)
+                .ok_or_else(|| Error::internal("column out of range"))?;
+            Ok((name.clone(), read_value(f, src)?))
+        })
+        .collect()
+}
+
+fn columns(table_columns: i32) -> Result<usize> {
+    usize::try_from(table_columns).map_err(|_| Error::internal("bad column count"))
+}
+
+/// 1 when a foreign key names `table` (as child or parent), so its writes
+/// go through SQL; 0 when they go direct; `STOOLAP_ERROR` on error.
 ///
 /// # Safety
 ///
@@ -139,8 +155,9 @@ pub unsafe extern "C" fn stoolap_writes_through_sql(
 ///
 /// # Safety
 ///
-/// As `stoolap_delete_row`; `fields` holds `nfields` entries and `record`
-/// must be a record buffer of the layout they describe.
+/// `db` must be a valid `StoolapDB`, `table` a NUL-terminated UTF-8
+/// string, `fields` hold `nfields` entries and `record` be a record buffer
+/// of the layout they describe. `affected` may be NULL.
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_insert_record(
     db: *mut StoolapDB,
@@ -153,17 +170,26 @@ pub unsafe extern "C" fn stoolap_insert_record(
     ctx: *mut c_void,
     affected: *mut i64,
 ) -> i32 {
-    on_write_table(db, table, affected, "stoolap_insert_record", |t| {
-        let cols =
-            usize::try_from(table_columns).map_err(|_| Error::internal("bad column count"))?;
-        let src = RecordIn {
-            record,
-            encode,
-            ctx,
-        };
-        let row = row_values(field_slice(fields, nfields)?, &src)?;
-        write::insert(t, cols, vec![row])
-    })
+    let src = RecordIn {
+        record,
+        encode,
+        ctx,
+    };
+    write_through(
+        db,
+        table,
+        affected,
+        "stoolap_insert_record",
+        false,
+        |t| {
+            let row = row_values(field_slice(fields, nfields)?, &src)?;
+            write::insert(t, columns(table_columns)?, vec![row])
+        },
+        |session, name| {
+            let row = row_values(field_slice(fields, nfields)?, &src)?;
+            sql_write::insert(session, name, vec![row])
+        },
+    )
 }
 
 /// Rows a bulk insert holds until it writes them
@@ -255,11 +281,12 @@ pub unsafe extern "C" fn stoolap_row_buffer_errmsg(
 }
 
 /// Inserts the rows `buffer` holds, which it gives up (the buffer is left
-/// empty whatever the outcome).
+/// empty whatever the outcome). Through SQL, rows outside an open
+/// transaction go in one of their own.
 ///
 /// # Safety
 ///
-/// As `stoolap_delete_row`; `buffer` must be a valid `StoolapRowBuffer`.
+/// As `stoolap_insert_record`; `buffer` must be a valid `StoolapRowBuffer`.
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_insert_buffer(
     db: *mut StoolapDB,
@@ -269,31 +296,39 @@ pub unsafe extern "C" fn stoolap_insert_buffer(
     affected: *mut i64,
 ) -> i32 {
     let rows = match buffer.as_mut() {
-        Some(buf) => std::mem::take(&mut buf.rows),
+        Some(buf) => Cell::new(std::mem::take(&mut buf.rows)),
         None => return STOOLAP_ERROR,
     };
-    on_write_table(db, table, affected, "stoolap_insert_buffer", |t| {
-        let cols =
-            usize::try_from(table_columns).map_err(|_| Error::internal("bad column count"))?;
-        write::insert(t, cols, rows)
-    })
+    write_through(
+        db,
+        table,
+        affected,
+        "stoolap_insert_buffer",
+        false,
+        |t| write::insert(t, columns(table_columns)?, rows.take()),
+        |session, name| sql_write::insert(session, name, rows.take()),
+    )
 }
 
-/// Sets row `row_id` from `new_record` where `fields` (the columns the
-/// statement writes) differ from `old_record`; `affected` gets 1 when
-/// nothing differs, 0 when the row is gone.
+/// Sets the row from `new_record` where `fields` (the columns the
+/// statement writes) differ from `old_record`: row `row_id` when
+/// `has_row_id`, else the row the primary key `keys` holds in `old_record`
+/// names. `affected` gets 1 when nothing differs, 0 when the row is gone.
 ///
 /// # Safety
 ///
-/// As `stoolap_insert_record`, for both records.
+/// As `stoolap_insert_record`, for both records; `keys` holds `nkeys`.
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_update_record(
     db: *mut StoolapDB,
     table: *const c_char,
     table_columns: i32,
     row_id: i64,
+    has_row_id: i32,
     fields: *const StoolapField,
     nfields: i32,
+    keys: *const StoolapField,
+    nkeys: i32,
     old_record: *const u8,
     new_record: *const u8,
     encode: Option<EncodeFn>,
@@ -314,20 +349,69 @@ pub unsafe extern "C" fn stoolap_update_record(
         }
         return STOOLAP_OK;
     }
-    on_write_table(db, table, affected, "stoolap_update_record", |t| {
-        let cols =
-            usize::try_from(table_columns).map_err(|_| Error::internal("bad column count"))?;
-        let src = RecordIn {
-            record: new_record,
-            encode,
-            ctx,
-        };
-        let mut columns = Vec::with_capacity(changed.len());
-        let mut values = Vec::with_capacity(changed.len());
-        for f in &changed {
-            columns.push(f.column as usize);
-            values.push(read_value(f, &src)?);
-        }
-        write::update(t, cols, row_id, &columns, values)
-    })
+    let new = RecordIn {
+        record: new_record,
+        encode,
+        ctx,
+    };
+    let old = RecordIn {
+        record: old_record,
+        encode,
+        ctx,
+    };
+    write_through(
+        db,
+        table,
+        affected,
+        "stoolap_update_record",
+        has_row_id == 0,
+        |t| {
+            let set: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
+            let values = read_values(&changed, &new)?;
+            write::update(t, columns(table_columns)?, row_id, &set, values)
+        },
+        |session, name| {
+            let set = named(session, name, &changed, &new)?;
+            let key = named(session, name, field_slice(keys, nkeys)?, &old)?;
+            sql_write::update(session, name, set, key)
+        },
+    )
+}
+
+/// Deletes row `row_id` when `has_row_id`, else the row the primary key
+/// `keys` holds in `record` names; `affected` gets 0 when it is gone.
+///
+/// # Safety
+///
+/// As `stoolap_insert_record`; `keys` holds `nkeys`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_delete_record(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    row_id: i64,
+    has_row_id: i32,
+    keys: *const StoolapField,
+    nkeys: i32,
+    record: *const u8,
+    encode: Option<EncodeFn>,
+    ctx: *mut c_void,
+    affected: *mut i64,
+) -> i32 {
+    let src = RecordIn {
+        record,
+        encode,
+        ctx,
+    };
+    write_through(
+        db,
+        table,
+        affected,
+        "stoolap_delete_record",
+        has_row_id == 0,
+        |t| write::delete(t, row_id),
+        |session, name| {
+            let key = named(session, name, field_slice(keys, nkeys)?, &src)?;
+            sql_write::delete(session, name, key)
+        },
+    )
 }

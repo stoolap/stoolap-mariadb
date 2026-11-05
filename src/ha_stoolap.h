@@ -17,7 +17,6 @@
 
 #include "stoolap_bridge.h"
 
-#include <deque>
 #include <string>
 #include <vector>
 
@@ -67,9 +66,7 @@ public:
     int pre_direct_delete_rows_init() override;
     int pre_direct_delete_rows() override;
 
-    // Bulk INSERT: accumulate write_row params into one batch, inserted
-    // directly in one call (stoolap_stmt_exec_batch for a table a foreign
-    // key names).
+    // Bulk INSERT: the rows wait in Rust and go in with one call.
     void start_bulk_insert(ha_rows rows, uint flags) override;
     int end_bulk_insert() override;
     // Eager flush at kBulkFlushRows threshold; bulk_active_ stays true.
@@ -164,8 +161,6 @@ private:
     // write.
     int64_t cur_row_id_ = 0;
     bool cur_row_id_valid_ = false;
-    // Direct writes; -1 for a table a foreign key names (write via SQL).
-    int update_row_direct(const uchar* old_data, const uchar* new_data);
     int write_error(StoolapDB* db, const char* what);
     StoolapDB* direct_write_db();
     bool key_row_id(const uchar* record, int64_t* id);
@@ -226,34 +221,28 @@ private:
     std::vector<int32_t> ir_order_;
     std::vector<std::string> ir_text_;
 
-    // INSERT SQL template; stoolap's semantic cache hashes it.
-    std::string insert_sql_;
-
-    // Bulk-INSERT prepared stmt: cached because the batch ABI needs a
-    // stmt handle, not because stoolap's cache wouldn't reuse the SQL.
-    stoolap_mariadb::StmtPtr bulk_insert_stmt_;
-
+    // A bulk insert's rows wait in Rust (row_buffer_, bulk_rows_ of them)
+    // until a flush writes them.
     bool bulk_active_ = false;
-    // True when the chunk-flush path opened the outer tx (autocommit
-    // bulk INSERT); flush_bulk_buffer rolls back on failure.
-    bool bulk_owns_tx_ = false;
-    std::vector<StoolapValue> bulk_params_;
-    // deque, not vector: bulk_params_[i].text.ptr points into the i-th
-    // holder; vector realloc would dangle short-string pointers.
-    std::deque<std::string> bulk_text_holders_;
-    // A table no foreign key names: the bulk rows wait in Rust
-    // (row_buffer_, bulk_rows_ of them) and go in with one direct insert.
-    bool bulk_direct_ = false;
     stoolap_mariadb::RowBufferPtr row_buffer_;
     int64_t bulk_rows_ = 0;
+    // A foreign key names the table: its chunked flushes in autocommit
+    // mode share one transaction the chunk-flush path opens
+    // (bulk_owns_tx_), which a failure rolls back.
+    bool bulk_fk_ = false;
+    bool bulk_owns_tx_ = false;
 
-    // Direct writes read the record by these: every field (inserts), and
-    // the fields write_set names (updates), rebuilt when it changes.
+    // Writes read the record by these: every field (inserts), the fields
+    // write_set names (updates, rebuilt when it changes), and the PRIMARY
+    // KEY parts (a row a write has no row id for).
     std::vector<StoolapField> write_fields_;
     std::vector<StoolapField> update_fields_;
     std::vector<uint32_t> update_words_;
+    std::vector<StoolapField> key_fields_;
+    bool key_fields_built_ = false;
     const std::vector<StoolapField>& insert_fields();
     const std::vector<StoolapField>& refresh_update_fields();
+    const std::vector<StoolapField>& key_fields();
 
     // Approximate row-count cache (HA_STATS_RECORDS_IS_EXACT isn't set).
     // Invalidated by local writes; cross-connection writes leave it

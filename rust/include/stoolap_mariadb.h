@@ -43,7 +43,6 @@ extern "C" {
 typedef struct StoolapDB     StoolapDB;
 
 /** Prepared statement handle. */
-typedef struct StoolapStmt   StoolapStmt;
 
 /** Transaction handle. */
 typedef struct StoolapTx     StoolapTx;
@@ -128,7 +127,7 @@ const char* stoolap_version(void);
  * transactions) but has its own executor and error state.
  *
  * StoolapRows and StoolapTx handles must remain on the thread that created
- * them. StoolapStmt handles must not be used concurrently.
+ * them.
  *
  * Recommended pattern:
  *   StoolapDB* db;
@@ -230,48 +229,6 @@ int32_t stoolap_exec_params(
 int32_t stoolap_query(StoolapDB* db, const char* sql, StoolapRows** out_rows);
 
 /* =========================================================================
- * Prepared statements
- * ========================================================================= */
-
-/**
- * Prepare a SQL statement for repeated execution.
- * On success, *out_stmt must be finalized with stoolap_stmt_finalize().
- *
- * The statement keeps the underlying database engine alive even if the
- * originating StoolapDB handle is closed before the statement is finalized.
- */
-int32_t stoolap_prepare(StoolapDB* db, const char* sql, StoolapStmt** out_stmt);
-
-/**
- * Execute a prepared statement as a batch inside a single transaction.
- *
- * @param db             Database handle (used to begin the transaction).
- * @param stmt           Prepared statement to execute for each row.
- * @param params         Flat row-major array of row_count * params_per_row values.
- * @param params_per_row Number of parameters per row.
- * @param row_count      Number of rows to execute.
- * @param total_affected On success, receives the total rows affected.
- * @return STOOLAP_OK on success. On error the transaction is rolled back.
- */
-int32_t stoolap_stmt_exec_batch(
-    StoolapDB* db,
-    const StoolapStmt* stmt,
-    const StoolapValue* params,
-    int32_t params_per_row,
-    int32_t row_count,
-    int64_t* total_affected
-);
-
-/**
- * Finalize (destroy) a prepared statement and free resources.
- * Safe to call with NULL (no-op).
- */
-void stoolap_stmt_finalize(StoolapStmt* stmt);
-
-/** Get the last error message for a statement handle. */
-const char* stoolap_stmt_errmsg(const StoolapStmt* stmt);
-
-/* =========================================================================
  * Transactions
  * ========================================================================= */
 
@@ -299,26 +256,6 @@ int32_t stoolap_tx_exec_params(
 
 /** Query within a transaction (no parameters). */
 int32_t stoolap_tx_query(StoolapTx* tx, const char* sql, StoolapRows** out_rows);
-
-/**
- * Execute a prepared statement within a transaction (with parameters).
- *
- * Combines parse-once performance with transaction atomicity.
- * The statement must have been created via stoolap_prepare().
- *
- * @param tx             Transaction handle.
- * @param stmt           Prepared statement handle (not consumed).
- * @param params         Array of parameter values. May be NULL if params_len is 0.
- * @param params_len     Number of parameters.
- * @param rows_affected  If non-NULL, receives the number of affected rows.
- */
-int32_t stoolap_tx_stmt_exec(
-    StoolapTx* tx,
-    const StoolapStmt* stmt,
-    const StoolapValue* params,
-    int32_t params_len,
-    int64_t* rows_affected
-);
 
 /**
  * Commit a transaction.
@@ -410,12 +347,12 @@ typedef struct StoolapField {
 } StoolapField;
 
 /**
- * Encodes field `field` of the record a write reads into `out`, for the
- * kinds StoolapField does not read itself; returns 0, else the write
- * fails. Text `out` points to must stay valid until the next call.
+ * Encodes field `field` of `record` into `out`, for the kinds StoolapField
+ * does not read itself; returns 0, else the write fails. Text `out` points
+ * to must stay valid until the next call.
  */
 typedef int32_t (*StoolapEncodeFn)(void* ctx, int32_t field,
-                                   StoolapValue* out);
+                                   const uint8_t* record, StoolapValue* out);
 
 /**
  * Stores one value, `cell` (one cell of the packed format below), in
@@ -505,14 +442,9 @@ void stoolap_cursor_end(StoolapCursor* cursor);
 int32_t stoolap_end_statement(StoolapDB* db, int32_t commit);
 
 /**
- * Returned by a direct write on a table a foreign key names, as child or
- * parent: write it through SQL instead, where stoolap checks the keys.
- */
-#define STOOLAP_FALLBACK 2
-
-/**
- * 1 when a foreign key names `table` (as child or parent), so its direct
- * writes return STOOLAP_FALLBACK; 0 when they go direct; STOOLAP_ERROR.
+ * 1 when a foreign key names `table` (as child or parent), so its writes
+ * go through SQL, where stoolap checks the keys; 0 when they go direct;
+ * STOOLAP_ERROR.
  */
 int32_t stoolap_writes_through_sql(StoolapDB* db, const char* table);
 
@@ -554,7 +486,8 @@ const char* stoolap_row_buffer_errmsg(const StoolapRowBuffer* buffer);
 
 /**
  * Insert the rows `buffer` holds, which it gives up: it is empty after,
- * whatever the outcome.
+ * whatever the outcome. Through SQL, rows outside an open transaction go
+ * in one of their own.
  */
 int32_t stoolap_insert_buffer(
     StoolapDB* db,
@@ -565,27 +498,35 @@ int32_t stoolap_insert_buffer(
 );
 
 /**
- * Set row `row_id` from `new_record` where `fields` (the columns the
- * statement writes) differ from `old_record`. 1 affected when nothing
- * differs, 0 when the row is gone.
+ * Set the row from `new_record` where `fields` (the columns the statement
+ * writes) differ from `old_record`: row `row_id` when `has_row_id`, else
+ * the row the primary key `keys` holds in `old_record` names. 1 affected
+ * when nothing differs, 0 when the row is gone.
  */
 int32_t stoolap_update_record(
     StoolapDB* db,
     const char* table,
     int32_t table_columns,
-    int64_t row_id,
+    int64_t row_id, int32_t has_row_id,
     const StoolapField* fields, int32_t nfields,
+    const StoolapField* keys, int32_t nkeys,
     const uint8_t* old_record,
     const uint8_t* new_record,
     StoolapEncodeFn encode, void* ctx,
     int64_t* rows_affected
 );
 
-/** Delete row `row_id`; 0 affected when it is gone. */
-int32_t stoolap_delete_row(
+/**
+ * Delete row `row_id` when `has_row_id`, else the row the primary key
+ * `keys` holds in `record` names; 0 affected when it is gone.
+ */
+int32_t stoolap_delete_record(
     StoolapDB* db,
     const char* table,
-    int64_t row_id,
+    int64_t row_id, int32_t has_row_id,
+    const StoolapField* keys, int32_t nkeys,
+    const uint8_t* record,
+    StoolapEncodeFn encode, void* ctx,
     int64_t* rows_affected
 );
 

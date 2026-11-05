@@ -58,10 +58,14 @@ pub struct StoolapField {
 pub type StoreFn =
     unsafe extern "C" fn(ctx: *mut c_void, field: i32, cell: *const u8, len: usize) -> i32;
 
-/// Encodes field `field` of the record the write reads into `out`; 0 on
-/// success, else the write fails
-pub type EncodeFn =
-    unsafe extern "C" fn(ctx: *mut c_void, field: i32, out: *mut StoolapValue) -> i32;
+/// Encodes field `field` of `record` into `out`; 0 on success, else the
+/// write fails
+pub type EncodeFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    field: i32,
+    record: *const u8,
+    out: *mut StoolapValue,
+) -> i32;
 
 /// The record a write reads, and the callback for the kinds read elsewhere
 pub struct RecordIn {
@@ -252,7 +256,7 @@ pub unsafe fn read_value(f: &StoolapField, src: &RecordIn) -> Result<Value> {
         .encode
         .ok_or_else(|| Error::internal("a field needs an encode callback"))?;
     let mut out: StoolapValue = std::mem::zeroed();
-    let rc = encode(src.ctx, f.field, &mut out);
+    let rc = encode(src.ctx, f.field, src.record, &mut out);
     if rc != 0 {
         return Err(Error::internal(format!(
             "encoding field {} failed ({})",

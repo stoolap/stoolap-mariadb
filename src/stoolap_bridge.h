@@ -38,11 +38,6 @@ struct RowsDeleter {
         if (p) stoolap_rows_close(p);
     }
 };
-struct StmtDeleter {
-    void operator()(StoolapStmt* p) const noexcept {
-        if (p) stoolap_stmt_finalize(p);
-    }
-};
 
 struct CursorDeleter {
     void operator()(StoolapCursor* p) const noexcept {
@@ -53,7 +48,6 @@ struct CursorDeleter {
 using DbPtr = std::unique_ptr<StoolapDB, DbDeleter>;
 using TxPtr = std::unique_ptr<StoolapTx, TxDeleter>;
 using RowsPtr = std::unique_ptr<StoolapRows, RowsDeleter>;
-using StmtPtr = std::unique_ptr<StoolapStmt, StmtDeleter>;
 using CursorPtr = std::unique_ptr<StoolapCursor, CursorDeleter>;
 
 struct RowBufferDeleter {

@@ -23,7 +23,6 @@ mod database;
 mod error;
 mod read;
 pub(crate) mod rows;
-mod statement;
 mod transaction;
 pub(crate) mod types;
 pub(crate) mod value;
@@ -33,10 +32,9 @@ mod write;
 pub use database::*;
 pub use read::*;
 pub use rows::*;
-pub use statement::*;
 pub use transaction::*;
 pub use types::{
-    StoolapBlobData, StoolapDB, StoolapRows, StoolapStmt, StoolapTextData, StoolapTx, StoolapValue,
+    StoolapBlobData, StoolapDB, StoolapRows, StoolapTextData, StoolapTx, StoolapValue,
     StoolapValueData,
 };
 pub use write::*;

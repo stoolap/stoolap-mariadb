@@ -58,15 +58,6 @@ int ThdContext::rollback() {
     return rc;
 }
 
-StoolapStmt* ThdContext::bulk_stmt_get(const std::string& sql) {
-    auto it = bulk_stmt_cache_.find(sql);
-    return it == bulk_stmt_cache_.end() ? nullptr : it->second.get();
-}
-
-void ThdContext::bulk_stmt_put(std::string sql, StmtPtr stmt) {
-    bulk_stmt_cache_.emplace(std::move(sql), std::move(stmt));
-}
-
 void ThdContext::note_records_dirty(const std::string& table) {
     if (!table.empty()) dirty_record_tables_.insert(table);
 }

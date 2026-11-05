@@ -24,7 +24,7 @@ use std::sync::Arc;
 use stoolap::core::types::IsolationLevel;
 use stoolap::core::{Error, Result};
 
-use super::types::{StoolapDB, StoolapRows, StoolapStmt, StoolapTx, StoolapValue};
+use super::types::{StoolapDB, StoolapRows, StoolapTx, StoolapValue};
 use super::value;
 use super::{
     STOOLAP_ERROR, STOOLAP_ISOLATION_READ_COMMITTED, STOOLAP_ISOLATION_SNAPSHOT, STOOLAP_OK,
@@ -252,38 +252,6 @@ pub unsafe extern "C" fn stoolap_tx_commit(tx: *mut StoolapTx) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_tx_rollback(tx: *mut StoolapTx) -> i32 {
     end_tx(tx, Session::rollback)
-}
-
-/// Execute a prepared statement within a transaction (with parameters).
-///
-/// # Safety
-///
-/// - `tx` must be a valid `StoolapTx` pointer.
-/// - `stmt` must be a valid `StoolapStmt` pointer.
-/// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL).
-/// - `rows_affected` may be NULL.
-#[no_mangle]
-pub unsafe extern "C" fn stoolap_tx_stmt_exec(
-    tx: *mut StoolapTx,
-    stmt: *const StoolapStmt,
-    params: *const StoolapValue,
-    params_len: i32,
-    rows_affected: *mut i64,
-) -> i32 {
-    let Some(stmt_handle) = stmt.as_ref() else {
-        if let Some(h) = tx.as_mut() {
-            h.set_error("statement handle is NULL");
-        }
-        return STOOLAP_ERROR;
-    };
-    on_tx(tx, "stoolap_tx_stmt_exec", |session| {
-        let p = value::params_to_vec(params, params_len)?;
-        let affected = session.run_plan(&stmt_handle.plan, p)?.rows_affected();
-        if !rows_affected.is_null() {
-            *rows_affected = affected;
-        }
-        Ok(())
-    })
 }
 
 /// Get the last error message for a transaction handle.
