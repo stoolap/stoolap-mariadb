@@ -28,7 +28,7 @@ SELECT STRAIGHT_JOIN r.id, r.bu, r.iu, r.v FROM k JOIN r ON r.id = k.id ORDER BY
 
 -- The same rows through pushdown: the whole SELECT, expressions whose
 -- result fields MariaDB types itself, and a derived table joined to
--- InnoDB.
+-- InnoDB. case_06_pushdown checks that these three push.
 SELECT * FROM r ORDER BY id;
-SELECT id, t + 1, iu * 2, b DIV 2, f * 2, d / 2, CONCAT(v, id), LENGTH(v), bo AND 1 FROM r ORDER BY id;
+SELECT id, t + 1, i - 1, -m, f * 2, d / 2, CONCAT(v, 'x'), CHAR_LENGTH(v) FROM r ORDER BY id;
 SELECT STRAIGHT_JOIN k.id, x.t, x.bu, x.d, x.v FROM k JOIN (SELECT id, t, bu, d, v FROM r WHERE id > 0) x ON x.id = k.id ORDER BY k.id;
