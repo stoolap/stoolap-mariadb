@@ -336,7 +336,8 @@ pub unsafe extern "C" fn stoolap_cursor_fetch(
     finish_fetch(handle, result, out_buf, out_len, "stoolap_cursor_fetch")
 }
 
-/// Ends the cursor's read, if one is open, keeping the cursor for the next
+/// Ends the cursor's read, if one is open, keeping the cursor for the
+/// next; the last chunk is gone, and its buffer too when it grew large
 ///
 /// # Safety
 ///
@@ -345,6 +346,7 @@ pub unsafe extern "C" fn stoolap_cursor_fetch(
 pub unsafe extern "C" fn stoolap_cursor_end(cursor: *mut StoolapCursor) {
     if let Some(c) = cursor.as_mut() {
         c.cursor = None;
+        reset_packed(&mut c.packed);
     }
 }
 

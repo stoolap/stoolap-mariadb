@@ -2271,7 +2271,7 @@ int ha_stoolap::load_chunk(int rc, const uint8_t* buf, int64_t len) {
 }
 
 int ha_stoolap::rnd_end() {
-    reset_scan_state();
+    release_read();
     return 0;
 }
 
@@ -2435,7 +2435,7 @@ int ha_stoolap::index_init(uint keynr, bool sorted) {
 int ha_stoolap::index_end() {
     active_index = MAX_KEY;
     key_filter_active_ = false;
-    reset_scan_state();
+    release_read();
     return 0;
 }
 

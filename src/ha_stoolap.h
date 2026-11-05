@@ -150,6 +150,12 @@ private:
         if (reading_) stoolap_cursor_end(cursor_.get());
         reading_ = false;
     }
+    // At the end of a scan: also lets go of a buffer a large chunk grew,
+    // which a handler cached with its TABLE would keep otherwise.
+    void release_read() {
+        reset_scan_state();
+        if (cursor_) stoolap_cursor_end(cursor_.get());
+    }
     int open_read(const StoolapCond* conds, int32_t nconds,
                   const int32_t* order, int32_t norder, bool desc,
                   uint32_t first_chunk = 0);

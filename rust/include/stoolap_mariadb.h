@@ -423,7 +423,10 @@ int32_t stoolap_cursor_fetch(
 
 const char* stoolap_cursor_errmsg(const StoolapCursor* cursor);
 
-/** End the cursor's read, if one is open; the cursor stays. */
+/**
+ * End the cursor's read, if one is open; the cursor stays. Its last chunk
+ * is gone, and the buffer with it when a large chunk grew it.
+ */
 void stoolap_cursor_end(StoolapCursor* cursor);
 
 /** As stoolap_read(), for the one row `row_id` (no row if not visible). */
