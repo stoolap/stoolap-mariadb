@@ -141,6 +141,10 @@ INSERT INTO sp VALUES (1);
         c.close()
     h.assert_err("the ANSI_QUOTES FK is enforced",
                  "INSERT INTO sa VALUES (99)", r"foreign key constraint fails")
+    h.assert_ok("FOREIGN inside a column name is not a clause",
+                f"CREATE TABLE sx (x$FOREIGN INT) ENGINE={h.engine}")
+    h.assert_ok("a table named foreign is not a clause",
+                f"CREATE TABLE {h.db}.foreign (id INT) ENGINE={h.engine}")
     h.assert_ok("a comment naming FOREIGN KEY is not a clause",
                 "CREATE TABLE sm (pid INT /* FOREIGN KEY later */, "
                 f"x INT) ENGINE={h.engine}")

@@ -195,16 +195,18 @@ fn skip_ws(s: &[u8], mut p: usize) -> usize {
     p
 }
 
-/// `word` at `p`, any case, on word boundaries: the position after it
+/// `word` at `p`, any case, a word of its own: not part of an identifier
+/// (x$FOREIGN) nor a qualified name's part (d.foreign). The position
+/// after it
 fn keyword(s: &[u8], p: usize, word: &str) -> Option<usize> {
     let end = p + word.len();
     if end > s.len() || !s[p..end].eq_ignore_ascii_case(word.as_bytes()) {
         return None;
     }
-    if p > 0 && is_word(s[p - 1]) {
+    if p > 0 && (is_ident_byte(s[p - 1]) || s[p - 1] == b'.') {
         return None;
     }
-    if end < s.len() && is_word(s[end]) {
+    if end < s.len() && is_ident_byte(s[end]) {
         return None;
     }
     Some(end)
@@ -343,9 +345,13 @@ fn foreign_key(
         Some((child, parent_db, parent_table, parent_columns, actions, p))
     };
     let Some((child, parent_db, parent_table, parent_columns, actions, end)) = parse() else {
-        // DROP FOREIGN KEY names a key to drop; anything else is a clause
-        // that would be lost, and with it the key
-        if after_drop(s, at) {
+        // FOREIGN not followed by KEY is no clause; DROP FOREIGN KEY names
+        // a key to drop; anything else is a clause that would be lost, and
+        // with it the key
+        let is_clause = keyword(s, at, "FOREIGN")
+            .and_then(|p| keyword(s, skip_ws(s, p), "KEY"))
+            .is_some();
+        if !is_clause || after_drop(s, at) {
             return Ok(None);
         }
         return Err(Error::NotSupported(
@@ -540,6 +546,14 @@ mod tests {
             let sql =
                 format!("CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES {parent} (id))");
             assert!(fks(&sql, "d_1c").is_err(), "{parent}");
+        }
+        // FOREIGN in a name is no clause
+        for sql in [
+            "CREATE TABLE c (x$FOREIGN INT, y\u{e9}foreign INT)",
+            "CREATE TABLE d.foreign (id INT)",
+            "CREATE TABLE c (foreign_id INT)",
+        ] {
+            assert_eq!(fks(sql, "d_1c").unwrap(), "", "{sql}");
         }
         // So is the current database's
         let mut out = String::new();
