@@ -256,7 +256,7 @@ pub unsafe extern "C" fn stoolap_row_buffer_add(
         }
         Err(_) => "panic during stoolap_row_buffer_add".to_string(),
     };
-    buf.last_error = CString::new(msg.replace('\0', "\\0")).ok();
+    buf.last_error = CString::new(super::error::error_text(&msg)).ok();
     -1
 }
 

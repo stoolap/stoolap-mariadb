@@ -26,6 +26,8 @@
 #include "ha_stoolap_select.h"
 #include "stoolap_thd_inspect.h"
 
+#include <dirent.h>
+
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -881,7 +883,36 @@ int ha_stoolap::delete_table(const char* name) {
     const std::string flat = stoolap_table_from_path(name);
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
-    if (stoolap_drop_table(db, flat.c_str()) != STOOLAP_OK) {
+    // A parent other tables' foreign keys name is refused, as InnoDB does,
+    // but under foreign_key_checks = 0. DROP DATABASE drops its tables one
+    // by one, a parent maybe before its children: the database's own go
+    // with it.
+    THD* thd = ha_thd();
+    const bool check_fks =
+        !thd || !thd_test_options(thd, OPTION_NO_FOREIGN_KEY_CHECKS);
+    std::vector<std::string> dropping;
+    std::vector<const char*> dropping_names;
+    if (thd && thd_sql_command(thd) == SQLCOM_DROP_DB) {
+        // The tables still in the database's directory, by their .frm (a
+        // long name's stoolap form keeps no prefix to tell them by)
+        const std::string_view path(name);
+        const std::string dir(path.substr(0, path.rfind('/') + 1));
+        if (DIR* d = opendir(dir.c_str())) {
+            while (const dirent* e = readdir(d)) {
+                const std::string_view file(e->d_name);
+                if (file.size() > 4 && file.substr(file.size() - 4) == ".frm")
+                    dropping.push_back(stoolap_table_from_path(
+                        (dir + std::string(file.substr(0, file.size() - 4)))
+                            .c_str()));
+            }
+            closedir(d);
+        }
+        for (const auto& t : dropping)
+            dropping_names.push_back(t.c_str());
+    }
+    if (stoolap_drop_table(db, flat.c_str(), check_fks, dropping_names.data(),
+                           static_cast<int32_t>(dropping_names.size())) !=
+        STOOLAP_OK) {
         auto verr = fetch_db_error(db);
         sql_print_error("stoolap: DROP TABLE failed: %s", verr.message);
         return report_stoolap_error(verr);

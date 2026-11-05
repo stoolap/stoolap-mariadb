@@ -175,8 +175,33 @@ pub fn create_table(
     Ok(failed)
 }
 
-/// Drops `table` if it is there
-pub fn drop_table(session: &Session, table: &str) -> Result<()> {
+/// Drops `table` if it is there. A parent other tables' foreign keys name
+/// is refused, as InnoDB refuses it, unless `check_fks` is false; the
+/// children among `dropping` (DROP DATABASE: the database's tables) go
+/// with it, dropped first.
+pub fn drop_table(
+    session: &Session,
+    table: &str,
+    check_fks: bool,
+    dropping: &[String],
+) -> Result<()> {
+    let dropping: Vec<String> = dropping.iter().map(|t| t.to_lowercase()).collect();
+    for (child, column, parent_column) in session.referencing_tables(table) {
+        if dropping.contains(&child) {
+            session.run(
+                &format!("DROP TABLE IF EXISTS {}", quote(&child)),
+                ParamVec::new(),
+            )?;
+        } else if check_fks {
+            return Err(Error::foreign_key_violation(
+                &child,
+                column,
+                table,
+                parent_column,
+                format!("cannot drop table '{table}': still referenced by table '{child}'"),
+            ));
+        }
+    }
     session.run(
         &format!("DROP TABLE IF EXISTS {}", quote(table)),
         ParamVec::new(),

@@ -40,7 +40,7 @@ pub struct StoolapCursor {
 
 impl StoolapCursor {
     fn set_error(&mut self, msg: &str) {
-        self.last_error = CString::new(msg.replace('\0', "\\0")).ok();
+        self.last_error = CString::new(super::error::error_text(msg)).ok();
     }
 }
 
