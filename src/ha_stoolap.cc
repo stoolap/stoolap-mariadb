@@ -1728,8 +1728,12 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         }
     }
 
-    const StoolapKeyBound bound{table->record[1], static_cast<int32_t>(nparts),
-                                op, filter_mask, pad_mask, STOOLAP_BOUND_KEY};
+    const StoolapKeyBound bound{table->record[1],
+                                static_cast<int32_t>(nparts),
+                                op,
+                                filter_mask,
+                                pad_mask,
+                                STOOLAP_BOUND_KEY};
     if (int err = open_read(&bound, 1, ir_order_.data(),
                             static_cast<int32_t>(ir_order_.size()), desc))
         return err;
@@ -1890,8 +1894,8 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         if (nparts == 0) return 0;
         std::memset(rec, 0, table->s->reclength);
         key_restore(rec, range->key, &key_info, klen);
-        bounds[nbounds++] = {rec, static_cast<int32_t>(nparts), op, 0, 0,
-                             STOOLAP_BOUND_RANGE};
+        bounds[nbounds++] = {rec, static_cast<int32_t>(nparts), op, 0,
+                             0,   STOOLAP_BOUND_RANGE};
         return 0;
     };
     if (start_key) {
@@ -2012,9 +2016,9 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
             uchar* rec = r == start_key ? table->record[1] : bound_record();
             std::memset(rec, 0, table->s->reclength);
             key_restore(rec, r->key, &ki, ki.key_part[0].store_length);
-            bounds[nbounds++] = {rec, 1,
-                                 r == start_key ? STOOLAP_OP_GE : STOOLAP_OP_LE,
-                                 0, 0, STOOLAP_BOUND_LEADING};
+            bounds[nbounds++] = {
+                rec, 1, r == start_key ? STOOLAP_OP_GE : STOOLAP_OP_LE,
+                0,   0, STOOLAP_BOUND_LEADING};
         }
     } else if (const_prefix > 0 && key_part_pads(ki.key_part[0], trust_bin)) {
         // Every row of the range equals the bounds' first part there: the
