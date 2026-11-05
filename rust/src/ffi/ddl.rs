@@ -55,6 +55,13 @@ pub struct StoolapForeignKeyDef {
     pub on_update: i32,
 }
 
+/// A column an ALTER renames
+#[repr(C)]
+pub struct StoolapColumnRename {
+    pub from: *const c_char,
+    pub to: *const c_char,
+}
+
 unsafe fn text<'a>(p: *const c_char, what: &str) -> Result<&'a str> {
     if p.is_null() {
         return Err(Error::internal(format!("{} is NULL", what)));
@@ -100,7 +107,10 @@ unsafe fn on_session(
 }
 
 /// Creates `table` (stoolap's name) from `columns`, `keys` and
-/// `foreign_keys`. `STOOLAP_INDEX_FAILED`
+/// `foreign_keys`, and, when `keep_from` is not NULL, the foreign keys of
+/// that table, which a copying ALTER rebuilds into this one (`renames`,
+/// the columns it renames; `dropped`, those it drops).
+/// `STOOLAP_INDEX_FAILED`
 /// when some secondary index was not created (listed in `stoolap_errmsg`).
 ///
 /// # Safety
@@ -117,6 +127,11 @@ pub unsafe extern "C" fn stoolap_create_table(
     nkeys: i32,
     foreign_keys: *const StoolapForeignKeyDef,
     nforeign_keys: i32,
+    keep_from: *const c_char,
+    renames: *const StoolapColumnRename,
+    nrenames: i32,
+    dropped: *const *const c_char,
+    ndropped: i32,
     if_not_exists: i32,
 ) -> i32 {
     let mut failed = Vec::new();
@@ -146,7 +161,30 @@ pub unsafe extern "C" fn stoolap_create_table(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let fks = slice(foreign_keys, nforeign_keys)?
+        let mut fks = if keep_from.is_null() {
+            Vec::new()
+        } else {
+            let renames = slice(renames, nrenames)?
+                .iter()
+                .map(|r| {
+                    Ok((
+                        text(r.from, "renamed column")?.to_string(),
+                        text(r.to, "renamed column")?.to_string(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let dropped = slice(dropped, ndropped)?
+                .iter()
+                .map(|&d| Ok(text(d, "dropped column")?.to_string()))
+                .collect::<Result<Vec<_>>>()?;
+            ddl::kept_foreign_keys(
+                session,
+                text(keep_from, "altered table")?,
+                &renames,
+                &dropped,
+            )?
+        };
+        let new_fks = slice(foreign_keys, nforeign_keys)?
             .iter()
             .map(|f| {
                 Ok(ForeignKey {
@@ -162,6 +200,7 @@ pub unsafe extern "C" fn stoolap_create_table(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        fks.extend(new_fks);
         failed = ddl::create_table(
             session,
             text(table, "table name")?,

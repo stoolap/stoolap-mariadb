@@ -1,4 +1,3 @@
--- known-diff-file: DDL: any copy ALTER on a child table drops its FOREIGN KEYs
 CREATE TABLE p (id INT PRIMARY KEY) ENGINE={E};
 CREATE TABLE c (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES p(id)) ENGINE={E};
 ALTER TABLE c ADD COLUMN z INT;

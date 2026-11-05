@@ -188,6 +188,50 @@ INSERT INTO `my-db`.`P\u00e9` VALUES (1);
     h.assert_err("the TEMPORARY child's FK is enforced",
                  "INSERT INTO tc VALUES (99)", r"foreign key constraint fails")
     h.exec_stmt("DROP TEMPORARY TABLE tc")
+    # A copying ALTER keeps the keys (tests/diff/alter_keeps_fks.sql);
+    # dropping a column one uses is refused, as InnoDB refuses it (1828
+    # there)
+    h.exec_stmt("CREATE TABLE sz (id INT NOT NULL PRIMARY KEY, pid INT, "
+                f"FOREIGN KEY (pid) REFERENCES sp (id)) ENGINE={h.engine}")
+    h.assert_err("dropping a FOREIGN KEY's column is refused",
+                 "ALTER TABLE sz DROP COLUMN pid",
+                 r"used by a FOREIGN KEY")
+    h.assert_err("the key survives the refused ALTER",
+                 "INSERT INTO sz VALUES (1, 98)",
+                 r"foreign key constraint fails")
+    # A dropped column's key does not move to the column renamed into its
+    # place
+    h.exec_stmt("CREATE TABLE sw (id INT NOT NULL PRIMARY KEY, pid INT, "
+                f"qid INT, FOREIGN KEY (pid) REFERENCES sp (id)) "
+                f"ENGINE={h.engine}")
+    h.assert_err("a dropped key column renamed over is refused",
+                 "ALTER TABLE sw DROP COLUMN pid, CHANGE qid pid INT",
+                 r"used by a FOREIGN KEY")
+    # A TEMPORARY table keeps its own keys, not those of the permanent
+    # table its name shadows
+    h.assert_ok("ALTER of a TEMPORARY table shadowing a child",
+                f"CREATE TEMPORARY TABLE sw (id INT) ENGINE={h.engine}")
+    h.assert_ok("copying ALTER of the TEMPORARY table",
+                "ALTER TABLE sw ADD COLUMN z INT, ALGORITHM=COPY")
+    h.exec_stmt("DROP TEMPORARY TABLE sw")
+    # A key naming its column in other letter case, past ASCII
+    h.assert_ok("FK naming its column in other case",
+                "CREATE TABLE su (`\u00e9` INT, FOREIGN KEY (`\u00c9`) "
+                f"REFERENCES sp (id)) ENGINE={h.engine}")
+    h.assert_ok("copying ALTER keeps it", "ALTER TABLE su ADD COLUMN z INT")
+    h.assert_err("the key is enforced after the ALTER",
+                 "INSERT INTO su VALUES (97, NULL)",
+                 r"foreign key constraint fails")
+    h.assert_ok("renaming its column keeps it",
+                "ALTER TABLE su CHANGE `\u00c9` `\u00f6` INT")
+    h.assert_err("the key follows the rename",
+                 "INSERT INTO su VALUES (96, NULL)",
+                 r"foreign key constraint fails")
+    # A table converted from another engine has no stoolap keys to keep
+    h.exec_script("CREATE TABLE si (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB;"
+                  "INSERT INTO si VALUES (1)")
+    h.assert_ok("ALTER ... ENGINE=STOOLAP", f"ALTER TABLE si ENGINE={h.engine}")
+    h.assert_scalar("converted rows", "SELECT COUNT(*) FROM si", "1")
     # The actions come from the parser too
     h.exec_script(f"""
 CREATE TABLE ap (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
