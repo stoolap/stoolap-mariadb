@@ -154,4 +154,4 @@ CREATE TABLE sp_t (id INT NOT NULL PRIMARY KEY, n INT) ENGINE={h.engine};
     else:
         h._fail(f"Stoolap_unmapped_errors moved to {val}",
                 "savepoint paths produced an error wording",
-                "map_stoolap_error does not cover")
+                "stoolap_error_class does not cover")

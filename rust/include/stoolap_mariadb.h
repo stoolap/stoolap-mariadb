@@ -592,6 +592,95 @@ void stoolap_rows_close(StoolapRows* rows);
  * Bulk fetch
  * ========================================================================= */
 
+/* =========================================================================
+ * Tables
+ * ========================================================================= */
+
+/** The stoolap type a column is stored in. */
+#define STOOLAP_COL_INTEGER     1
+#define STOOLAP_COL_FLOAT       2
+#define STOOLAP_COL_TEXT        3
+
+typedef struct StoolapColumnDef {
+    const char* name;
+    int32_t kind;           /**< STOOLAP_COL_* */
+    int32_t nullable;
+    int32_t auto_increment;
+} StoolapColumnDef;
+
+#define STOOLAP_KEYDEF_PRIMARY  0
+#define STOOLAP_KEYDEF_UNIQUE   1
+/** A non-unique key: a stoolap index over its parts. */
+#define STOOLAP_KEYDEF_INDEX    2
+
+typedef struct StoolapKeyDef {
+    const char* name;
+    const int32_t* columns; /**< the key's columns, by position */
+    int32_t ncolumns;
+    int32_t kind;           /**< STOOLAP_KEYDEF_* */
+} StoolapKeyDef;
+
+/** The table was created, but some indexes were not (stoolap_errmsg). */
+#define STOOLAP_INDEX_FAILED 3
+
+/**
+ * Create `table` (stoolap's name) from `columns` and `keys` (in MariaDB's
+ * key order), in MariaDB's database `db_name`, with its secondary indexes.
+ * A single-column PRIMARY KEY is inline; a composite one and each UNIQUE
+ * key are table-level constraints, numbered in that order (the ordinals
+ * stoolap_error_class gives). `create_sql`, the statement's
+ * `create_sql_len` bytes as the client sent them (any character set, NUL
+ * inside literals) or NULL, is read for FOREIGN KEY clauses, which
+ * MariaDB does not hand an engine
+ * that does not claim them; their parent tables get stoolap's names, and a
+ * composite or self-referencing one is refused.
+ */
+int32_t stoolap_create_table(
+    StoolapDB* db,
+    const char* table,
+    const char* db_name,
+    const StoolapColumnDef* columns, int32_t ncolumns,
+    const StoolapKeyDef* keys, int32_t nkeys,
+    const uint8_t* create_sql, int64_t create_sql_len,
+    int32_t if_not_exists
+);
+
+/** Drop `table` if it is there. */
+int32_t stoolap_drop_table(StoolapDB* db, const char* table);
+
+/** Rename table `from` to `to`. */
+int32_t stoolap_rename_table(StoolapDB* db, const char* from, const char* to);
+
+/* =========================================================================
+ * Error classes
+ * ========================================================================= */
+
+/** A wording no class covers (stoolap drift). */
+#define STOOLAP_ERR_UNKNOWN             0
+/** Known, with no MariaDB counterpart: report the text. */
+#define STOOLAP_ERR_GENERIC             1
+#define STOOLAP_ERR_DUP_KEY             2
+#define STOOLAP_ERR_NO_REFERENCED_ROW   3
+#define STOOLAP_ERR_ROW_IS_REFERENCED   4
+/** Retry the statement: a write conflict, a lock, a schema change. */
+#define STOOLAP_ERR_DEADLOCK            5
+#define STOOLAP_ERR_TABLE_EXISTS        6
+#define STOOLAP_ERR_NO_SUCH_TABLE       7
+#define STOOLAP_ERR_UNSUPPORTED         8
+
+/** The key a duplicate names: none, or the PRIMARY KEY. */
+#define STOOLAP_KEY_NONE               -1
+#define STOOLAP_KEY_PRIMARY            -2
+
+/**
+ * The STOOLAP_ERR_* class of the error message `msg`, as any handle's
+ * errmsg gives it; for a duplicate, `key` gets the key it names: a
+ * STOOLAP_KEY_* or the ordinal of the table-level unique constraint in
+ * CREATE TABLE order. An error recorded with its stoolap value is
+ * classed by the value, anything else by its wording. `key` may be NULL.
+ */
+int32_t stoolap_error_class(const char* msg, int32_t* key);
+
 /**
  * The packed format of stoolap_query_params_all() and of the cells a
  * StoolapStoreFn takes (one tag and payload).

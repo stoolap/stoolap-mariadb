@@ -1,6 +1,8 @@
 """Foreign key enforcement: CREATE-time, ALTER ADD CONSTRAINT, INSERT/UPDATE/
 DELETE-time validation. Stoolap supports single-column FKs only."""
 
+import mysql.connector
+
 
 def run(h):
     h.exec_script(f"""
@@ -63,3 +65,58 @@ INSERT INTO tchild  VALUES (10,1),(20,2);
     h.assert_ok("TRUNCATE child",           "TRUNCATE TABLE tchild")
     h.assert_ok("TRUNCATE parent (now ok)", "TRUNCATE TABLE tparent")
     h.assert_scalar("post-success TRUNCATE COUNT", "SELECT COUNT(*) FROM tparent", "0")
+
+    # The CREATE's FOREIGN KEY clauses are read from the statement's bytes
+    # as the client sent them: a NUL inside a literal before the clause
+    # must not hide it, nor bytes of another character set stop the scan.
+    h.section("FOREIGN KEY read past a NUL literal and non-UTF-8 text")
+    h.exec_script(f"""
+CREATE TABLE np (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+INSERT INTO np VALUES (1);
+""")
+    h.cur.execute(
+        "CREATE TABLE nc (id INT NOT NULL PRIMARY KEY, b VARBINARY(4) "
+        "DEFAULT 'a\x00b', pid INT, FOREIGN KEY (pid) REFERENCES np (id)) "
+        f"ENGINE={h.engine}")
+    h.assert_err("FK after a NUL literal is enforced",
+                 "INSERT INTO nc (id, pid) VALUES (1, 99)",
+                 r"foreign key constraint fails")
+    h.assert_ok("FK after a NUL literal accepts a parent row",
+                "INSERT INTO nc (id, pid) VALUES (2, 1)")
+    c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=True,
+                                charset="latin1", use_pure=True)
+    try:
+        c.cursor().execute(
+            "CREATE TABLE nl (id INT NOT NULL PRIMARY KEY, pid INT, "
+            "FOREIGN KEY (pid) REFERENCES np (id)) "
+            f"ENGINE={h.engine} COMMENT='café'")
+        h._pass("CREATE from a latin1 connection")
+    except mysql.connector.Error as e:
+        h._fail("CREATE from a latin1 connection", str(e))
+    finally:
+        c.close()
+    h.assert_err("FK of the latin1 CREATE is enforced",
+                 "INSERT INTO nl VALUES (1, 99)",
+                 r"foreign key constraint fails")
+    # A latin1 name in the clause would read lossily as U+FFFD, itself a
+    # column name: the CREATE is refused instead of binding to that one.
+    h.exec_stmt("CREATE TABLE nq (`\u00e9` INT NOT NULL PRIMARY KEY, "
+                f"`\ufffd` INT, UNIQUE KEY u (`\ufffd`)) ENGINE={h.engine}")
+    h.exec_stmt("INSERT INTO nq VALUES (1, 99)")
+    c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=True,
+                                charset="latin1", use_pure=True)
+    try:
+        c.cursor().execute(
+            "CREATE TABLE nr (id INT NOT NULL PRIMARY KEY, pid INT, "
+            "FOREIGN KEY (pid) REFERENCES nq (`\u00e9`)) "
+            f"ENGINE={h.engine}")
+        h._fail("latin1 FK name refused", "the CREATE succeeded")
+    except mysql.connector.Error as e:
+        if "not UTF-8" in str(e):
+            h._pass("latin1 FK name refused")
+        else:
+            h._fail("latin1 FK name refused", str(e))
+    finally:
+        c.close()

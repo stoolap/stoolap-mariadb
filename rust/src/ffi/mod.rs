@@ -20,6 +20,7 @@
 //! Build: `cargo build --release --features ffi` produces `libstoolap.{so,dylib,dll}`
 
 mod database;
+mod ddl;
 mod error;
 mod read;
 pub(crate) mod rows;
