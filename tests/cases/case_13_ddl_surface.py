@@ -116,6 +116,18 @@ CREATE TABLE nn (
     h.assert_ok("CREATE a child of the long parent",
                 f"CREATE TABLE `{u}`.c (id INT PRIMARY KEY, pid INT, "
                 f"FOREIGN KEY (pid) REFERENCES `{u}` (id)) ENGINE={h.engine}")
+    # stoolap matches table names lowercased: a parent named in other
+    # letter case, one name shortened, is still found
+    pa = "_" * 63 + "a"
+    h.exec_script(f"CREATE TABLE `{u}`.`{pa}` (id INT PRIMARY KEY) "
+                  f"ENGINE={h.engine}")
+    h.assert_ok("CREATE a child naming the long parent in upper case",
+                f"CREATE TABLE `{u}`.c2 (id INT PRIMARY KEY, pid INT, "
+                f"FOREIGN KEY (pid) REFERENCES `{pa.upper()}` (id)) "
+                f"ENGINE={h.engine}")
+    h.exec_stmt(f"INSERT INTO `{u}`.`{pa}` VALUES (1)")
+    h.assert_ok("child row of the parent named in upper case",
+                f"INSERT INTO `{u}`.c2 VALUES (1, 1)")
     h.exec_stmt(f"INSERT INTO `{u}`.`{u}` VALUES (1, 100)")
     h.exec_stmt(f"INSERT INTO `{u}`.`{u[1:]}` VALUES (1, 200)")
     h.assert_ok("child row of an existing parent",
@@ -140,4 +152,5 @@ CREATE TABLE nn (
                     f"SELECT v FROM `{u}`.`{u[2:]}x` WHERE id = 1", "200")
     # The child first: stoolap refuses to drop a parent rows reference
     h.exec_script(f"DROP TABLE `{u}`.c")
+    h.exec_script(f"DROP TABLE `{u}`.c2")
     h.exec_script(f"DROP DATABASE `{u}`")

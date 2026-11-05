@@ -53,9 +53,11 @@ fn stored_len(c: char) -> usize {
 }
 
 /// `name`, or when stoolap cannot hold it, its first characters, `_2` and
-/// a hash of the whole (FNV-1a, 64 bits). The escaping never writes `_2`,
-/// so no name that fits meets a shortened one; the hash must not change,
-/// a file-backed table keeps its name.
+/// a hash of the whole lowercased (FNV-1a, 64 bits): stoolap matches table
+/// names lowercased, so names in other letter case shorten to one it
+/// matches too. The escaping never writes `_2`, so no name that fits meets
+/// a shortened one; the hash must not change, a file-backed table keeps
+/// its name.
 pub fn fit_name(name: String) -> String {
     const TAIL: usize = 2 + 16;
     if name.chars().map(stored_len).sum::<usize>() <= MAX_TABLE_NAME {
@@ -71,7 +73,7 @@ pub fn fit_name(name: String) -> String {
         out.push(c);
     }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes() {
+    for b in name.to_lowercase().bytes() {
         hash = (hash ^ b as u64).wrapping_mul(0x0100_0000_01b3);
     }
     out.push_str(&format!("_2{hash:016x}"));
@@ -552,6 +554,10 @@ mod tests {
         let fits = "a".repeat(255);
         assert_eq!(fit_name(fits.clone()), fits);
         assert_eq!(fit_name("a".repeat(256)).len(), 255);
+        assert_eq!(
+            fit_name("a".repeat(256)).to_lowercase(),
+            fit_name("A".repeat(256)).to_lowercase()
+        );
         assert_eq!(
             fks(
                 "CREATE TABLE c (id INT, pid INT, CONSTRAINT f FOREIGN KEY fk (pid) REFERENCES `p` (id) ON DELETE CASCADE ON UPDATE SET NULL)",
