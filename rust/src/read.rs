@@ -207,6 +207,28 @@ impl Cursor {
             column_ok(c)?;
         }
 
+        // A key lookup (a join's eq_ref probe): the row by its id, with no
+        // expression, plan or scanner
+        if let [Node::Cond(Cond {
+            column,
+            op: CondOp::Eq,
+            value,
+        })] = spec.conds.as_slice()
+        {
+            if schema.pk_column_index() == Some(*column) {
+                if let Value::Integer(id) = value
+                    .clone()
+                    .into_coerce_to_type(schema.columns[*column].data_type)
+                {
+                    let rows = table.fetch_rows_by_ids(&[id], &ConstBoolExpr::true_expr())?;
+                    return Ok(Cursor {
+                        source: Source::Sorted(rows.into_iter().collect::<Vec<_>>().into_iter()),
+                        columns: spec.columns.to_vec(),
+                    });
+                }
+            }
+        }
+
         let mut exprs: Vec<Box<dyn Expression>> = Vec::with_capacity(spec.conds.len());
         for node in spec.conds {
             let cond = match node {
