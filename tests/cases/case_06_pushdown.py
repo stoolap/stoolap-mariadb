@@ -940,3 +940,23 @@ DEALLOCATE PREPARE pu3;""")
         h._fail("prepared UNION with projection placeholder still pushed")
     else:
         h._pass("prepared UNION with projection placeholder bailed")
+
+    # tests/diff/record_reads.sql compares these results with InnoDB; here
+    # they must push, so the rows come through the pushdown record path.
+    h.section("record_reads.sql pushdown shapes push")
+    h.exec_script(f"""
+CREATE TABLE recr (id INT NOT NULL PRIMARY KEY, t TINYINT, i INT, m MEDIUMINT,
+                   f FLOAT, d DOUBLE, v VARCHAR(10)) ENGINE={h.engine} DEFAULT CHARSET=utf8mb4;
+INSERT INTO recr VALUES (1, 1, 1, 1, 1.5, 2.5, 'a');
+CREATE TABLE reck (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO reck VALUES (1);
+""")
+    h.assert_pushed("record_reads whole SELECT",
+                    "SELECT * FROM recr ORDER BY id")
+    h.assert_pushed("record_reads expressions",
+                    "SELECT id, t + 1, i - 1, -m, f * 2, d / 2, CONCAT(v, 'x'), "
+                    "CHAR_LENGTH(v) FROM recr ORDER BY id")
+    h.assert_pushed_derived("record_reads derived table",
+                            "SELECT STRAIGHT_JOIN k.id, x.t, x.d, x.v FROM reck k JOIN "
+                            "(SELECT id, t, d, v FROM recr WHERE id > 0) x "
+                            "ON x.id = k.id ORDER BY k.id")

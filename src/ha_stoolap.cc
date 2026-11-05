@@ -2148,7 +2148,6 @@ int ha_stoolap::delete_all_rows() {
 
 using stoolap_mariadb::pkt_le32;
 using stoolap_mariadb::pkt_parse_header;
-using stoolap_mariadb::pkt_store_value;
 
 int ha_stoolap::rnd_init(bool /*scan*/) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
@@ -2177,20 +2176,10 @@ void ha_stoolap::refresh_projection() {
     }
     if (w == read_cols_words_ && !read_fields_.empty()) return;
     read_fields_.clear();
-    const uchar* rec = table->record[0];
     for (uint i = 0; i < fields; ++i) {
         if (any && !(w[i / 32] & (uint32_t(1) << (i % 32)))) continue;
-        Field* f = table->field[i];
-        StoolapField d{};
-        d.column = static_cast<int32_t>(i);
-        d.field = static_cast<int32_t>(i);
-        d.offset = static_cast<uint32_t>(f->ptr - rec);
-        if (f->null_ptr) {
-            d.null_offset = static_cast<uint32_t>(f->null_ptr - rec);
-            d.null_mask = f->null_bit;
-        }
-        stoolap_mariadb::describe_field(f, &d);
-        read_fields_.push_back(d);
+        read_fields_.push_back(
+            stoolap_mariadb::record_field(table, i, static_cast<int32_t>(i)));
     }
     read_cols_words_ = w;
 }
@@ -2233,16 +2222,6 @@ StoolapCursor* ha_stoolap::read_cursor() {
     return cursor_.get();
 }
 
-// The read's store callback: a field the cursor does not write itself.
-int32_t ha_stoolap::store_cell(void* ctx, int32_t field, const uint8_t* cell,
-                               size_t len) {
-    auto* h = static_cast<ha_stoolap*>(ctx);
-    size_t pos = 0;
-    const int err = pkt_store_value(cell, len, &pos, h->table->field[field]);
-    if (err) h->store_err_ = err;
-    return err;
-}
-
 int ha_stoolap::rnd_end() {
     release_read();
     return 0;
@@ -2256,11 +2235,11 @@ int ha_stoolap::rnd_next(uchar* buf) {
         static_cast<my_ptrdiff_t>(buf - table->record[0]);
     if (table->s->null_bytes) std::memset(buf, 0, table->s->null_bytes);
     move_fields(table, row_diff);
-    store_err_ = 0;
+    stoolap_mariadb::RecordTarget target{table, 0};
     int64_t id = 0;
     int32_t last = 0;
     const int rc = stoolap_cursor_next(
-        cursor_.get(), buf, &ha_stoolap::store_cell, this, &id, &last);
+        cursor_.get(), buf, &stoolap_mariadb::store_cell, &target, &id, &last);
     move_fields(table, -row_diff);
     if (rc == STOOLAP_ROW) {
         cur_row_id_ = id;
@@ -2272,7 +2251,7 @@ int ha_stoolap::rnd_next(uchar* buf) {
     }
     reading_ = false;
     if (rc == STOOLAP_DONE) return HA_ERR_END_OF_FILE;
-    if (store_err_) return store_err_;
+    if (target.err) return target.err;
     StoolapErrorView verr{stoolap_cursor_errmsg(cursor_.get())};
     sql_print_error("stoolap: read failed: %s", verr.message);
     return report_stoolap_error(verr);

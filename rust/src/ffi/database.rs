@@ -375,7 +375,7 @@ unsafe fn query_params(
 }
 
 /// Run a query with positional parameters and pack every row into one
-/// buffer, in the format of `stoolap_rows_fetch_all()`, without a rows
+/// buffer, in the packed format (see the C header), without a rows
 /// handle.
 ///
 /// Runs inside `tx` when it is not NULL; a `tx` begun on another database

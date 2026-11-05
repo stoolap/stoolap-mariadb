@@ -10,12 +10,10 @@
 
 #pragma once
 
-// Shared parser for the packed binary format produced by
-// stoolap_rows_fetch_all() and stoolap_cursor_fetch(). Used by both the
-// handler's direct reads (rnd_next in ha_stoolap.cc) and the pushdown handlers (select_handler,
-// derived_handler, unit_handler in ha_stoolap_select.cc) to consume one
-// packed buffer per result set instead of issuing per-row /
-// per-cell FFI accessors.
+// The packed binary format of stoolap_query_params_all(), and the reads'
+// record helpers: the field descriptions a read writes rows by
+// (record_field) and the store callback for the values it leaves to
+// Field::store (store_cell, one cell of this format at a time).
 //
 // Format (little-endian):
 //   u32 col_count
@@ -36,6 +34,7 @@
 #include "stoolap_mariadb.h"
 
 #include "field.h"
+#include "table.h"
 #include "my_global.h"
 #include "stoolap_types.h"
 
@@ -86,39 +85,6 @@ inline bool pkt_parse_header(const uint8_t* buf, size_t len, size_t* pos,
     }
     *cols_out = cols;
     return true;
-}
-
-/// Skip past one column payload. Used when stoolap returns more columns
-/// than the destination wants (schema drift, projection skip).
-inline bool pkt_skip_value(const uint8_t* buf, size_t len, size_t* pos) {
-    if (*pos + 1 > len) return false;
-    uint8_t tag = buf[(*pos)++];
-    switch (tag) {
-        case STOOLAP_TYPE_NULL:
-            return true;
-        case STOOLAP_TYPE_INTEGER:
-        case STOOLAP_TYPE_FLOAT:
-        case STOOLAP_TYPE_TIMESTAMP:
-            if (*pos + 8 > len) return false;
-            *pos += 8;
-            return true;
-        case STOOLAP_TYPE_BOOLEAN:
-            if (*pos + 1 > len) return false;
-            *pos += 1;
-            return true;
-        case STOOLAP_TYPE_TEXT:
-        case STOOLAP_TYPE_JSON:
-        case STOOLAP_TYPE_BLOB: {
-            if (*pos + 4 > len) return false;
-            uint32_t bl = pkt_le32(buf + *pos);
-            *pos += 4;
-            if (*pos + bl > len) return false;
-            *pos += bl;
-            return true;
-        }
-        default:
-            return false;
-    }
 }
 
 /// Read one column's payload and Field::store() it. Returns 0 on success
@@ -204,6 +170,40 @@ inline int pkt_store_value(const uint8_t* buf, size_t len, size_t* pos,
         default:
             return HA_ERR_UNSUPPORTED;
     }
+}
+
+// What a read into `table` writes for its field `index`, from the read's
+// column `column` (see StoolapField).
+inline StoolapField record_field(TABLE* table, uint index, int32_t column) {
+    Field* f = table->field[index];
+    const uchar* rec = table->record[0];
+    StoolapField d{};
+    d.column = column;
+    d.field = static_cast<int32_t>(index);
+    d.offset = static_cast<uint32_t>(f->ptr - rec);
+    if (f->null_ptr) {
+        d.null_offset = static_cast<uint32_t>(f->null_ptr - rec);
+        d.null_mask = f->null_bit;
+    }
+    describe_field(f, &d);
+    return d;
+}
+
+// The store callback of a read into `table`, for a value
+// stoolap_cursor_next leaves to Field::store; the fields point into the
+// record the read writes. Keeps the error for the read's failure.
+struct RecordTarget {
+    TABLE* table = nullptr;
+    int err = 0;
+};
+
+inline int32_t store_cell(void* ctx, int32_t field, const uint8_t* cell,
+                          size_t len) {
+    auto* t = static_cast<RecordTarget*>(ctx);
+    size_t pos = 0;
+    const int err = pkt_store_value(cell, len, &pos, t->table->field[field]);
+    if (err) t->err = err;
+    return err;
 }
 
 }  // namespace stoolap_mariadb

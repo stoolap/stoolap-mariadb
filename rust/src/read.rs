@@ -355,6 +355,14 @@ impl Cursor {
         })
     }
 
+    /// A read of rows a query already gave, in their order (id 0)
+    pub fn from_rows(rows: Vec<(i64, Row)>) -> Cursor {
+        Cursor {
+            source: Source::Sorted(rows.into_iter()),
+            current: None,
+        }
+    }
+
     /// The next row and its id; the row stays valid until the next call
     pub fn next_row(&mut self) -> Result<Option<(i64, &Row)>> {
         let Cursor {

@@ -22,7 +22,7 @@ use stoolap::core::types::DataType;
 use stoolap::core::{Result, Value};
 
 use super::types::StoolapRows;
-use super::{STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
+use super::{STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_ROW};
 
 /// Advance to the next row.
 ///
@@ -228,7 +228,7 @@ pub(crate) fn write_header<'a>(
     count_at
 }
 
-/// Packs one cell: a type tag and its payload (see `stoolap_rows_fetch_all`)
+/// Packs one cell: a type tag and its payload (the packed format)
 pub(crate) fn write_value(val: Option<&Value>, buf: &mut Vec<u8>) -> Result<()> {
     match val {
         None => {
@@ -330,98 +330,6 @@ pub(crate) fn pack_all(rows: &mut Rows, buf: &mut Vec<u8>) -> Result<u32> {
     let count_at = write_header(rows.columns().iter().map(|n| n.as_bytes()), buf);
     let col_count = rows.columns().len();
     write_rows(rows, col_count, usize::MAX, count_at, buf)
-}
-
-/// Fetch all remaining rows into a packed binary buffer.
-///
-/// Binary format:
-/// ```text
-/// [column_count: u32 LE]
-/// [for each column: name_len:u16 LE, name_bytes:u8[name_len]]
-/// [row_count: u32 LE]
-/// [for each row, for each column:
-///   type_tag: u8
-///   payload (varies by type):
-///     NULL(0): empty
-///     INTEGER(1): i64 LE (8 bytes)
-///     FLOAT(2): f64 LE (8 bytes)
-///     TEXT(3): len:u32 LE + bytes:u8[len]
-///     BOOLEAN(4): u8 (0 or 1)
-///     TIMESTAMP(5): i64 LE (8 bytes, nanos since epoch)
-///     JSON(6): len:u32 LE + bytes:u8[len]
-///     BLOB(7): len:u32 LE + bytes:u8[len]
-/// ]
-/// ```
-///
-/// On success, `*out_buf` receives a heap-allocated buffer and `*out_len`
-/// its byte length. The caller MUST free it with `stoolap_buffer_free()`.
-/// The rows handle is consumed and closed by this call. A runtime error
-/// that ends the result early returns `STOOLAP_ERROR` and no buffer.
-///
-/// # Safety
-///
-/// `rows` must be a valid `StoolapRows` pointer. `out_buf` and `out_len` must not be NULL.
-#[no_mangle]
-pub unsafe extern "C" fn stoolap_rows_fetch_all(
-    rows: *mut StoolapRows,
-    out_buf: *mut *mut u8,
-    out_len: *mut i64,
-) -> i32 {
-    if out_buf.is_null() || out_len.is_null() {
-        return STOOLAP_ERROR;
-    }
-    *out_buf = std::ptr::null_mut();
-    *out_len = 0;
-
-    let handle = match rows.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let mut buf = Vec::with_capacity(4096);
-        let count_at = write_header(handle.columns.iter().map(|n| n.as_bytes()), &mut buf);
-        let col_count = handle.columns.len();
-        let packed = match &mut handle.rows {
-            Some(r) => write_rows(r, col_count, usize::MAX, count_at, &mut buf),
-            None => Ok(0),
-        };
-        if packed.is_err() {
-            return STOOLAP_ERROR;
-        }
-
-        // Transfer ownership to caller.
-        // into_boxed_slice guarantees len == capacity (unlike shrink_to_fit
-        // which is only a hint). This makes stoolap_buffer_free safe.
-        let boxed = buf.into_boxed_slice();
-        let len = boxed.len();
-        let ptr = Box::into_raw(boxed) as *mut u8;
-
-        *out_buf = ptr;
-        *out_len = len as i64;
-        STOOLAP_OK
-    }));
-
-    // Close rows handle after fetching
-    handle.rows = None;
-    handle.has_row = false;
-
-    result.unwrap_or(STOOLAP_ERROR)
-}
-
-/// Free a buffer allocated by `stoolap_rows_fetch_all()`.
-///
-/// # Safety
-///
-/// `buf` must be a pointer returned by `stoolap_rows_fetch_all`, or NULL.
-/// `len` must be the exact length returned alongside the buffer.
-#[no_mangle]
-pub unsafe extern "C" fn stoolap_buffer_free(buf: *mut u8, len: i64) {
-    if !buf.is_null() && len > 0 {
-        // The buffer was created via Box::into_raw(Vec::into_boxed_slice()),
-        // so len == capacity is guaranteed. Reconstruct and drop.
-        let _ = Vec::from_raw_parts(buf, len as usize, len as usize);
-    }
 }
 
 /// Close the result set and free resources.

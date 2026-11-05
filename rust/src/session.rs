@@ -359,6 +359,11 @@ impl Rows {
         self.result.row()
     }
 
+    /// The current row, taken out of the result
+    pub fn take_row(&mut self) -> Row {
+        self.result.take_row()
+    }
+
     pub fn error(&mut self) -> Option<Error> {
         self.pending_error.take()
     }

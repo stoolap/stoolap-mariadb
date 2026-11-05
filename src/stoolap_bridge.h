@@ -56,56 +56,6 @@ using RowsPtr = std::unique_ptr<StoolapRows, RowsDeleter>;
 using StmtPtr = std::unique_ptr<StoolapStmt, StmtDeleter>;
 using CursorPtr = std::unique_ptr<StoolapCursor, CursorDeleter>;
 
-// Owns the packed buffer from stoolap_rows_fetch_all(); destructor calls
-// stoolap_buffer_free. Avoids the std::vector::assign memcpy on the very
-// path designed to cut FFI overhead.
-class StoolapBuffer {
-public:
-    StoolapBuffer() = default;
-    ~StoolapBuffer() noexcept { reset(); }
-
-    StoolapBuffer(StoolapBuffer&& o) noexcept : buf_(o.buf_), len_(o.len_) {
-        o.buf_ = nullptr;
-        o.len_ = 0;
-    }
-    StoolapBuffer& operator=(StoolapBuffer&& o) noexcept {
-        if (this != &o) {
-            reset();
-            buf_ = o.buf_;
-            len_ = o.len_;
-            o.buf_ = nullptr;
-            o.len_ = 0;
-        }
-        return *this;
-    }
-
-    StoolapBuffer(const StoolapBuffer&) = delete;
-    StoolapBuffer& operator=(const StoolapBuffer&) = delete;
-
-    void take(uint8_t* buf, int64_t len) {
-        reset();
-        buf_ = buf;
-        len_ = len;
-    }
-
-    void reset() noexcept {
-        if (buf_) {
-            stoolap_buffer_free(buf_, len_);
-            buf_ = nullptr;
-            len_ = 0;
-        }
-    }
-
-    uint8_t* data() noexcept { return buf_; }
-    const uint8_t* data() const noexcept { return buf_; }
-    size_t size() const noexcept { return static_cast<size_t>(len_); }
-    bool empty() const noexcept { return len_ == 0; }
-
-private:
-    uint8_t* buf_ = nullptr;
-    int64_t len_ = 0;
-};
-
 // Process-wide handle; each handler clones via stoolap_clone for thread safety.
 class Engine {
 public:
