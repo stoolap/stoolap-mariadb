@@ -144,10 +144,6 @@ private:
     bool reading_ = false;
     // Rows the read gave, added to Stoolap_buffered_rows when it ends
     uint64_t read_rows_ = 0;
-    // The error of the store callback, for the read's failure
-    int store_err_ = 0;
-    static int32_t store_cell(void* ctx, int32_t field, const uint8_t* cell,
-                              size_t len);
     StoolapCursor* read_cursor();
     void end_read() {
         if (reading_) stoolap_cursor_end(cursor_.get());

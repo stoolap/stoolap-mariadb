@@ -17,7 +17,7 @@ use std::panic;
 
 use stoolap::core::{Error, Result};
 
-use super::types::{StoolapDB, StoolapValue};
+use super::types::{StoolapDB, StoolapRows, StoolapValue};
 use super::{value, STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
 use crate::read::{Cond, CondOp, Cursor, Node, ReadSpec};
 use crate::record::{write_record, Sink, StoolapField, StoreFn};
@@ -48,6 +48,8 @@ pub struct StoolapCursor {
     cursor: Option<Cursor>,
     /// The fields each row fills
     fields: Vec<StoolapField>,
+    /// The column count of the query result it holds, if any
+    width: Option<usize>,
     /// The values the store callback takes, one at a time
     scratch: Vec<u8>,
     last_error: Option<CString>,
@@ -107,6 +109,7 @@ unsafe fn read_into(
     };
     handle.last_error = None;
     handle.cursor = None;
+    handle.width = None;
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| -> Result<()> {
         handle.fields = field_list(fields, nfields)?;
         let columns: Vec<usize> = handle.fields.iter().map(|f| f.column as usize).collect();
@@ -132,6 +135,7 @@ pub extern "C" fn stoolap_cursor_new() -> *mut StoolapCursor {
     Box::into_raw(Box::new(StoolapCursor {
         cursor: None,
         fields: Vec::new(),
+        width: None,
         scratch: Vec::new(),
         last_error: None,
     }))
@@ -233,6 +237,93 @@ pub unsafe extern "C" fn stoolap_end_statement(db: *mut StoolapDB, commit: i32) 
         }
         Err(_) => {
             handle.set_error("panic during stoolap_end_statement");
+            STOOLAP_ERROR
+        }
+    }
+}
+
+/// Takes every row of `rows` into `cursor`, ending the read it had, so
+/// that a query's runtime error shows here rather than halfway through
+/// its rows; `stoolap_cursor_set_fields` then says what they fill. `rows`
+/// is left empty.
+///
+/// # Safety
+///
+/// `rows` must be a valid `StoolapRows`, `cursor` a valid `StoolapCursor`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_rows_into_cursor(
+    rows: *mut StoolapRows,
+    cursor: *mut StoolapCursor,
+) -> i32 {
+    let (Some(rows), Some(handle)) = (rows.as_mut(), cursor.as_mut()) else {
+        return STOOLAP_ERROR;
+    };
+    handle.last_error = None;
+    handle.cursor = None;
+    handle.width = None;
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| -> Result<()> {
+        let mut taken = Vec::new();
+        if let Some(r) = rows.rows.as_mut() {
+            while r.advance() {
+                taken.push((0, r.take_row()));
+            }
+            if let Some(e) = r.error() {
+                return Err(e);
+            }
+        }
+        rows.rows = None;
+        rows.has_row = false;
+        handle.width = Some(rows.columns.len());
+        handle.cursor = Some(Cursor::from_rows(taken));
+        Ok(())
+    }));
+    match result {
+        Ok(Ok(())) => STOOLAP_OK,
+        Ok(Err(e)) => {
+            handle.set_error(&e.to_string());
+            STOOLAP_ERROR
+        }
+        Err(_) => {
+            handle.set_error("panic during stoolap_rows_into_cursor");
+            STOOLAP_ERROR
+        }
+    }
+}
+
+/// Sets the fields the rows `stoolap_rows_into_cursor` took fill, each
+/// naming a column of the result; refused when one is past its columns.
+///
+/// # Safety
+///
+/// `cursor` must be a valid `StoolapCursor`, `fields` hold `nfields`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_cursor_set_fields(
+    cursor: *mut StoolapCursor,
+    fields: *const StoolapField,
+    nfields: i32,
+) -> i32 {
+    let Some(handle) = cursor.as_mut() else {
+        return STOOLAP_ERROR;
+    };
+    handle.last_error = None;
+    let result = field_list(fields, nfields).and_then(|fields| {
+        let width = handle.width.unwrap_or(usize::MAX);
+        match fields.iter().find(|f| f.column as usize >= width) {
+            Some(f) => Err(Error::internal(format!(
+                "the result has {} columns, field {} reads column {}",
+                width, f.field, f.column
+            ))),
+            None => Ok(fields),
+        }
+    });
+    match result {
+        Ok(fields) => {
+            handle.fields = fields;
+            STOOLAP_OK
+        }
+        Err(e) => {
+            handle.cursor = None;
+            handle.set_error(&e.to_string());
             STOOLAP_ERROR
         }
     }

@@ -49,7 +49,7 @@ pub struct StoolapField {
     pub field: i32,
 }
 
-/// Stores the cell `cell` (`stoolap_rows_fetch_all` format, one value) in
+/// Stores the cell `cell` (the packed format, one value) in
 /// field `field`; 0 on success
 pub type StoreFn =
     unsafe extern "C" fn(ctx: *mut c_void, field: i32, cell: *const u8, len: usize) -> i32;

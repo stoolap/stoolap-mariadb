@@ -1145,59 +1145,74 @@ inline bool perf_trace_on() {
 }
 
 /**
- * Wraps a `StoolapRows*` opened by the eager stoolap_query in the
- * pushdown factory, immediately calls stoolap_rows_fetch_all to turn it
- * into a packed buffer, and parses the header. The handler then
- * delivers rows by walking the buffer in-process -- no per-cell FFI.
+ * The rows of a pushed query. The factory takes them all at once
+ * (stoolap_rows_into_cursor), so a runtime error still falls back to
+ * MariaDB; next_row then has the cursor write each into the handler's
+ * table record, result column c into table->field[c].
  */
-struct PushdownPacked {
-    stoolap_mariadb::StoolapBuffer buf;
-    size_t pos = 0;          // current parse offset (past header)
-    uint32_t cols = 0;       // declared column count
-    uint32_t rows_left = 0;  // rows still to deliver
-    bool ok = false;
+struct PushdownRows {
+    stoolap_mariadb::CursorPtr cursor;
+    bool described = false;
 
-    void take(stoolap_mariadb::RowsPtr rows) {
-        if (!rows) return;
-        uint8_t* raw = nullptr;
-        int64_t blen = 0;
-        int frc = stoolap_rows_fetch_all(rows.get(), &raw, &blen);
-        // RowsPtr destructor closes the iterator after fetch_all consumed it.
-        rows.reset();
-        if (frc != STOOLAP_OK) {
-            if (raw) stoolap_buffer_free(raw, blen);
-            return;
+    bool take(stoolap_mariadb::RowsPtr rows) {
+        if (!rows) return false;
+        cursor.reset(stoolap_cursor_new());
+        if (!cursor ||
+            stoolap_rows_into_cursor(rows.get(), cursor.get()) != STOOLAP_OK) {
+            cursor.reset();
+            return false;
         }
-        buf.take(raw, blen);
-        if (!stoolap_mariadb::pkt_parse_header(buf.data(), buf.size(), &pos,
-                                               &cols)) {
-            buf.reset();
-            return;
+        return true;
+    }
+
+    // The next row into table->record[0].
+    int next(TABLE* table, const char* what) {
+        if (!cursor) return HA_ERR_END_OF_FILE;
+        if (!described) {
+            std::vector<StoolapField> fields;
+            fields.reserve(table->s->fields);
+            for (uint c = 0; c < table->s->fields; ++c)
+                fields.push_back(stoolap_mariadb::record_field(
+                    table, c, static_cast<int32_t>(c)));
+            if (stoolap_cursor_set_fields(
+                    cursor.get(), fields.data(),
+                    static_cast<int32_t>(fields.size())) != STOOLAP_OK)
+                return fail(what);
+            described = true;
         }
-        if (pos + 4 > buf.size()) {
-            buf.reset();
-            return;
-        }
-        rows_left = stoolap_mariadb::pkt_le32(buf.data() + pos);
-        pos += 4;
-        ok = true;
+        stoolap_mariadb::RecordTarget target{table, 0};
+        int64_t id = 0;
+        int32_t last = 0;
+        const int rc = stoolap_cursor_next(cursor.get(), table->record[0],
+                                           &stoolap_mariadb::store_cell,
+                                           &target, &id, &last);
+        if (rc == STOOLAP_ROW) return 0;
+        if (rc == STOOLAP_DONE) return HA_ERR_END_OF_FILE;
+        return target.err ? target.err : fail(what);
+    }
+
+    int fail(const char* what) {
+        my_printf_error(ER_GET_ERRMSG, "stoolap %s: %s", MYF(0), what,
+                        stoolap_cursor_errmsg(cursor.get()));
+        cursor.reset();
+        return HA_ERR_GENERIC;
     }
 };
 
 class ha_stoolap_select_handler : public select_handler {
 public:
     ha_stoolap_select_handler(THD* thd_arg, SELECT_LEX* sel, std::string sql,
-                              PushdownPacked packed)
+                              PushdownRows rows)
         : select_handler(thd_arg, stoolap_hton, sel),
           sql_(std::move(sql)),
-          packed_(std::move(packed)) {}
+          rows_(std::move(rows)) {}
 
     // Unit overload: whole UNION/EXCEPT/INTERSECT pushdown.
     ha_stoolap_select_handler(THD* thd_arg, SELECT_LEX_UNIT* unit,
-                              std::string sql, PushdownPacked packed)
+                              std::string sql, PushdownRows rows)
         : select_handler(thd_arg, stoolap_hton, unit),
           sql_(std::move(sql)),
-          packed_(std::move(packed)) {}
+          rows_(std::move(rows)) {}
 
     ~ha_stoolap_select_handler() override = default;
 
@@ -1205,9 +1220,8 @@ protected:
     int init_scan() override {
         const bool trace = perf_trace_on();
         const uint64_t t0 = trace ? now_ns() : 0;
-        // Factory ran stoolap_query then stoolap_rows_fetch_all. If the
-        // packed buffer didn't materialise we have no data to deliver.
-        const int rc = packed_.ok ? 0 : HA_ERR_INTERNAL_ERROR;
+        // The factory ran the query and took its rows.
+        const int rc = rows_.cursor ? 0 : HA_ERR_INTERNAL_ERROR;
         if (trace) {
             stoolap_mariadb::g_stats.perf_init_scan_ns.fetch_add(
                 now_ns() - t0, std::memory_order_relaxed);
@@ -1218,37 +1232,7 @@ protected:
     int next_row() override {
         const bool trace = perf_trace_on();
         const uint64_t t0 = trace ? now_ns() : 0;
-        if (!packed_.ok || packed_.rows_left == 0) return HA_ERR_END_OF_FILE;
-
-        const uint fields = table->s->fields;
-        if (static_cast<uint>(packed_.cols) < fields) {
-            my_printf_error(ER_GET_ERRMSG,
-                            "stoolap pushdown: column count mismatch "
-                            "(got %u, want %u)",
-                            MYF(0), packed_.cols, fields);
-            packed_.rows_left = 0;
-            return HA_ERR_GENERIC;
-        }
-
-        const uint8_t* p = packed_.buf.data();
-        const size_t len = packed_.buf.size();
-        // The pushed SQL was built from the SELECT_LEX's item list, so
-        // result cell c maps 1:1 to table->field[c]. Trailing extra
-        // cells (schemas drifting under us) get skipped.
-        int err = 0;
-        for (uint c = 0; c < fields && !err; ++c) {
-            err = stoolap_mariadb::pkt_store_value(p, len, &packed_.pos,
-                                                   table->field[c]);
-        }
-        for (uint c = fields; c < packed_.cols && !err; ++c) {
-            if (!stoolap_mariadb::pkt_skip_value(p, len, &packed_.pos))
-                err = HA_ERR_GENERIC;
-        }
-        if (err) {
-            packed_.rows_left = 0;
-        } else {
-            packed_.rows_left--;
-        }
+        const int err = rows_.next(table, "pushdown");
         if (trace) {
             stoolap_mariadb::g_stats.perf_next_row_ns.fetch_add(
                 now_ns() - t0, std::memory_order_relaxed);
@@ -1261,7 +1245,7 @@ protected:
     int end_scan() override {
         const bool trace = perf_trace_on();
         const uint64_t t0 = trace ? now_ns() : 0;
-        packed_.buf.reset();
+        rows_.cursor.reset();
         if (trace) {
             stoolap_mariadb::g_stats.perf_end_scan_ns.fetch_add(
                 now_ns() - t0, std::memory_order_relaxed);
@@ -1271,7 +1255,7 @@ protected:
 
 private:
     std::string sql_;
-    PushdownPacked packed_;
+    PushdownRows rows_;
 };
 
 }  // namespace
@@ -1283,12 +1267,12 @@ void count_miss() {
         1, std::memory_order_relaxed);
 }
 
-// Runs generated pushdown SQL eagerly and packs its rows. Eager, so any
+// Runs generated pushdown SQL eagerly and takes its rows. Eager, so any
 // stoolap-side error (unknown function, type mismatch, ...) still falls
 // back to MariaDB: once a factory returns a handler, MariaDB is committed
 // to it. stoolap_prepare catches only syntax; semantic errors surface at
 // execute time only.
-bool run_pushdown(THD* thd, const std::string& sql, PushdownPacked* packed,
+bool run_pushdown(THD* thd, const std::string& sql, PushdownRows* rows,
                   uint64_t* eager_ns) {
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
         thd_get_ha_data(thd, stoolap_hton));
@@ -1342,8 +1326,7 @@ bool run_pushdown(THD* thd, const std::string& sql, PushdownPacked* packed,
         }
         return false;
     }
-    packed->take(stoolap_mariadb::RowsPtr(raw));
-    return packed->ok;
+    return rows->take(stoolap_mariadb::RowsPtr(raw));
 }
 
 void explain_refusal(THD* thd, const std::string& why) {
@@ -1372,16 +1355,16 @@ select_handler* create_stoolap_select_handler(THD* thd, SELECT_LEX* sel_lex,
         count_miss();
         return nullptr;
     }
-    PushdownPacked packed;
+    PushdownRows rows;
     uint64_t eager_ns = 0;
-    if (!run_pushdown(thd, sql, &packed, trace ? &eager_ns : nullptr)) {
+    if (!run_pushdown(thd, sql, &rows, trace ? &eager_ns : nullptr)) {
         count_miss();
         return nullptr;
     }
     stoolap_mariadb::g_stats.pushdown_hits.fetch_add(1,
                                                      std::memory_order_relaxed);
     auto* h = new ha_stoolap_select_handler(thd, sel_lex, std::move(sql),
-                                            std::move(packed));
+                                            std::move(rows));
     if (trace) {
         stoolap_mariadb::g_stats.perf_eager_query_ns.fetch_add(
             eager_ns, std::memory_order_relaxed);
@@ -1412,15 +1395,15 @@ select_handler* create_stoolap_unit_handler(THD* thd, SELECT_LEX_UNIT* unit) {
         count_miss();
         return nullptr;
     }
-    PushdownPacked packed;
-    if (!run_pushdown(thd, sql, &packed, nullptr)) {
+    PushdownRows rows;
+    if (!run_pushdown(thd, sql, &rows, nullptr)) {
         count_miss();
         return nullptr;
     }
     stoolap_mariadb::g_stats.pushdown_hits.fetch_add(1,
                                                      std::memory_order_relaxed);
     return new ha_stoolap_select_handler(thd, unit, std::move(sql),
-                                         std::move(packed));
+                                         std::move(rows));
 }
 
 }  // namespace stoolap_pushdown
@@ -1433,55 +1416,27 @@ namespace {
 
 class ha_stoolap_derived_handler : public derived_handler {
 public:
-    ha_stoolap_derived_handler(THD* thd_arg, std::string sql,
-                               PushdownPacked packed)
+    ha_stoolap_derived_handler(THD* thd_arg, std::string sql, PushdownRows rows)
         : derived_handler(thd_arg, stoolap_hton),
           sql_(std::move(sql)),
-          packed_(std::move(packed)) {}
+          rows_(std::move(rows)) {}
 
     ~ha_stoolap_derived_handler() override = default;
 
-    int init_scan() override { return packed_.ok ? 0 : HA_ERR_INTERNAL_ERROR; }
-
-    int next_row() override {
-        if (!packed_.ok || packed_.rows_left == 0) return HA_ERR_END_OF_FILE;
-
-        const uint fields = table->s->fields;
-        if (static_cast<uint>(packed_.cols) < fields) {
-            my_printf_error(ER_GET_ERRMSG,
-                            "stoolap derived: column count mismatch "
-                            "(got %u, want %u)",
-                            MYF(0), packed_.cols, fields);
-            packed_.rows_left = 0;
-            return HA_ERR_GENERIC;
-        }
-        const uint8_t* p = packed_.buf.data();
-        const size_t len = packed_.buf.size();
-        int err = 0;
-        for (uint c = 0; c < fields && !err; ++c) {
-            err = stoolap_mariadb::pkt_store_value(p, len, &packed_.pos,
-                                                   table->field[c]);
-        }
-        for (uint c = fields; c < packed_.cols && !err; ++c) {
-            if (!stoolap_mariadb::pkt_skip_value(p, len, &packed_.pos))
-                err = HA_ERR_GENERIC;
-        }
-        if (err) {
-            packed_.rows_left = 0;
-        } else {
-            packed_.rows_left--;
-        }
-        return err;
+    int init_scan() override {
+        return rows_.cursor ? 0 : HA_ERR_INTERNAL_ERROR;
     }
 
+    int next_row() override { return rows_.next(table, "derived"); }
+
     int end_scan() override {
-        packed_.buf.reset();
+        rows_.cursor.reset();
         return 0;
     }
 
 private:
     std::string sql_;
-    PushdownPacked packed_;
+    PushdownRows rows_;
 };
 
 }  // namespace
@@ -1526,15 +1481,14 @@ derived_handler* create_stoolap_derived_handler(THD* thd, TABLE_LIST* derived) {
         count_miss();
         return nullptr;
     }
-    PushdownPacked packed;
-    if (!run_pushdown(thd, sql, &packed, nullptr)) {
+    PushdownRows rows;
+    if (!run_pushdown(thd, sql, &rows, nullptr)) {
         count_miss();
         return nullptr;
     }
     stoolap_mariadb::g_stats.pushdown_hits.fetch_add(1,
                                                      std::memory_order_relaxed);
-    return new ha_stoolap_derived_handler(thd, std::move(sql),
-                                          std::move(packed));
+    return new ha_stoolap_derived_handler(thd, std::move(sql), std::move(rows));
 }
 
 bool item_safe_for_byte_comparison(Item* item) {

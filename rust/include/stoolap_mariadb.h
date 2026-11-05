@@ -408,8 +408,8 @@ typedef struct StoolapField {
 } StoolapField;
 
 /**
- * Stores one value, `cell` (one cell of the stoolap_rows_fetch_all()
- * format), in field `field`; returns 0, else the read fails.
+ * Stores one value, `cell` (one cell of the packed format below), in
+ * field `field`; returns 0, else the read fails.
  */
 typedef int32_t (*StoolapStoreFn)(void* ctx, int32_t field,
                                   const uint8_t* cell, size_t len);
@@ -465,6 +465,21 @@ int32_t stoolap_cursor_next(
     int64_t* row_id,
     int32_t* last
 );
+
+/**
+ * Take every row of `rows` into `cursor`, ending the read it had, so that
+ * a query's runtime error shows here rather than halfway through its rows.
+ * stoolap_cursor_set_fields() then says what the rows fill, and
+ * stoolap_cursor_next() gives them (row id 0). `rows` is left empty.
+ */
+int32_t stoolap_rows_into_cursor(StoolapRows* rows, StoolapCursor* cursor);
+
+/**
+ * Set the fields the taken rows fill, each naming a column of the result;
+ * refused when one is past its columns.
+ */
+int32_t stoolap_cursor_set_fields(StoolapCursor* cursor,
+                                  const StoolapField* fields, int32_t nfields);
 
 const char* stoolap_cursor_errmsg(const StoolapCursor* cursor);
 
@@ -561,7 +576,8 @@ void stoolap_rows_close(StoolapRows* rows);
  * ========================================================================= */
 
 /**
- * Fetch all remaining rows into a packed binary buffer (single call).
+ * The packed format of stoolap_query_params_all() and of the cells a
+ * StoolapStoreFn takes (one tag and payload).
  *
  * Format:
  *   [column_count: u32 LE]
@@ -579,28 +595,11 @@ void stoolap_rows_close(StoolapRows* rows);
  *       JSON(6):      len:u32 LE + bytes
  *       BLOB(7):      len:u32 LE + bytes (packed f32 for vectors)
  *   ]
- *
- * On success, *out_buf receives a heap-allocated buffer and *out_len its
- * byte length.  Caller MUST free with stoolap_buffer_free().
- * The rows handle's data is consumed; call stoolap_rows_close() afterward.
- * A runtime error that ends the result early returns STOOLAP_ERROR and no
- * buffer.
  */
-int32_t stoolap_rows_fetch_all(
-    StoolapRows* rows,
-    uint8_t** out_buf,
-    int64_t* out_len
-);
-
-/**
- * Free a buffer allocated by stoolap_rows_fetch_all().
- * Safe to call with NULL (no-op).
- */
-void stoolap_buffer_free(uint8_t* buf, int64_t len);
 
 /**
  * Run a query with positional parameters and pack every row, in the
- * stoolap_rows_fetch_all() format, in one call and without a rows handle.
+ * packed format above, in one call and without a rows handle.
  *
  * Runs inside tx when tx is not NULL; a tx begun on another database than
  * db (a stoolap_clone() of it is the same one) is an error. The buffer
