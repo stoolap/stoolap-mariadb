@@ -14,7 +14,7 @@
 use stoolap::core::{Result, Value};
 
 use crate::read::{Cond, CondOp, Node};
-use crate::record::{read_value, RecordIn, StoolapField, STOOLAP_FIELD_INT};
+use crate::record::{read_value, RecordIn, StoolapField, STOOLAP_FIELD_INT, STOOLAP_FIELD_VARCHAR};
 
 pub const STOOLAP_OP_EQ: i32 = 0;
 pub const STOOLAP_OP_GT: i32 = 1;
@@ -42,6 +42,11 @@ pub struct StoolapKeyBound {
     pub op: i32,
     /// Parts it leaves out, the caller's filter compares them (bit i)
     pub skip: u32,
+    /// Skipped equality parts in a PAD SPACE binary collation (bit i),
+    /// where `v` matches `rtrim(v)` and any trailing spaces: looked up as
+    /// those candidates (pad_space_nodes), the caller's filter still
+    /// compares them
+    pub pad: u32,
     /// `STOOLAP_BOUND_*`
     pub mode: i32,
 }
@@ -245,6 +250,13 @@ pub unsafe fn bound_nodes(
     let start = out.len();
     for (i, f) in parts[..n].iter().enumerate() {
         if bound.skip & (1 << i) != 0 {
+            // A utf8mb4 VARCHAR's byte order is its collation's; other
+            // encodings stay out
+            if bound.pad & (1 << i) != 0 && f.kind == STOOLAP_FIELD_VARCHAR {
+                if let KeyValue::Value(Value::Text(s)) = key_value(f, src)? {
+                    pad_space_nodes(f, &s, out);
+                }
+            }
             continue;
         }
         let op = if i == n - 1 { bound.op } else { STOOLAP_OP_EQ };
@@ -254,4 +266,33 @@ pub unsafe fn bound_nodes(
         }
     }
     Ok(true)
+}
+
+/// Past this many trailing-space variants a PAD SPACE lookup bounds a
+/// range instead
+const PAD_SPACE_LOOKUPS: usize = 256;
+
+/// The candidates for `f = s` in a PAD SPACE binary collation: the values
+/// `s` matches are its bytes without the trailing spaces followed by up to
+/// `max_chars` spaces. Each is an equality a hash index (stoolap's for TEXT)
+/// looks up; for a long column, the byte range they all sit in.
+fn pad_space_nodes(f: &StoolapField, s: &str, out: &mut Vec<Node>) {
+    let trimmed = s.trim_end_matches(' ');
+    let pads = (f.max_chars as usize).saturating_sub(trimmed.chars().count());
+    let mut v = String::with_capacity(trimmed.len() + pads);
+    v.push_str(trimmed);
+    if pads >= PAD_SPACE_LOOKUPS {
+        out.push(cond(f, CondOp::Ge, Value::text(trimmed)));
+        v.extend(std::iter::repeat_n(' ', pads));
+        out.push(cond(f, CondOp::Le, Value::text(v)));
+        return;
+    }
+    for _ in 0..pads {
+        out.push(cond(f, CondOp::Eq, Value::text(v.as_str())));
+        v.push(' ');
+    }
+    out.push(cond(f, CondOp::Eq, Value::text(v)));
+    if pads > 0 {
+        out.push(Node::Or(pads + 1));
+    }
 }

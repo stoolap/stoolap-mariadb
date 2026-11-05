@@ -315,6 +315,12 @@ typedef struct StoolapKeyBound {
     int32_t op;
     /** Parts left out for the caller's own comparison (bit i) */
     uint32_t skip;
+    /**
+     * Skipped equality parts in a PAD SPACE binary collation (bit i):
+     * looked up as rtrim(v) followed by each count of spaces the column
+     * fits, which the caller's comparison still filters
+     */
+    uint32_t pad;
     int32_t mode;
 } StoolapKeyBound;
 

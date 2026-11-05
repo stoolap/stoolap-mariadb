@@ -1618,6 +1618,15 @@ static bool key_part_needs_filter(const KEY_PART_INFO& kp, bool trust_bin) {
     }
 }
 
+// A filtered part whose collation orders bytes but pads with spaces
+// ('_bin'): stoolap looks up the values equal to a key but for trailing
+// spaces (StoolapKeyBound::pad), the filter compares them.
+static bool key_part_pads(const KEY_PART_INFO& kp, bool trust_bin) {
+    return key_part_needs_filter(kp, trust_bin) && kp.field &&
+           !(kp.key_part_flag & HA_PART_KEY_SEG) &&
+           (kp.field->charset()->state & MY_CS_BINSORT);
+}
+
 int ha_stoolap::index_init(uint keynr, bool sorted) {
     active_index = keynr;
     index_sorted_ = sorted;
@@ -1687,10 +1696,13 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     // key_part_needs_filter).
     const bool trust_bin = stoolap_thd_trust_binary_strings(ha_thd());
     uint32_t filter_mask = 0;
+    uint32_t pad_mask = 0;
     if (find_flag == HA_READ_KEY_EXACT) {
         for (uint i = 0; i < nparts; ++i) {
-            if (key_part_needs_filter(key_info.key_part[i], trust_bin))
+            const KEY_PART_INFO& kp = key_info.key_part[i];
+            if (key_part_needs_filter(kp, trust_bin))
                 filter_mask |= uint32_t(1) << i;
+            if (key_part_pads(kp, trust_bin)) pad_mask |= uint32_t(1) << i;
         }
     }
 
@@ -1717,7 +1729,7 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     }
 
     const StoolapKeyBound bound{table->record[1], static_cast<int32_t>(nparts),
-                                op, filter_mask, STOOLAP_BOUND_KEY};
+                                op, filter_mask, pad_mask, STOOLAP_BOUND_KEY};
     if (int err = open_read(&bound, 1, ir_order_.data(),
                             static_cast<int32_t>(ir_order_.size()), desc))
         return err;
@@ -1787,10 +1799,11 @@ int ha_stoolap::read_range_first(const key_range* start_key,
 
     KEY& key_info = table->key_info[active_index];
 
-    // Punt ci string ranges to handler::read_range_first (it does
-    // index_read_map(start) + per-row compare_key(end) using MariaDB's
-    // collation). _bin / BINARY / BLOB are byte-safe; NEWDECIMAL/ENUM/SET
-    // still punt (encoded bound semantics not re-validated).
+    // Ranges stoolap cannot compare as MariaDB does go to
+    // read_range_filtered: a prefix part, a ci or PAD SPACE collation
+    // (key_part_needs_filter), a hex encoding out of order; NEWDECIMAL /
+    // ENUM / SET too (encoded bound semantics not re-validated).
+    const bool trust_bin = stoolap_thd_trust_binary_strings(ha_thd());
     auto contains_unsafe_part = [&](const key_range* range) {
         if (!range) return false;
         for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
@@ -1808,9 +1821,9 @@ int ha_stoolap::read_range_first(const key_range* start_key,
                             stoolap_mariadb::Enc::HEX &&
                         !stoolap_mariadb::hex_keeps_order(f))
                         return true;
-                    CHARSET_INFO* cs = f->charset();
-                    if (cs && (cs->state & MY_CS_BINSORT)) break;
-                    return true;
+                    if (key_part_needs_filter(key_info.key_part[i], trust_bin))
+                        return true;
+                    break;
                 }
                 case MYSQL_TYPE_NEWDECIMAL:
                 case MYSQL_TYPE_ENUM:
@@ -1877,7 +1890,7 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         if (nparts == 0) return 0;
         std::memset(rec, 0, table->s->reclength);
         key_restore(rec, range->key, &key_info, klen);
-        bounds[nbounds++] = {rec, static_cast<int32_t>(nparts), op, 0,
+        bounds[nbounds++] = {rec, static_cast<int32_t>(nparts), op, 0, 0,
                              STOOLAP_BOUND_RANGE};
         return 0;
     };
@@ -2001,8 +2014,16 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
             key_restore(rec, r->key, &ki, ki.key_part[0].store_length);
             bounds[nbounds++] = {rec, 1,
                                  r == start_key ? STOOLAP_OP_GE : STOOLAP_OP_LE,
-                                 0, STOOLAP_BOUND_LEADING};
+                                 0, 0, STOOLAP_BOUND_LEADING};
         }
+    } else if (const_prefix > 0 && key_part_pads(ki.key_part[0], trust_bin)) {
+        // Every row of the range equals the bounds' first part there: the
+        // values a PAD SPACE part matches, as index_read_map looks them up.
+        std::memset(table->record[1], 0, table->s->reclength);
+        key_restore(table->record[1], start_key->key, &ki,
+                    ki.key_part[0].store_length);
+        bounds[nbounds++] = {table->record[1], 1, STOOLAP_OP_EQ, 1, 1,
+                             STOOLAP_BOUND_KEY};
     }
     if (sorted) {
         // The order index_flags promised: every part offering it, past
