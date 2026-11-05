@@ -310,7 +310,7 @@ pub unsafe extern "C" fn stoolap_query(
     sql: *const c_char,
     out_rows: *mut *mut StoolapRows,
 ) -> i32 {
-    stoolap_query_params(db, sql, std::ptr::null(), 0, out_rows)
+    query_params(db, sql, std::ptr::null(), 0, out_rows)
 }
 
 /// Execute a query with positional parameters, returning a result set.
@@ -321,8 +321,7 @@ pub unsafe extern "C" fn stoolap_query(
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL).
 /// - `out_rows` must be a valid pointer to a `*mut StoolapRows`.
-#[no_mangle]
-pub unsafe extern "C" fn stoolap_query_params(
+unsafe fn query_params(
     db: *mut StoolapDB,
     sql: *const c_char,
     params: *const StoolapValue,
@@ -370,7 +369,7 @@ pub unsafe extern "C" fn stoolap_query_params(
     }));
 
     result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_query_params");
+        handle.set_error("panic during stoolap_query");
         STOOLAP_ERROR
     })
 }

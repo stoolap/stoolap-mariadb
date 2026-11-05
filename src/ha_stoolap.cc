@@ -285,17 +285,6 @@ int query_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
     return stoolap_query(warm_db(ctx, fallback), sql, out_rows);
 }
 
-int query_params_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
-                     const char* sql, const StoolapValue* params,
-                     int32_t nparams, StoolapRows** out_rows) {
-    if (ctx && ctx->has_tx()) {
-        return stoolap_tx_query_params(ctx->tx(), sql, params, nparams,
-                                       out_rows);
-    }
-    return stoolap_query_params(warm_db(ctx, fallback), sql, params, nparams,
-                                out_rows);
-}
-
 }  // namespace (helpers below have external linkage so
 // ha_stoolap_select.cc can call them.)
 
@@ -1078,12 +1067,8 @@ std::string stoolap_table_name(const TABLE_SHARE* share) {
 
 ha_stoolap::ha_stoolap(handlerton* hton, TABLE_SHARE* table_arg)
     : handler(hton, table_arg) {
-    // Schema-only instances (mysql_create_frm_image) have a NULL share.
-    // `ref`: a flag byte, stoolap's row id, and the full record for a row
-    // a SQL read returned, which has no row id (see position()).
-    if (table_arg) {
-        ref_length = 1 + 8 + table_arg->reclength;
-    }
+    // `ref`: a flag byte and stoolap's row id (see position()).
+    ref_length = 1 + 8;
 }
 
 ulonglong ha_stoolap::table_flags() const {
@@ -1158,27 +1143,6 @@ void create_secondary_indexes(StoolapDB* db, const std::string& tbl,
 
 int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
     stoolap_table_ = stoolap_table_from_path(name);
-
-    // Detect BLOB/TEXT columns once per open. rnd_pos() needs this to refuse
-    // restore-from-ref when any field's in-record bytes are a (length, ptr)
-    // trio whose ptr lifetime is bound to the prior rnd_next's value-store
-    // (see has_blob_field_ comment in ha_stoolap.h).
-    has_blob_field_ = false;
-    if (table) {
-        for (uint i = 0; i < table->s->fields; ++i) {
-            switch (table->field[i]->real_type()) {
-                case MYSQL_TYPE_TINY_BLOB:
-                case MYSQL_TYPE_BLOB:
-                case MYSQL_TYPE_MEDIUM_BLOB:
-                case MYSQL_TYPE_LONG_BLOB:
-                    has_blob_field_ = true;
-                    break;
-                default:
-                    break;
-            }
-            if (has_blob_field_) break;
-        }
-    }
 
     // Reconcile: MariaDB may have a .frm while stoolap is missing the table
     // (fresh datadir, wipe, DSN switch). CREATE TABLE IF NOT EXISTS no-ops
@@ -2187,63 +2151,6 @@ using stoolap_mariadb::pkt_parse_header;
 using stoolap_mariadb::pkt_skip_value;
 using stoolap_mariadb::pkt_store_value;
 
-std::vector<uint32_t> ha_stoolap::projection_words() const {
-    std::vector<uint32_t> w;
-    if (!table->read_set || !table->write_set) return w;
-    const uint fields = table->s->fields;
-    w.assign((fields + 31) / 32, 0);
-    for (uint i = 0; i < fields; ++i) {
-        if (bitmap_is_set(table->read_set, i) ||
-            bitmap_is_set(table->write_set, i)) {
-            w[i / 32] |= uint32_t(1) << (i % 32);
-        }
-    }
-    return w;
-}
-
-std::string ha_stoolap::build_scan_columns() {
-    // Project read_set | write_set: write_set covers UPDATE's old/new
-    // compare; ORDER BY columns are already in read_set (filesort would
-    // read garbage otherwise). Only-read_set broke ORDER BY paths.
-    scan_proj_cols_ = projection_words();
-    scan_proj_.assign(table->s->fields, -1);
-    if (!table->read_set || !table->write_set) {
-        for (uint i = 0; i < table->s->fields; ++i)
-            scan_proj_[i] = i;
-        return "*";
-    }
-    // Plus the PRIMARY KEY, which MariaDB leaves out of read_set: a row a
-    // SQL read returns has no row id, so position(), update_row and
-    // delete_row take it from the key (see key_row_id).
-    TABLE_SHARE* share = table->s;
-    if (share->primary_key < share->keys) {
-        const KEY& pk = share->key_info[share->primary_key];
-        for (uint j = 0; j < pk.user_defined_key_parts; ++j) {
-            const uint i = pk.key_part[j].fieldnr - 1;
-            scan_proj_cols_[i / 32] |= uint32_t(1) << (i % 32);
-        }
-    }
-
-    std::string cols;
-    int proj_pos = 0;
-    for (uint i = 0; i < table->s->fields; ++i) {
-        const bool need = scan_proj_cols_[i / 32] & (uint32_t(1) << (i % 32));
-        if (!need) continue;
-        scan_proj_[i] = proj_pos++;
-        if (!cols.empty()) cols += ", ";
-        Field* f = table->field[i];
-        cols.append(quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length)));
-    }
-    if (cols.empty()) {
-        // No bits set -- COUNT(*)-shape needs one row per stoolap row.
-        for (uint i = 0; i < table->s->fields; ++i)
-            scan_proj_[i] = i;
-        return "*";
-    }
-    return cols;
-}
-
 int ha_stoolap::rnd_init(bool /*scan*/) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     reset_scan_state();
@@ -2251,8 +2158,9 @@ int ha_stoolap::rnd_init(bool /*scan*/) {
 }
 
 void ha_stoolap::refresh_projection() {
-    // build_scan_columns' projection without the SQL text: read_set |
-    // write_set, or every field when there are no bitmaps or no bits.
+    // read_set | write_set (write_set covers UPDATE's old / new compare),
+    // or every field when there are no bitmaps or no bits (a COUNT(*)
+    // still needs a row per row).
     const uint fields = table->s->fields;
     std::vector<uint32_t>& w = proj_words_scratch_;
     w.assign((fields + 31) / 32, 0);
@@ -2268,41 +2176,46 @@ void ha_stoolap::refresh_projection() {
     } else {
         w.clear();
     }
-    if (w == read_cols_words_ && w == scan_proj_cols_ && !read_cols_.empty())
-        return;
-    scan_proj_.assign(fields, -1);
+    if (w == read_cols_words_ && !read_cols_.empty()) return;
     read_cols_.clear();
     scan_buf_cell_to_field_.clear();
     for (uint i = 0; i < fields; ++i) {
         if (any && !(w[i / 32] & (uint32_t(1) << (i % 32)))) continue;
-        scan_proj_[i] = static_cast<int>(read_cols_.size());
         read_cols_.push_back(static_cast<int32_t>(i));
         scan_buf_cell_to_field_.push_back(static_cast<int>(i));
     }
     read_cols_words_ = w;
-    scan_proj_cols_ = w;
 }
 
 // Opens a direct read of the projected columns and loads its first chunk.
 int ha_stoolap::open_read(const StoolapCond* conds, int32_t nconds,
-                          const int32_t* order, int32_t norder, bool desc) {
+                          const int32_t* order, int32_t norder, bool desc,
+                          uint32_t first_chunk) {
     refresh_projection();
     const uint fields = table->s->fields;
 
     auto* ctx = get_thd_ctx(ha_thd());
     StoolapDB* db = ctx->db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
+    // A statement that sets the primary key moves rows to new ids
+    int32_t flags = desc ? STOOLAP_READ_DESC : 0;
+    const uint pk = table->s->primary_key;
+    if (pk != MAX_KEY &&
+        bitmap_is_set(table->write_set,
+                      table->key_info[pk].key_part[0].fieldnr - 1))
+        flags |= STOOLAP_READ_FIXED;
     StoolapCursor* cur = nullptr;
     if (stoolap_read(db, stoolap_table_.c_str(), static_cast<int32_t>(fields),
                      read_cols_.data(), static_cast<int32_t>(read_cols_.size()),
-                     conds, nconds, order, norder, desc ? 1 : 0,
-                     &cur) != STOOLAP_OK) {
+                     conds, nconds, order, norder, flags, &cur) != STOOLAP_OK) {
         auto verr = fetch_db_error(db);
         sql_print_error("stoolap: read failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     cursor_.reset(cur);
-    cursor_chunk_ = stoolap_thd_has_explicit_limit(ha_thd()) ? 64 : 1024;
+    cursor_chunk_ = first_chunk                                ? first_chunk
+                    : stoolap_thd_has_explicit_limit(ha_thd()) ? 64
+                                                               : 1024;
     stoolap_mariadb::g_stats.buffered_scans.fetch_add(
         1, std::memory_order_relaxed);
     return next_chunk();
@@ -2407,106 +2320,18 @@ int ha_stoolap::rnd_next(uchar* buf) {
         return err;
     }
 
-    // Streaming SQL result: filtered range reads set up scan_.
-    cur_row_id_valid_ = false;
-    if (!scan_) return HA_ERR_END_OF_FILE;
-
-    int rc = stoolap_rows_next(scan_.get());
-    if (rc == STOOLAP_DONE) return HA_ERR_END_OF_FILE;
-    if (rc != STOOLAP_ROW) {
-        sql_print_error("stoolap: rows_next: %s",
-                        stoolap_rows_errmsg(scan_.get()));
-        return HA_ERR_GENERIC;
-    }
-    // Schema mismatch is caught at rnd_init / index_init when we open the
-    // result set; checking column_count() per row here was paying one FFI
-    // call per scanned row for a check that can't change mid-scan.
-
-    const my_ptrdiff_t row_diff =
-        static_cast<my_ptrdiff_t>(buf - table->record[0]);
-    move_fields(table, row_diff);
-
-    if (table->s->null_bytes) {
-        std::memset(buf, 0, table->s->null_bytes);
-    }
-
-    int err = 0;
-    // We tried bitmap-gated projection (read_set | write_set) but MariaDB's
-    // filesort / temp-table / GROUP BY paths sometimes consult columns
-    // outside the bitmap for sort keys, producing empty results on
-    // ORDER BY ... LIMIT N. Populating every projected column is the only
-    // correct choice without diving into the optimizer hooks.
-    for (uint i = 0; i < table->s->fields; ++i) {
-        const int col = (i < scan_proj_.size()) ? scan_proj_[i] : -1;
-        if (col < 0) continue;
-        Field* f = table->field[i];
-        // Skip column_is_null FFI for NOT NULL columns (schema guarantees);
-        // for nullable, set_notnull() clears stale 1s in the null bitmap.
-        if (f->maybe_null()) {
-            if (stoolap_rows_column_is_null(scan_.get(),
-                                            static_cast<int32_t>(col))) {
-                f->set_null();
-                continue;
-            }
-            f->set_notnull();
-        }
-        const int32_t c = static_cast<int32_t>(col);
-        switch (f->real_type()) {
-            case MYSQL_TYPE_TINY:
-            case MYSQL_TYPE_SHORT:
-            case MYSQL_TYPE_LONG:
-            case MYSQL_TYPE_LONGLONG:
-            case MYSQL_TYPE_INT24:
-            case MYSQL_TYPE_YEAR:
-            case MYSQL_TYPE_BIT:
-            case MYSQL_TYPE_DATE:
-            case MYSQL_TYPE_NEWDATE:
-            case MYSQL_TYPE_TIME:
-            case MYSQL_TYPE_TIME2:
-            case MYSQL_TYPE_DATETIME:
-            case MYSQL_TYPE_DATETIME2:
-            case MYSQL_TYPE_TIMESTAMP:
-            case MYSQL_TYPE_TIMESTAMP2:
-            case MYSQL_TYPE_ENUM:
-            case MYSQL_TYPE_SET:
-                // INTEGER columns; store_int decodes by the field's type.
-                stoolap_mariadb::store_int(
-                    f, stoolap_rows_column_int64(scan_.get(), c));
-                break;
-            case MYSQL_TYPE_FLOAT:
-            case MYSQL_TYPE_DOUBLE:
-                f->store(stoolap_rows_column_double(scan_.get(), c));
-                break;
-            case MYSQL_TYPE_VARCHAR:
-            case MYSQL_TYPE_VAR_STRING:
-            case MYSQL_TYPE_STRING:
-            case MYSQL_TYPE_NEWDECIMAL:
-            case MYSQL_TYPE_TINY_BLOB:
-            case MYSQL_TYPE_BLOB:
-            case MYSQL_TYPE_MEDIUM_BLOB:
-            case MYSQL_TYPE_LONG_BLOB: {
-                int64_t len = 0;
-                const char* s = stoolap_rows_column_text(scan_.get(), c, &len);
-                if (s) {
-                    stoolap_mariadb::store_text(f, s, static_cast<size_t>(len));
-                } else if (f->maybe_null()) {
-                    f->set_null();
-                }
-                break;
-            }
-            default:
-                err = HA_ERR_UNSUPPORTED;
-                goto done;
-        }
-    }
-
-done:
-    move_fields(table, -row_diff);
-    return err;
+    return HA_ERR_END_OF_FILE;
 }
 
 int ha_stoolap::rnd_pos(uchar* buf, uchar* pos) {
-    if (pos[0]) {
+    if (!pos[0]) {
+        // position() had no row id for it (see there).
+        my_printf_error(ER_GET_ERRMSG,
+                        "stoolap: re-read by position of a row with no row id",
+                        MYF(0));
+        return HA_ERR_UNSUPPORTED;
+    }
+    {
         // Re-read the row by its id.
         int64_t id;
         std::memcpy(&id, pos + 1, sizeof(id));
@@ -2531,20 +2356,6 @@ int ha_stoolap::rnd_pos(uchar* buf, uchar* pos) {
         const int rc = rnd_next(buf);
         return rc == HA_ERR_END_OF_FILE ? HA_ERR_RECORD_DELETED : rc;
     }
-    // BLOB hazard: a BLOB Field's in-record bytes are (length, ptr) where
-    // ptr is owned by the prior read's value-store and overwritten by the
-    // next one. Restoring ref bytes verbatim resurrects a freed pointer.
-    if (has_blob_field_) {
-        my_printf_error(ER_GET_ERRMSG,
-                        "stoolap: rnd_pos / re-read by position is not "
-                        "supported on tables with BLOB/TEXT columns "
-                        "(would resurrect freed payload pointer)",
-                        MYF(0));
-        return HA_ERR_UNSUPPORTED;
-    }
-    std::memcpy(buf, pos + 9, table->s->reclength);
-    cur_row_id_valid_ = false;
-    return 0;
 }
 
 // The row id of the row in `record` when the last read gave none: a
@@ -2568,19 +2379,13 @@ bool ha_stoolap::key_row_id(const uchar* record, int64_t* id) {
 }
 
 void ha_stoolap::position(const uchar* record) {
-    // A row is named by its row id, from the read or else from its key; a
-    // row with neither keeps its record. A row id alone names the row:
-    // the rest stays zero, so cmp_ref() finds two positions of one row
-    // equal.
+    // A row is named by its row id: the last read's, or else its key's.
+    // Every read gives one, so the else is a row MariaDB positions with no
+    // read before it, which rnd_pos() refuses (flag 0).
     int64_t id = cur_row_id_;
-    if (cur_row_id_valid_ || key_row_id(record, &id)) {
-        ref[0] = 1;
-        std::memcpy(ref + 1, &id, sizeof(id));
-        std::memset(ref + 9, 0, table->s->reclength);
-        return;
-    }
-    std::memset(ref, 0, 9);
-    std::memcpy(ref + 9, record, table->s->reclength);
+    const bool known = cur_row_id_valid_ || key_row_id(record, &id);
+    ref[0] = known ? 1 : 0;
+    std::memcpy(ref + 1, &id, sizeof(id));
 }
 
 // Whether an exact-lookup key part must be filtered by MariaDB rather
@@ -2820,63 +2625,33 @@ int ha_stoolap::index_next(uchar* buf) {
 int ha_stoolap::index_first(uchar* buf) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     if (active_index >= table->s->keys) return HA_ERR_INTERNAL_ERROR;
-    reset_scan_state();
-
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
-    sql += " ORDER BY ";
-    KEY& ki = table->key_info[active_index];
-    for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
-        if (i) sql += ", ";
-        Field* f = ki.key_part[i].field;
-        sql += quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length));
-    }
-    // No LIMIT 1: besides MIN probes, MariaDB runs ordered full index
-    // scans (UPDATE/DELETE ... ORDER BY pk LIMIT n) as index_first then
-    // index_next, which reads on from this stream. (index_last stays a
-    // one-row probe: without HA_READ_PREV nothing scans backwards.)
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: index_first SELECT failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    scan_.reset(rows);
-    int next_rc = rnd_next(buf);
-    return (next_rc == HA_ERR_END_OF_FILE) ? HA_ERR_KEY_NOT_FOUND : next_rc;
+    return index_end_read(buf, false);
 }
 
 int ha_stoolap::index_last(uchar* buf) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     if (active_index >= table->s->keys) return HA_ERR_INTERNAL_ERROR;
-    reset_scan_state();
+    return index_end_read(buf, true);
+}
 
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
-    sql += " ORDER BY ";
+// The whole table in the active index's order, from its first row (or
+// its last, `desc`). Besides MIN / MAX probes, which read one row and so
+// start with a one-row chunk, MariaDB runs ordered full index scans
+// (UPDATE / DELETE ... ORDER BY pk LIMIT n) as index_first then
+// index_next, which reads on. (Nothing scans backwards: no HA_READ_PREV.)
+int ha_stoolap::index_end_read(uchar* buf, bool desc) {
+    reset_scan_state();
     KEY& ki = table->key_info[active_index];
-    for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
-        if (i) sql += ", ";
-        Field* f = ki.key_part[i].field;
-        sql += quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length));
-        sql += " DESC";
-    }
-    sql += " LIMIT 1";
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: index_last SELECT failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    scan_.reset(rows);
-    int next_rc = rnd_next(buf);
-    return (next_rc == HA_ERR_END_OF_FILE) ? HA_ERR_KEY_NOT_FOUND : next_rc;
+    ir_order_.clear();
+    for (uint i = 0; i < ki.user_defined_key_parts; ++i)
+        ir_order_.push_back(
+            static_cast<int32_t>(ki.key_part[i].field->field_index));
+    if (int err = open_read(nullptr, 0, ir_order_.data(),
+                            static_cast<int32_t>(ir_order_.size()), desc,
+                            /*first_chunk=*/1))
+        return err;
+    const int rc = rnd_next(buf);
+    return rc == HA_ERR_END_OF_FILE ? HA_ERR_KEY_NOT_FOUND : rc;
 }
 
 int ha_stoolap::read_range_first(const key_range* start_key,
@@ -2927,25 +2702,7 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         return read_range_filtered(start_key, end_key, sorted);
     }
 
-    // Lexicographic-tuple semantics: (a,b) >= (1,5) is NOT a >= 1 AND b >= 5
-    // (which would be empty when paired with the upper bound). Expand to
-    //   (a > 1) OR (a = 1 AND b >= 5)   -- lower bound
-    //   (a < 2) OR (a = 2 AND b <= 3)   -- upper bound
-    // evaluated correctly by stoolap's expression VM.
-    auto count_bound_parts = [&](const key_range* range) -> uint {
-        if (!range) return 0;
-        uint n = 0;
-        for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
-            if (!(range->keypart_map & (key_part_map(1) << i))) break;
-            n = i + 1;
-        }
-        return n;
-    };
-    const uint start_parts = count_bound_parts(start_key);
-    const uint end_parts = count_bound_parts(end_key);
-    const bool composite_range = (start_parts > 1 || end_parts > 1);
-
-    // SQL op for the last bound part; earlier parts are always equality.
+    // The comparison for the last bound part; earlier parts are equality.
     auto op_for_start = [](ha_rkey_function f) -> const char* {
         switch (f) {
             case HA_READ_KEY_EXACT:
@@ -2987,38 +2744,32 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         }
     };
 
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
-
-    std::vector<StoolapValue> params;
-    // deque, not vector: append_bound runs twice and stashes
-    // text_holders.back().data() into StoolapValue.text.ptr; a vector
-    // realloc between phases would invalidate pointers from phase one.
+    ir_conds_.clear();
+    ir_order_.clear();
+    // deque: the conditions' text values point into these.
     std::deque<std::string> text_holders;
-    int next_param = 1;
-    bool any_pred = false;
-
-    // For nparts > 1 with non-eq last_op emits the OR-chain:
-    //   (p0 <strict> v0) OR (p0 = v0 AND p1 <last_op> v1)
-    auto append_lex_bound = [&](const char* col, const char* op, int param_no,
-                                bool is_first_pred) {
-        sql += is_first_pred ? " WHERE " : " AND ";
-        sql += col;
-        sql += ' ';
-        sql += op;
-        sql += " $";
-        sql += std::to_string(param_no);
+    auto push_cond = [&](Field* f, int32_t op, const StoolapValue& v) {
+        StoolapCond c{};
+        c.column = static_cast<int32_t>(f->field_index);
+        c.op = op;
+        c.value = v;
+        ir_conds_.push_back(c);
     };
-    (void)composite_range;
+    auto push_join = [&](int32_t op, int32_t n) {
+        StoolapCond c{};
+        c.column = n;
+        c.op = op;
+        ir_conds_.push_back(c);
+    };
+
     auto append_bound = [&](const key_range* range,
-                            const char* (*op_fn)(ha_rkey_function),
-                            bool is_end) -> int {
+                            const char* (*op_fn)(ha_rkey_function)) -> int {
         if (!range) return 0;
         const char* last_op = op_fn(range->flag);
         if (!last_op) return HA_ERR_UNSUPPORTED;
         const bool is_eq_op = (last_op[0] == '=' && last_op[1] == '\0');
-        // Strict variant for OR-chain prefix legs: ">=" / ">" -> ">".
-        const char strict = (last_op[0] == '>') ? '>' : '<';
+        // Strict variant for the chain's prefix legs: ">=" / ">" -> ">".
+        const char* strict = (last_op[0] == '>') ? ">" : "<";
 
         uint nparts = 0, klen = 0;
         count_parts(key_info, range->keypart_map, nparts, klen);
@@ -3031,81 +2782,56 @@ int ha_stoolap::read_range_first(const key_range* start_key,
             static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
         move_fields(table, d);
 
-        // OR-chain for composite non-eq bounds.
+        // A composite non-equality bound is lexicographic: (a,b) >= (1,5)
+        // is (a > 1) OR (a = 1 AND b >= 5), not a >= 1 AND b >= 5.
         if (nparts > 1 && !is_eq_op) {
-            // Bind every key-part value once; each is referenced per leg.
-            std::vector<int> param_nos;
-            param_nos.reserve(nparts);
+            std::vector<StoolapValue> vals(nparts);
             for (uint i = 0; i < nparts; ++i) {
                 Field* f = key_info.key_part[i].field;
                 if (f->is_null()) {
                     move_fields(table, -d);
                     return HA_ERR_KEY_NOT_FOUND;  // NULL in lex bound: no rows.
                 }
-                StoolapValue v{};
                 text_holders.emplace_back();
-                if (!extract_field(f, v, text_holders.back())) {
+                if (!extract_field(f, vals[i], text_holders.back())) {
                     move_fields(table, -d);
                     return HA_ERR_UNSUPPORTED;
                 }
-                params.push_back(v);
-                param_nos.push_back(next_param++);
             }
-            sql += any_pred ? " AND (" : " WHERE (";
-            any_pred = true;
-            for (uint chain_i = 0; chain_i < nparts; ++chain_i) {
-                if (chain_i) sql += " OR ";
-                sql += "(";
-                for (uint i = 0; i <= chain_i; ++i) {
-                    if (i) sql += " AND ";
-                    Field* f = key_info.key_part[i].field;
-                    sql += quote_ident(std::string_view(f->field_name.str,
-                                                        f->field_name.length));
-                    char this_op[3] = {0};
-                    if (i < chain_i) {
-                        this_op[0] = '=';
-                    } else if (chain_i < nparts - 1) {
-                        this_op[0] = strict;
-                    } else {
-                        this_op[0] = last_op[0];
-                        this_op[1] = last_op[1];
-                    }
-                    sql.push_back(' ');
-                    sql += this_op;
-                    sql += " $";
-                    sql += std::to_string(param_nos[i]);
+            // The bound it implies on the leading part, which an index
+            // can read (an OR alone is not).
+            push_cond(key_info.key_part[0].field,
+                      strict[0] == '>' ? STOOLAP_OP_GE : STOOLAP_OP_LE,
+                      vals[0]);
+            for (uint leg = 0; leg < nparts; ++leg) {
+                for (uint i = 0; i <= leg; ++i) {
+                    const char* op = i < leg            ? "="
+                                     : leg < nparts - 1 ? strict
+                                                        : last_op;
+                    push_cond(key_info.key_part[i].field, cond_op(op), vals[i]);
                 }
-                sql += ")";
+                if (leg)
+                    push_join(STOOLAP_OP_AND, static_cast<int32_t>(leg + 1));
             }
-            sql += ")";
+            push_join(STOOLAP_OP_OR, static_cast<int32_t>(nparts));
             move_fields(table, -d);
-            (void)is_end;
-            (void)append_lex_bound;
             return 0;
         }
 
         for (uint i = 0; i < nparts; ++i) {
             Field* f = key_info.key_part[i].field;
-            const bool is_last = (i == nparts - 1);
-            const char* op = is_last ? last_op : "=";
-            Beyond beyond = Beyond::NONE;
-            const bool special = f->is_null() || unsigned_beyond_i64(f);
-            if (special) {
-                beyond = bound_beyond(op, f->is_null());
+            const char* op = (i == nparts - 1) ? last_op : "=";
+            if (f->is_null() || unsigned_beyond_i64(f)) {
+                const Beyond beyond = bound_beyond(op, f->is_null());
                 if (beyond == Beyond::NONE) {
                     move_fields(table, -d);
                     return HA_ERR_KEY_NOT_FOUND;
                 }
                 if (beyond == Beyond::ALL) continue;
-            }
-
-            sql += any_pred ? " AND " : " WHERE ";
-            any_pred = true;
-
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-            if (special) {
-                sql += beyond == Beyond::IS_NULL ? " IS NULL" : " IS NOT NULL";
+                push_cond(f,
+                          beyond == Beyond::IS_NULL ? STOOLAP_OP_IS_NULL
+                                                    : STOOLAP_OP_IS_NOT_NULL,
+                          StoolapValue{});
                 continue;
             }
             StoolapValue v{};
@@ -3114,23 +2840,17 @@ int ha_stoolap::read_range_first(const key_range* start_key,
                 move_fields(table, -d);
                 return HA_ERR_UNSUPPORTED;
             }
-            sql.push_back(' ');
-            sql += op;
-            sql += " $";
-            sql += std::to_string(next_param++);
-            params.push_back(v);
+            push_cond(f, cond_op(op), v);
         }
         move_fields(table, -d);
-        (void)is_end;
         return 0;
     };
 
-    if (int rc = append_bound(start_key, op_for_start, /*is_end=*/false))
-        return rc;
-    if (int rc = append_bound(end_key, op_for_end, /*is_end=*/true)) return rc;
+    if (int rc = append_bound(start_key, op_for_start)) return rc;
+    if (int rc = append_bound(end_key, op_for_end)) return rc;
 
-    // Skip ORDER BY when an exact unique-index lookup (one row) or when
-    // MariaDB's `sorted` flag says the range plan doesn't need order.
+    // Skip the order when an exact unique-index lookup (one row) or when
+    // MariaDB's `sorted` flag says the range plan doesn't need it.
     bool exact_unique = false;
     if (start_key && start_key->flag == HA_READ_KEY_EXACT &&
         (key_info.flags & HA_NOSAME)) {
@@ -3139,27 +2859,16 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         exact_unique = (sk_parts == key_info.user_defined_key_parts);
     }
     if (!exact_unique && sorted) {
-        sql += " ORDER BY ";
-        for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
-            if (i) sql += ", ";
-            Field* f = key_info.key_part[i].field;
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-        }
+        for (uint i = 0; i < key_info.user_defined_key_parts; ++i)
+            ir_order_.push_back(
+                static_cast<int32_t>(key_info.key_part[i].field->field_index));
     }
 
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    int rc = query_params_via(ctx, db_raw(), sql.c_str(), params.data(),
-                              static_cast<int32_t>(params.size()), &rows);
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: read_range query failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    scan_.reset(rows);
-    int next_rc = rnd_next(table->record[0]);
-    return (next_rc == HA_ERR_END_OF_FILE) ? HA_ERR_END_OF_FILE : next_rc;
+    if (int err = open_read(
+            ir_conds_.data(), static_cast<int32_t>(ir_conds_.size()),
+            ir_order_.data(), static_cast<int32_t>(ir_order_.size()), false))
+        return err;
+    return rnd_next(table->record[0]);
 }
 
 int ha_stoolap::read_range_next() {
@@ -3233,17 +2942,14 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
         }
     }
 
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
-    std::vector<StoolapValue> params;
+    ir_conds_.clear();
+    ir_order_.clear();
     std::deque<std::string> holders;
     if (part_safe(0)) {
         // Every row of the range has its first part between the bounds'
         // first parts (inclusive, whatever the flags); NULLs sort first,
         // so an upper bound keeps them.
         Field* f = ki.key_part[0].field;
-        const std::string col = quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length));
         for (const key_range* r : {start_key, end_key}) {
             if (!r || !(r->keypart_map & 1)) continue;
             std::memset(table->record[1], 0, table->s->reclength);
@@ -3252,20 +2958,25 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
             const my_ptrdiff_t d =
                 static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
             move_fields(table, d);
-            StoolapValue v{};
+            StoolapCond c{};
+            c.column = static_cast<int32_t>(f->field_index);
+            c.op = r == start_key ? STOOLAP_OP_GE : STOOLAP_OP_LE;
             holders.emplace_back();
             const bool bind = !f->is_null() && !unsigned_beyond_i64(f) &&
-                              extract_field(f, v, holders.back());
+                              extract_field(f, c.value, holders.back());
             move_fields(table, -d);
             if (!bind) continue;
-            sql += params.empty() ? " WHERE (" : " AND (";
-            sql += col;
-            sql += r == start_key ? " >= $" : " <= $";
-            params.push_back(v);
-            sql += std::to_string(params.size());
-            if (r == end_key && f->real_maybe_null())
-                sql += " OR " + col + " IS NULL";
-            sql.push_back(')');
+            ir_conds_.push_back(c);
+            if (r == end_key && f->real_maybe_null()) {
+                StoolapCond n{};
+                n.column = c.column;
+                n.op = STOOLAP_OP_IS_NULL;
+                ir_conds_.push_back(n);
+                StoolapCond either{};
+                either.column = 2;
+                either.op = STOOLAP_OP_OR;
+                ir_conds_.push_back(either);
+            }
         }
     }
     if (sorted) {
@@ -3275,7 +2986,6 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
         // ORDER BY check skips the same way).
         const key_part_map where_const =
             table->const_key_parts ? table->const_key_parts[active_index] : 0;
-        bool first = true;
         for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
             // A constant part is one value to MariaDB: sorting stoolap's
             // bytes there could split values its collation calls equal
@@ -3285,25 +2995,15 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
             if (!ki.key_part[i].field ||
                 !(index_flags(active_index, i, false) & HA_READ_ORDER))
                 break;
-            Field* f = ki.key_part[i].field;
-            sql += first ? " ORDER BY " : ", ";
-            first = false;
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-            sql += " NULLS FIRST";
+            ir_order_.push_back(
+                static_cast<int32_t>(ki.key_part[i].field->field_index));
         }
     }
 
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    if (query_params_via(ctx, db_raw(), sql.c_str(), params.data(),
-                         static_cast<int32_t>(params.size()),
-                         &rows) != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: read_range query failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    scan_.reset(rows);
+    if (int err = open_read(
+            ir_conds_.data(), static_cast<int32_t>(ir_conds_.size()),
+            ir_order_.data(), static_cast<int32_t>(ir_order_.size()), false))
+        return err;
 
     range_has_start_ = start_key != nullptr;
     if (start_key) {

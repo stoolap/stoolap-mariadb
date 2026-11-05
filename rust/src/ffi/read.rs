@@ -18,8 +18,10 @@ use stoolap::core::{Error, Result};
 use super::rows::{reset_packed, write_header, write_value};
 use super::types::{StoolapDB, StoolapValue};
 use super::{value, STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
-use crate::read::{Cond, CondOp, Cursor, ReadSpec};
+use crate::read::{Cond, CondOp, Cursor, Node, ReadSpec};
 
+pub const STOOLAP_READ_DESC: i32 = 1;
+pub const STOOLAP_READ_FIXED: i32 = 2;
 pub const STOOLAP_OP_EQ: i32 = 0;
 pub const STOOLAP_OP_GT: i32 = 1;
 pub const STOOLAP_OP_GE: i32 = 2;
@@ -27,6 +29,9 @@ pub const STOOLAP_OP_LT: i32 = 3;
 pub const STOOLAP_OP_LE: i32 = 4;
 pub const STOOLAP_OP_IS_NULL: i32 = 5;
 pub const STOOLAP_OP_IS_NOT_NULL: i32 = 6;
+/// Joins the `column` (a count) conditions before it
+pub const STOOLAP_OP_AND: i32 = 7;
+pub const STOOLAP_OP_OR: i32 = 8;
 
 /// `column op value`, the column by position
 #[repr(C)]
@@ -98,8 +103,8 @@ unsafe fn finish_open(
 /// Opens a read of `table`, in the open transaction or else in a read
 /// transaction of the statement's own, which `stoolap_end_statement` ends:
 /// the rows meeting every
-/// condition, each carrying `columns`, ordered by `order` (descending when
-/// `desc`) or in no set order when `norder` is 0.
+/// condition, each carrying `columns`, ordered by `order` (descending with
+/// `STOOLAP_READ_DESC` in `flags`) or in no set order when `norder` is 0.
 ///
 /// # Safety
 ///
@@ -116,7 +121,7 @@ pub unsafe extern "C" fn stoolap_read(
     nconds: i32,
     order: *const i32,
     norder: i32,
-    desc: i32,
+    flags: i32,
     out: *mut *mut StoolapCursor,
 ) -> i32 {
     if out.is_null() {
@@ -134,7 +139,17 @@ pub unsafe extern "C" fn stoolap_read(
         let order = positions(order, norder)?;
         let mut cond_list = Vec::with_capacity(nconds.max(0) as usize);
         for c in slice(conds, nconds)? {
+            let column =
+                usize::try_from(c.column).map_err(|_| Error::internal("negative column"))?;
             let op = match c.op {
+                STOOLAP_OP_AND => {
+                    cond_list.push(Node::And(column));
+                    continue;
+                }
+                STOOLAP_OP_OR => {
+                    cond_list.push(Node::Or(column));
+                    continue;
+                }
                 STOOLAP_OP_EQ => CondOp::Eq,
                 STOOLAP_OP_GT => CondOp::Gt,
                 STOOLAP_OP_GE => CondOp::Ge,
@@ -148,18 +163,17 @@ pub unsafe extern "C" fn stoolap_read(
                 CondOp::IsNull | CondOp::IsNotNull => stoolap::core::Value::null_unknown(),
                 _ => value::ffi_value_to_rust(&c.value)?,
             };
-            let column =
-                usize::try_from(c.column).map_err(|_| Error::internal("negative column"))?;
-            cond_list.push(Cond { column, op, value });
+            cond_list.push(Node::Cond(Cond { column, op, value }));
         }
         let spec = ReadSpec {
             table_columns: usize::try_from(table_columns).unwrap_or(usize::MAX),
             columns: &columns,
             conds: cond_list,
             order: &order,
-            desc: desc != 0,
+            desc: flags & STOOLAP_READ_DESC != 0,
+            fixed: flags & STOOLAP_READ_FIXED != 0,
         };
-        handle.session.with_table(name, |t| Cursor::open(t, spec))
+        Cursor::ordered(&handle.session, name, spec)
     }));
     finish_open(handle, result, out, "stoolap_read")
 }

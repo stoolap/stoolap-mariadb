@@ -229,18 +229,6 @@ int32_t stoolap_exec_params(
  */
 int32_t stoolap_query(StoolapDB* db, const char* sql, StoolapRows** out_rows);
 
-/**
- * Execute a query with positional parameters.
- * On success, *out_rows must be closed with stoolap_rows_close().
- */
-int32_t stoolap_query_params(
-    StoolapDB* db,
-    const char* sql,
-    const StoolapValue* params,
-    int32_t params_len,
-    StoolapRows** out_rows
-);
-
 /* =========================================================================
  * Prepared statements
  * ========================================================================= */
@@ -312,15 +300,6 @@ int32_t stoolap_tx_exec_params(
 /** Query within a transaction (no parameters). */
 int32_t stoolap_tx_query(StoolapTx* tx, const char* sql, StoolapRows** out_rows);
 
-/** Query within a transaction (with parameters). */
-int32_t stoolap_tx_query_params(
-    StoolapTx* tx,
-    const char* sql,
-    const StoolapValue* params,
-    int32_t params_len,
-    StoolapRows** out_rows
-);
-
 /**
  * Execute a prepared statement within a transaction (with parameters).
  *
@@ -373,8 +352,14 @@ const char* stoolap_tx_errmsg(const StoolapTx* tx);
 #define STOOLAP_OP_LE           4
 #define STOOLAP_OP_IS_NULL      5  /**< value unused */
 #define STOOLAP_OP_IS_NOT_NULL  6  /**< value unused */
+/** Joins the `column` (a count) conditions before it; postfix order. */
+#define STOOLAP_OP_AND          7
+#define STOOLAP_OP_OR           8
 
-/** `column op value`. */
+/**
+ * `column op value`, or an AND / OR of the conditions before it. The list
+ * is in postfix order; the conditions left at its end are ANDed.
+ */
 typedef struct StoolapCond {
     int32_t column;
     int32_t op;
@@ -383,12 +368,21 @@ typedef struct StoolapCond {
 
 typedef struct StoolapCursor StoolapCursor;
 
+/** stoolap_read() flags: order descending */
+#define STOOLAP_READ_DESC       1
+/**
+ * stoolap_read() flags: the statement may move rows to new row ids (it
+ * sets the primary key), so the read takes its rows when it opens instead
+ * of a page at a time, where a moved row would come back
+ */
+#define STOOLAP_READ_FIXED      2
+
 /**
  * Open a read of `table`: the rows meeting every condition, each carrying
- * `columns`, ordered by `order` (NULL first, all descending when `desc`),
- * or in no set order when `norder` is 0. `table_columns` is the column
- * count MariaDB knows; a table that differs is refused. Errors go to
- * stoolap_errmsg(db).
+ * `columns`, ordered by `order` (NULL first, all descending with
+ * STOOLAP_READ_DESC in `flags`), or in no set order when `norder` is 0.
+ * `table_columns` is the column count MariaDB knows; a table that differs
+ * is refused. Errors go to stoolap_errmsg(db).
  */
 int32_t stoolap_read(
     StoolapDB* db,
@@ -397,7 +391,7 @@ int32_t stoolap_read(
     const int32_t* columns, int32_t ncolumns,
     const StoolapCond* conds, int32_t nconds,
     const int32_t* order, int32_t norder,
-    int32_t desc,
+    int32_t flags,
     StoolapCursor** out_cursor
 );
 
@@ -484,15 +478,12 @@ void stoolap_cursor_close(StoolapCursor* cursor);
  * Advance to the next row.
  * @return STOOLAP_ROW if a row is available.
  *         STOOLAP_DONE when exhausted.
- *         STOOLAP_ERROR on error (check stoolap_rows_errmsg).
+ *         STOOLAP_ERROR on error.
  */
 int32_t stoolap_rows_next(StoolapRows* rows);
 
 /** Get an integer value. Returns 0 if NULL or not convertible. */
 int64_t stoolap_rows_column_int64(const StoolapRows* rows, int32_t index);
-
-/** Get a float value. Returns 0.0 if NULL or not convertible. */
-double stoolap_rows_column_double(const StoolapRows* rows, int32_t index);
 
 /**
  * Get a text value from the current row.
@@ -514,9 +505,6 @@ int32_t stoolap_rows_column_is_null(const StoolapRows* rows, int32_t index);
  * Must be called even after STOOLAP_DONE.
  */
 void stoolap_rows_close(StoolapRows* rows);
-
-/** Get the last error message for a rows handle. */
-const char* stoolap_rows_errmsg(const StoolapRows* rows);
 
 /* =========================================================================
  * Bulk fetch
@@ -546,7 +534,7 @@ const char* stoolap_rows_errmsg(const StoolapRows* rows);
  * byte length.  Caller MUST free with stoolap_buffer_free().
  * The rows handle's data is consumed; call stoolap_rows_close() afterward.
  * A runtime error that ends the result early returns STOOLAP_ERROR and no
- * buffer; read it with stoolap_rows_errmsg().
+ * buffer.
  */
 int32_t stoolap_rows_fetch_all(
     StoolapRows* rows,

@@ -57,9 +57,8 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
                     Value::Timestamp(t) => stoolap::core::value::timestamp_nanos(t).err(),
                     _ => None,
                 });
-            if let Some(err) = unrepresentable {
+            if unrepresentable.is_some() {
                 handle.has_row = false;
-                handle.set_error(&err.to_string());
                 return STOOLAP_ERROR;
             }
             handle.has_row = true;
@@ -67,18 +66,14 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
         } else {
             handle.has_row = false;
             // Check for runtime filter errors (e.g., invalid parameterized REGEXP)
-            if let Some(err) = rows_inner.error() {
-                handle.set_error(&err.to_string());
+            if rows_inner.error().is_some() {
                 return STOOLAP_ERROR;
             }
             STOOLAP_DONE
         }
     }));
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_rows_next");
-        STOOLAP_ERROR
-    })
+    result.unwrap_or(STOOLAP_ERROR)
 }
 
 /// Get the current Value at a column index, if the row is valid.
@@ -106,24 +101,6 @@ pub unsafe extern "C" fn stoolap_rows_column_int64(rows: *const StoolapRows, ind
     match get_current_value(handle, index) {
         Some(val) => val.as_int64().unwrap_or(0),
         None => 0,
-    }
-}
-
-/// Get a float value from the current row. Returns 0.0 if NULL or not convertible.
-///
-/// # Safety
-///
-/// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
-pub unsafe extern "C" fn stoolap_rows_column_double(rows: *const StoolapRows, index: i32) -> f64 {
-    let handle = match rows.as_ref() {
-        Some(h) => h,
-        None => return 0.0,
-    };
-
-    match get_current_value(handle, index) {
-        Some(val) => val.as_float64().unwrap_or(0.0),
-        None => 0.0,
     }
 }
 
@@ -409,8 +386,7 @@ pub unsafe extern "C" fn stoolap_rows_fetch_all(
             Some(r) => write_rows(r, col_count, usize::MAX, count_at, &mut buf),
             None => Ok(0),
         };
-        if let Err(e) = packed {
-            handle.set_error(&e.to_string());
+        if packed.is_err() {
             return STOOLAP_ERROR;
         }
 
@@ -430,10 +406,7 @@ pub unsafe extern "C" fn stoolap_rows_fetch_all(
     handle.rows = None;
     handle.has_row = false;
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_rows_fetch_all");
-        STOOLAP_ERROR
-    })
+    result.unwrap_or(STOOLAP_ERROR)
 }
 
 /// Free a buffer allocated by `stoolap_rows_fetch_all()`.
@@ -464,18 +437,5 @@ pub unsafe extern "C" fn stoolap_buffer_free(buf: *mut u8, len: i64) {
 pub unsafe extern "C" fn stoolap_rows_close(rows: *mut StoolapRows) {
     if !rows.is_null() {
         let _ = Box::from_raw(rows);
-    }
-}
-
-/// Get the last error message for a rows handle.
-///
-/// # Safety
-///
-/// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
-pub unsafe extern "C" fn stoolap_rows_errmsg(rows: *const StoolapRows) -> *const c_char {
-    match rows.as_ref() {
-        Some(handle) => handle.error_ptr(),
-        None => super::error::empty_cstr(),
     }
 }

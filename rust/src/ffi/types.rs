@@ -87,7 +87,6 @@ pub struct StoolapTx {
 pub struct StoolapRows {
     pub(crate) rows: Option<Rows>,
     pub(crate) has_row: bool,
-    pub(crate) last_error: Option<CString>,
     /// Column names of the result, kept after the rows are consumed
     pub(crate) columns: Vec<String>,
     /// Per column, the row it was read for and its text with a trailing NUL.
@@ -152,22 +151,9 @@ impl StoolapRows {
             columns: rows.columns().to_vec(),
             rows: Some(rows),
             has_row: false,
-            last_error: None,
             text_cache: Vec::new(),
             row_gen: 0,
         });
         Box::into_raw(handle)
-    }
-
-    pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
-    }
-
-    pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
     }
 }
