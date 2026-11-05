@@ -99,3 +99,24 @@ INSERT INTO np VALUES (1);
     h.assert_err("FK of the latin1 CREATE is enforced",
                  "INSERT INTO nl VALUES (1, 99)",
                  r"foreign key constraint fails")
+    # A latin1 name in the clause would read lossily as U+FFFD, itself a
+    # column name: the CREATE is refused instead of binding to that one.
+    h.exec_stmt("CREATE TABLE nq (`\u00e9` INT NOT NULL PRIMARY KEY, "
+                f"`\ufffd` INT, UNIQUE KEY u (`\ufffd`)) ENGINE={h.engine}")
+    h.exec_stmt("INSERT INTO nq VALUES (1, 99)")
+    c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=True,
+                                charset="latin1", use_pure=True)
+    try:
+        c.cursor().execute(
+            "CREATE TABLE nr (id INT NOT NULL PRIMARY KEY, pid INT, "
+            "FOREIGN KEY (pid) REFERENCES nq (`\u00e9`)) "
+            f"ENGINE={h.engine}")
+        h._fail("latin1 FK name refused", "the CREATE succeeded")
+    except mysql.connector.Error as e:
+        if "not UTF-8" in str(e):
+            h._pass("latin1 FK name refused")
+        else:
+            h._fail("latin1 FK name refused", str(e))
+    finally:
+        c.close()

@@ -210,8 +210,8 @@ fn keyword(s: &[u8], p: usize, word: &str) -> Option<usize> {
     Some(end)
 }
 
-/// An identifier at `p`, `quoted` or bare
-fn ident(s: &[u8], mut p: usize) -> Option<(String, usize)> {
+/// An identifier at `p`, `quoted` or bare, as its bytes
+fn ident(s: &[u8], mut p: usize) -> Option<(&[u8], usize)> {
     if p >= s.len() {
         return None;
     }
@@ -224,17 +224,17 @@ fn ident(s: &[u8], mut p: usize) -> Option<(String, usize)> {
         if p >= s.len() {
             return None;
         }
-        return Some((String::from_utf8_lossy(&s[start..p]).into_owned(), p + 1));
+        return Some((&s[start..p], p + 1));
     }
     let start = p;
     while p < s.len() && is_word(s[p]) {
         p += 1;
     }
-    (p > start).then(|| (String::from_utf8_lossy(&s[start..p]).into_owned(), p))
+    (p > start).then(|| (&s[start..p], p))
 }
 
-/// The text inside the parentheses at `p`, and the position after them
-fn paren_list(s: &[u8], p: usize) -> Option<(String, usize)> {
+/// The bytes inside the parentheses at `p`, and the position after them
+fn paren_list(s: &[u8], p: usize) -> Option<(&[u8], usize)> {
     if p >= s.len() || s[p] != b'(' {
         return None;
     }
@@ -245,7 +245,7 @@ fn paren_list(s: &[u8], p: usize) -> Option<(String, usize)> {
             b')' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some((String::from_utf8_lossy(&s[p + 1..i]).into_owned(), i + 1));
+                    return Some((&s[p + 1..i], i + 1));
                 }
             }
             _ => {}
@@ -263,7 +263,8 @@ fn foreign_key(
     table: &str,
     out: &mut String,
 ) -> Result<Option<usize>> {
-    let parse = || -> Option<(String, String, String, String, String, usize)> {
+    type Clause<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8], Vec<u8>, usize);
+    let parse = || -> Option<Clause<'_>> {
         let mut p = keyword(s, at, "FOREIGN")?;
         p = keyword(s, skip_ws(s, p), "KEY")?;
         // An index name before the column list
@@ -276,7 +277,7 @@ fn foreign_key(
         p = skip_ws(s, p);
         let (mut parent_table, np) = ident(s, p)?;
         p = np;
-        let mut parent_db = String::new();
+        let mut parent_db: &[u8] = &[];
         if p < s.len() && s[p] == b'.' {
             parent_db = parent_table;
             let (t, np) = ident(s, p + 1)?;
@@ -284,14 +285,14 @@ fn foreign_key(
             p = np;
         }
         p = skip_ws(s, p);
-        let mut parent_columns = String::new();
+        let mut parent_columns: &[u8] = &[];
         if p < s.len() && s[p] == b'(' {
             let (cols, np) = paren_list(s, p)?;
             parent_columns = cols;
             p = skip_ws(s, np);
         }
         // ON DELETE / ON UPDATE actions, verbatim
-        let mut actions = String::new();
+        let mut actions = Vec::new();
         for _ in 0..2 {
             let Some(after_on) = keyword(s, p, "ON") else {
                 break;
@@ -310,9 +311,9 @@ fn foreign_key(
                 end -= 1;
             }
             if !actions.is_empty() {
-                actions.push(' ');
+                actions.push(b' ');
             }
-            actions.push_str(&String::from_utf8_lossy(&s[p..end]));
+            actions.extend_from_slice(&s[p..end]);
             p = skip_ws(s, end);
         }
         Some((child, parent_db, parent_table, parent_columns, actions, p))
@@ -320,6 +321,24 @@ fn foreign_key(
     let Some((child, parent_db, parent_table, parent_columns, actions, end)) = parse() else {
         return Ok(None);
     };
+    // The names as written, in the client's character set: as UTF-8 only,
+    // since a lossy one could name another column ('\u{FFFD}' is one)
+    let utf8 = |b: &[u8]| -> Result<String> {
+        String::from_utf8(b.to_vec()).map_err(|_| {
+            Error::NotSupported(
+                "FOREIGN KEY names that are not UTF-8: create the table from a utf8mb4 \
+                 connection"
+                    .into(),
+            )
+        })
+    };
+    let (child, parent_db, parent_table, parent_columns, actions) = (
+        utf8(child)?,
+        utf8(parent_db)?,
+        utf8(parent_table)?,
+        utf8(parent_columns)?,
+        utf8(&actions)?,
+    );
 
     // Stoolap's foreign keys are single-column: dropping a composite one
     // would let the CREATE succeed and accept violating rows unseen
@@ -442,5 +461,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id)");
+        // A name in another character set is refused, not read lossily
+        // (which could name another column)
+        let mut out = String::new();
+        assert!(foreign_keys(
+            b"CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES p (`\xe9`))",
+            "d",
+            "d_1c",
+            &mut out,
+        )
+        .is_err());
     }
 }
