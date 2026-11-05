@@ -15,7 +15,9 @@
 //! both look the keys up first.
 
 use stoolap::core::{Error, Operator, Result, Row, Value};
-use stoolap::storage::expression::{AndExpr, ComparisonExpr, ConstBoolExpr, Expression};
+use stoolap::storage::expression::{
+    AndExpr, ComparisonExpr, ConstBoolExpr, Expression, InListExpr,
+};
 use stoolap::storage::traits::{ScanAccess, Table};
 
 use crate::read::check_columns;
@@ -31,14 +33,15 @@ pub fn insert(
 ) -> Result<i64> {
     check_columns(table, table_columns)?;
     let n = rows.len() as i64;
-    if table.has_unique_non_pk_indexes() {
-        // Row by row, each checked against the ones before it
+    if table.has_unique_non_pk_indexes() && rows.len() > 1 {
+        let rows: Vec<Row> = rows.into_iter().map(Row::from_values).collect();
+        check_unique_batch(table, &rows)?;
+        table.insert_batch(rows)?;
+    } else if table.has_unique_non_pk_indexes() {
         let all: Vec<usize> = (0..table_columns).collect();
-        for values in rows {
-            let row = Row::from_values(values);
-            check_unique(table, NO_ROW, &row, &all)?;
-            table.insert_discard(row)?;
-        }
+        let row = Row::from_values(rows.pop().ok_or_else(|| Error::internal("no row"))?);
+        check_unique(table, NO_ROW, &row, &all)?;
+        table.insert_discard(row)?;
     } else if rows.len() == 1 {
         let row = rows.pop().expect("one row");
         table.insert_discard(Row::from_values(row))?;
@@ -113,6 +116,72 @@ pub fn update(
 /// Deletes row `row_id`; 0 when it is gone
 pub fn delete(table: &mut dyn Table, row_id: i64) -> Result<i64> {
     Ok(table.delete_by_row_ids(&[row_id])? as i64)
+}
+
+/// Refuses `rows`, new rows, when two hold one key of a UNIQUE index or
+/// one holds a key the table does. Each single-column index is read once
+/// for all the keys: a check per row would read the transaction's own
+/// rows, which no index holds, once for every row.
+fn check_unique_batch(table: &dyn Table, rows: &[Row]) -> Result<()> {
+    let schema = table.schema();
+    for (index, names) in table.get_unique_indexes() {
+        let Some(ids) = names
+            .iter()
+            .map(|n| schema.get_column_index(n))
+            .collect::<Option<Vec<usize>>>()
+        else {
+            continue;
+        };
+        let conflict = |value: Vec<Value>, row_id| Error::UniqueConstraint {
+            index: index.clone(),
+            column: names.join(", "),
+            value: value.into(),
+            row_id,
+        };
+        let mut seen = std::collections::HashSet::with_capacity(rows.len());
+        for row in rows {
+            let key: Vec<Value> = ids
+                .iter()
+                .map(|&i| row.get(i).cloned().unwrap_or_else(Value::null_unknown))
+                .collect();
+            if key.iter().any(|v| v.is_null()) {
+                continue; // NULLs never collide
+            }
+            if !seen.insert(key.clone()) {
+                return Err(conflict(key, -1));
+            }
+        }
+        if seen.is_empty() {
+            continue;
+        }
+        let [column] = ids[..] else {
+            // A composite key: row by row
+            for row in rows {
+                check_unique(table, NO_ROW, row, &ids)?;
+            }
+            continue;
+        };
+        let values: Vec<Value> = seen.into_iter().map(|mut k| k.remove(0)).collect();
+        let mut filter = InListExpr::new(schema.columns[column].name.as_str(), values);
+        filter.prepare_for_schema(schema);
+        let plan = table.index_plan(&filter);
+        let access = match &plan {
+            Some(p) => ScanAccess::Index(p),
+            None => ScanAccess::Seq,
+        };
+        let mut scanner = table.scan_access(access, &[], None, Some(&filter))?;
+        if scanner.next() {
+            let value = scanner.row().get(column).cloned();
+            return Err(conflict(
+                value.into_iter().collect(),
+                scanner.current_row_id(),
+            ));
+        }
+        if let Some(e) = scanner.err() {
+            return Err(e.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Refuses `row`, the new state of row `row_id`, when a UNIQUE index over
