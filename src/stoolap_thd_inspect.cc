@@ -43,20 +43,21 @@ extern "C" int stoolap_thd_needs_per_row_dup_handling(THD* thd) {
     return 0;
 }
 
+// A name as MariaDB names its file: lowercased first when it keeps names
+// lowercased, as it does the table's own
+static std::string file_name(const LEX_CSTRING& name) {
+    std::string s(name.str, name.length);
+    if (lower_case_table_names == 1)
+        s.resize(my_casedn_str(files_charset_info, s.data()));
+    char buf[FN_REFLEN];
+    const uint n = tablename_to_filename(s.c_str(), buf, sizeof(buf));
+    return std::string(buf, n);
+}
+
 bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
                               size_t child_db_length,
                               std::vector<StoolapThdForeignKey>* out) {
     if (!thd || !thd->lex) return true;
-    // A name as MariaDB names its file: lowercased first when it keeps
-    // names lowercased, as it does the child's
-    auto file_name = [](const LEX_CSTRING& name) {
-        std::string s(name.str, name.length);
-        if (lower_case_table_names == 1)
-            s.resize(my_casedn_str(files_charset_info, s.data()));
-        char buf[FN_REFLEN];
-        const uint n = tablename_to_filename(s.c_str(), buf, sizeof(buf));
-        return std::string(buf, n);
-    };
     List_iterator_fast<Key> it(thd->lex->alter_info.key_list);
     while (Key* k = it++) {
         if (k->type != Key::FOREIGN_KEY) continue;
@@ -77,6 +78,37 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
         def.on_delete = fk->delete_opt;
         def.on_update = fk->update_opt;
         out->push_back(std::move(def));
+    }
+    return true;
+}
+
+bool stoolap_thd_altered_table(
+    THD* thd, std::string* path,
+    std::vector<std::pair<std::string, std::string>>* renames) {
+    if (!thd || !thd->lex) return false;
+    LEX* lex = thd->lex;
+    if (lex->sql_command != SQLCOM_ALTER_TABLE &&
+        lex->sql_command != SQLCOM_CREATE_INDEX &&
+        lex->sql_command != SQLCOM_DROP_INDEX)
+        return false;
+    const TABLE_LIST* t = lex->query_tables;
+    if (!t) return false;
+    *path = file_name(t->db) + '/' + file_name(t->table_name);
+    // CHANGE old new ...
+    List_iterator_fast<Create_field> fields(lex->alter_info.create_list);
+    while (const Create_field* f = fields++) {
+        if (f->change.length)
+            renames->emplace_back(
+                std::string(f->change.str, f->change.length),
+                std::string(f->field_name.str, f->field_name.length));
+    }
+    // RENAME COLUMN old TO new
+    List_iterator_fast<Alter_column> columns(lex->alter_info.alter_list);
+    while (const Alter_column* c = columns++) {
+        if (c->new_name.length)
+            renames->emplace_back(
+                std::string(c->name.str, c->name.length),
+                std::string(c->new_name.str, c->new_name.length));
     }
     return true;
 }

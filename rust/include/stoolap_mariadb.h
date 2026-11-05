@@ -648,9 +648,18 @@ typedef struct StoolapForeignKeyDef {
     int32_t on_update;
 } StoolapForeignKeyDef;
 
+/** A column an ALTER renames. */
+typedef struct StoolapColumnRename {
+    const char* from;
+    const char* to;
+} StoolapColumnRename;
+
 /**
  * Create `table` (stoolap's name) from `columns` and `keys` (in MariaDB's
- * key order), with its `foreign_keys` and secondary indexes. A
+ * key order), with its `foreign_keys` and secondary indexes, and, when
+ * `keep_from` is not NULL, the foreign keys of that table, which a copying
+ * ALTER rebuilds into this one (`renames`: the columns it renames; a
+ * dropped column a kept key uses is refused). A
  * single-column PRIMARY KEY is inline; a composite one and each UNIQUE
  * key are table-level constraints, numbered in that order (the ordinals
  * stoolap_error_class gives). A self-referencing foreign key is refused.
@@ -661,6 +670,8 @@ int32_t stoolap_create_table(
     const StoolapColumnDef* columns, int32_t ncolumns,
     const StoolapKeyDef* keys, int32_t nkeys,
     const StoolapForeignKeyDef* foreign_keys, int32_t nforeign_keys,
+    const char* keep_from,
+    const StoolapColumnRename* renames, int32_t nrenames,
     int32_t if_not_exists
 );
 

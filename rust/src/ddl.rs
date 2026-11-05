@@ -149,6 +149,16 @@ pub fn create_table(
         sql.push_str(&key_columns(k)?);
     }
     for fk in foreign_keys {
+        // A column an ALTER dropped from under a key the copy keeps
+        if !columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&fk.column))
+        {
+            return Err(Error::NotSupported(format!(
+                "column '{}' is used by a FOREIGN KEY: it cannot be dropped",
+                fk.column
+            )));
+        }
         foreign_key(fk, table, &mut sql)?;
     }
     sql.push(')');
@@ -212,6 +222,45 @@ pub const STOOLAP_FK_NO_ACTION: i32 = 2;
 pub const STOOLAP_FK_CASCADE: i32 = 3;
 pub const STOOLAP_FK_SET_NULL: i32 = 4;
 pub const STOOLAP_FK_SET_DEFAULT: i32 = 5;
+
+/// The foreign keys of `from`, the table a copying ALTER rebuilds, for its
+/// copy: MariaDB keeps none to hand back. A column the ALTER renames
+/// (`renames`, old name to new) goes by its new name. None when `from` is
+/// not a stoolap table (ALTER ... ENGINE=STOOLAP).
+pub fn kept_foreign_keys(
+    session: &Session,
+    from: &str,
+    renames: &[(String, String)],
+) -> Result<Vec<ForeignKey>> {
+    use stoolap::core::ForeignKeyAction;
+    let fks = match session.with_table(from, |t| Ok(t.schema().foreign_keys.clone())) {
+        Ok(fks) => fks,
+        Err(Error::TableNotFound(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let action = |a: ForeignKeyAction| match a {
+        ForeignKeyAction::Restrict => STOOLAP_FK_RESTRICT,
+        ForeignKeyAction::Cascade => STOOLAP_FK_CASCADE,
+        ForeignKeyAction::SetNull => STOOLAP_FK_SET_NULL,
+        ForeignKeyAction::NoAction => STOOLAP_FK_NO_ACTION,
+    };
+    Ok(fks
+        .into_iter()
+        .map(|fk| {
+            let column = renames
+                .iter()
+                .find(|(old, _)| old.eq_ignore_ascii_case(&fk.column_name))
+                .map_or(fk.column_name, |(_, new)| new.clone());
+            ForeignKey {
+                column,
+                parent: fk.referenced_table,
+                parent_column: Some(fk.referenced_column),
+                on_delete: action(fk.on_delete),
+                on_update: action(fk.on_update),
+            }
+        })
+        .collect())
+}
 
 /// Appends `fk`, a key of `table`, as a clause of its CREATE TABLE
 fn foreign_key(fk: &ForeignKey, table: &str, out: &mut String) -> Result<()> {

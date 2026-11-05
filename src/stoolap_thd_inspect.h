@@ -11,6 +11,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 class THD;
@@ -30,6 +31,13 @@ struct StoolapThdForeignKey {
 // database is in `child_db` (`child_db_length` bytes), the child's
 // database by name. False for a composite one, which stoolap does not
 // enforce.
+// The table the statement's copying ALTER TABLE (or CREATE / DROP INDEX)
+// rebuilds, by its file path ("db/table"), and the columns it renames
+// (old name, new name); false for any other statement.
+bool stoolap_thd_altered_table(
+    THD* thd, std::string* path,
+    std::vector<std::pair<std::string, std::string>>* renames);
+
 bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
                               size_t child_db_length,
                               std::vector<StoolapThdForeignKey>* out);

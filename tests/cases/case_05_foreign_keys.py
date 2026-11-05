@@ -188,6 +188,22 @@ INSERT INTO `my-db`.`P\u00e9` VALUES (1);
     h.assert_err("the TEMPORARY child's FK is enforced",
                  "INSERT INTO tc VALUES (99)", r"foreign key constraint fails")
     h.exec_stmt("DROP TEMPORARY TABLE tc")
+    # A copying ALTER keeps the keys (tests/diff/alter_keeps_fks.sql);
+    # dropping a column one uses is refused, as InnoDB refuses it (1828
+    # there)
+    h.exec_stmt("CREATE TABLE sz (id INT NOT NULL PRIMARY KEY, pid INT, "
+                f"FOREIGN KEY (pid) REFERENCES sp (id)) ENGINE={h.engine}")
+    h.assert_err("dropping a FOREIGN KEY's column is refused",
+                 "ALTER TABLE sz DROP COLUMN pid",
+                 r"used by a FOREIGN KEY")
+    h.assert_err("the key survives the refused ALTER",
+                 "INSERT INTO sz VALUES (1, 98)",
+                 r"foreign key constraint fails")
+    # A table converted from another engine has no stoolap keys to keep
+    h.exec_script("CREATE TABLE si (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB;"
+                  "INSERT INTO si VALUES (1)")
+    h.assert_ok("ALTER ... ENGINE=STOOLAP", f"ALTER TABLE si ENGINE={h.engine}")
+    h.assert_scalar("converted rows", "SELECT COUNT(*) FROM si", "1")
     # The actions come from the parser too
     h.exec_script(f"""
 CREATE TABLE ap (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
