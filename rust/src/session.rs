@@ -56,6 +56,25 @@ impl Session {
         &self._db
     }
 
+    /// The tables whose foreign keys name `parent`, other than itself,
+    /// each with the key's column and the parent column it names
+    pub fn referencing_tables(&self, parent: &str) -> Vec<(String, String, String)> {
+        let parent = parent.to_lowercase();
+        self.exec
+            .engine()
+            .find_referencing_fks(&parent)
+            .iter()
+            .filter(|(child, _)| *child != parent)
+            .map(|(child, fk)| {
+                (
+                    child.clone(),
+                    fk.column_name.clone(),
+                    fk.referenced_column.clone(),
+                )
+            })
+            .collect()
+    }
+
     pub fn new(db: &Database) -> Arc<Self> {
         Arc::new(Session {
             exec: Executor::new(Arc::clone(db.engine())),

@@ -2,9 +2,7 @@
 -- COLUMN, CREATE INDEX, an ALTER that adds another key, and CHANGE and
 -- RENAME COLUMN of the key's column, with its ON DELETE action.
 -- ALGORITHM=COPY has InnoDB copy the rows too, as the plugin does; it
--- renames a key's column only in place, so that child is empty then. The
--- children sort before the parent: DROP DATABASE drops in name order, and
--- stoolap keeps a parent rows reference.
+-- renames a key's column only in place, so that child is empty then.
 CREATE TABLE p (id INT PRIMARY KEY) ENGINE={E};
 INSERT INTO p VALUES (1), (2), (3);
 CREATE TABLE c (id INT PRIMARY KEY, pid INT, qid INT,

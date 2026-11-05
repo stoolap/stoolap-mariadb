@@ -1,4 +1,4 @@
--- known-diff-file: DDL: RENAME of a parent breaks child FKs; DROP of a parent strips them
+-- known-diff-file: DDL: RENAME of a parent leaves its children's FKs naming the old name (stoolap's rename keeps them), so the parent is dropped and the child refuses every row
 CREATE TABLE p (id INT PRIMARY KEY) ENGINE={E};
 CREATE TABLE c (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES p(id)) ENGINE={E};
 INSERT INTO p VALUES (1);

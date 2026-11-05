@@ -85,7 +85,9 @@ pub(crate) fn note_error(e: &Error) {
         Error::PrimaryKeyConstraint { .. } => (STOOLAP_ERR_DUP_KEY, STOOLAP_KEY_PRIMARY),
         Error::UniqueConstraint { index, .. } => (STOOLAP_ERR_DUP_KEY, unique_ordinal(index)),
         Error::ForeignKeyViolation { detail, .. } => {
-            if detail.contains("still referenced by table") {
+            // A parent row's delete, or a parent table's drop
+            if detail.contains("still referenced by table") || detail.contains("still reference it")
+            {
                 (STOOLAP_ERR_ROW_IS_REFERENCED, STOOLAP_KEY_NONE)
             } else {
                 (STOOLAP_ERR_NO_REFERENCED_ROW, STOOLAP_KEY_NONE)
@@ -127,7 +129,7 @@ fn class_of_text(m: &str) -> (i32, i32) {
         return (STOOLAP_ERR_DUP_KEY, unique_ordinal(index));
     } else if starts("unique constraint failed") {
         STOOLAP_ERR_DUP_KEY
-    } else if has("still referenced by table") {
+    } else if has("still referenced by table") || has("still reference it") {
         // The parent side; the child side's "referenced row ... does not
         // exist" is the violation below
         STOOLAP_ERR_ROW_IS_REFERENCED

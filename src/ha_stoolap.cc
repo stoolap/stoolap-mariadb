@@ -881,7 +881,22 @@ int ha_stoolap::delete_table(const char* name) {
     const std::string flat = stoolap_table_from_path(name);
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
-    if (stoolap_drop_table(db, flat.c_str()) != STOOLAP_OK) {
+    // A parent other tables' foreign keys name is refused, as InnoDB does,
+    // but under foreign_key_checks = 0. DROP DATABASE drops its tables one
+    // by one, a parent maybe before its children: the database's own go
+    // with it ("./db/" is their stoolap prefix).
+    THD* thd = ha_thd();
+    const bool check_fks =
+        !thd || !thd_test_options(thd, OPTION_NO_FOREIGN_KEY_CHECKS);
+    std::string dropped_db;
+    if (thd && thd_sql_command(thd) == SQLCOM_DROP_DB) {
+        const std::string_view path(name);
+        dropped_db = stoolap_table_from_path(
+            std::string(path.substr(0, path.rfind('/') + 1)).c_str());
+    }
+    if (stoolap_drop_table(db, flat.c_str(), check_fks,
+                           dropped_db.empty() ? nullptr : dropped_db.c_str()) !=
+        STOOLAP_OK) {
         auto verr = fetch_db_error(db);
         sql_print_error("stoolap: DROP TABLE failed: %s", verr.message);
         return report_stoolap_error(verr);

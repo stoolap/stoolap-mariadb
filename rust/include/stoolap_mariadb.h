@@ -687,8 +687,14 @@ int32_t stoolap_create_table(
  */
 size_t stoolap_fit_table_name(const char* name, size_t len, char* out);
 
-/** Drop `table` if it is there. */
-int32_t stoolap_drop_table(StoolapDB* db, const char* table);
+/**
+ * Drop `table` if it is there. A parent other tables' foreign keys name
+ * is refused (STOOLAP_ERR_ROW_IS_REFERENCED) when `check_fks`, except for
+ * children in `dropped_db` (NULL, or DROP DATABASE's stoolap prefix of its
+ * tables), which are dropped first.
+ */
+int32_t stoolap_drop_table(StoolapDB* db, const char* table, int32_t check_fks,
+                           const char* dropped_db);
 
 /** Rename table `from` to `to`. */
 int32_t stoolap_rename_table(StoolapDB* db, const char* from, const char* to);

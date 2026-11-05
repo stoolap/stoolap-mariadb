@@ -150,7 +150,4 @@ CREATE TABLE nn (
                 f"RENAME TABLE `{u}`.`{u[1:]}` TO `{u}`.`{u[2:]}x`")
     h.assert_scalar("renamed read",
                     f"SELECT v FROM `{u}`.`{u[2:]}x` WHERE id = 1", "200")
-    # The child first: stoolap refuses to drop a parent rows reference
-    h.exec_script(f"DROP TABLE `{u}`.c")
-    h.exec_script(f"DROP TABLE `{u}`.c2")
     h.exec_script(f"DROP DATABASE `{u}`")

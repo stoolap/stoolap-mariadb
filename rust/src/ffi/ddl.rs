@@ -247,15 +247,33 @@ pub unsafe extern "C" fn stoolap_fit_table_name(
     fit.len()
 }
 
-/// Drops `table` if it is there.
+/// Drops `table` if it is there: a parent other tables' foreign keys name
+/// is refused when `check_fks`, but for the children in `dropped_db` (NULL
+/// or a dropped database's stoolap prefix), which are dropped first.
 ///
 /// # Safety
 ///
-/// `db` must be a valid `StoolapDB`, `table` NUL-terminated UTF-8.
+/// `db` must be a valid `StoolapDB`, `table` and `dropped_db` (when not
+/// NULL) NUL-terminated UTF-8.
 #[no_mangle]
-pub unsafe extern "C" fn stoolap_drop_table(db: *mut StoolapDB, table: *const c_char) -> i32 {
+pub unsafe extern "C" fn stoolap_drop_table(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    check_fks: i32,
+    dropped_db: *const c_char,
+) -> i32 {
     on_session(db, "stoolap_drop_table", |session| {
-        ddl::drop_table(session, text(table, "table name")?)?;
+        let dropped_db = if dropped_db.is_null() {
+            None
+        } else {
+            Some(text(dropped_db, "dropped database")?)
+        };
+        ddl::drop_table(
+            session,
+            text(table, "table name")?,
+            check_fks != 0,
+            dropped_db,
+        )?;
         Ok(STOOLAP_OK)
     })
 }
