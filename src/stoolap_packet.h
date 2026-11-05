@@ -11,8 +11,8 @@
 #pragma once
 
 // Shared parser for the packed binary format produced by
-// stoolap_rows_fetch_all(). Used by both the row-pump full-scan path
-// (rnd_init in ha_stoolap.cc) and the pushdown handlers (select_handler,
+// stoolap_rows_fetch_all() and stoolap_cursor_fetch(). Used by both the
+// handler's direct reads (rnd_next in ha_stoolap.cc) and the pushdown handlers (select_handler,
 // derived_handler, unit_handler in ha_stoolap_select.cc) to consume one
 // packed buffer per result set instead of issuing per-row /
 // per-cell FFI accessors.
@@ -33,7 +33,7 @@
 //       JSON(6)      u32 len, u8[len] bytes
 //       BLOB(7)      u32 len, u8[len] bytes
 
-#include <stoolap.h>
+#include "stoolap_mariadb.h"
 
 #include "field.h"
 #include "my_global.h"

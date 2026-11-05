@@ -67,12 +67,13 @@ public:
     int pre_direct_delete_rows_init() override;
     int pre_direct_delete_rows() override;
 
-    // Bulk INSERT: accumulate write_row params into one packed batch
-    // shipped via stoolap_stmt_exec_batch (one FFI call, one tx).
+    // Bulk INSERT: accumulate write_row params into one batch, inserted
+    // directly in one call (stoolap_stmt_exec_batch for a table a foreign
+    // key names).
     void start_bulk_insert(ha_rows rows, uint flags) override;
     int end_bulk_insert() override;
     // Eager flush at kBulkFlushRows threshold; bulk_active_ stays true.
-    int flush_bulk_buffer();
+    int flush_bulk_buffer(bool partial = false);
     int analyze(THD* thd, HA_CHECK_OPT* check_opt) override;
 
     int rnd_init(bool scan) override;
@@ -135,30 +136,49 @@ private:
     // from racing the global executor / error buffer.
     StoolapDB* ddl_db();
 
-    // Streaming cursor: rnd_init opens, rnd_next drains.
+    // Streaming SQL result (read_range_first's filtered ranges).
     stoolap_mariadb::RowsPtr scan_;
 
-    // Buffered (Tier 3) scan: rnd_next parses rows from the packed
-    // fetch_all buffer. Used only on full scans (rnd_init); index/range
-    // paths stay streaming because they often LIMIT early. StoolapBuffer
-    // takes direct ownership to skip the std::vector::assign memcpy.
-    stoolap_mariadb::StoolapBuffer scan_buf_;
+    // Direct read (stoolap_read) for rnd_init and index_read_map: rnd_next
+    // parses the cursor's current packed chunk, which the cursor owns,
+    // and fetches the next when it runs out. Chunks start small when the
+    // statement has a LIMIT and grow.
+    stoolap_mariadb::CursorPtr cursor_;
+    uint32_t cursor_chunk_ = 0;
+    int open_read(const StoolapCond* conds, int32_t nconds,
+                  const int32_t* order, int32_t norder, bool desc);
+    int next_chunk();
+    const uint8_t* pkt_ = nullptr;
+    size_t pkt_len_ = 0;
+    // stoolap's row id of the row the last read returned, which
+    // update_row / delete_row / position name it by. Not valid after a
+    // streaming SQL read, which has none.
+    int64_t cur_row_id_ = 0;
+    bool cur_row_id_valid_ = false;
+    // Direct writes; -1 for a table a foreign key names (write via SQL).
+    int insert_direct(const StoolapValue* values, int32_t nrows,
+                      int64_t* affected);
+    int update_row_direct(const uchar* old_data, const uchar* new_data);
+    int write_error(StoolapDB* db, const char* what);
+    StoolapDB* direct_write_db();
+    bool key_row_id(const uchar* record, int64_t* id);
     size_t scan_buf_pos_ = 0;
     uint32_t scan_buf_cols_ = 0;
     uint32_t scan_buf_rows_left_ = 0;
     // Cell -> field map (inverse of scan_proj_); avoids per-row scan_proj_ lookup.
     std::vector<int> scan_buf_cell_to_field_;
 
-    // Centralized reset: rnd_next prefers scan_buf_ over scan_, so a
-    // stale buffer left over from a prior rnd_init would silently shadow
-    // a fresh index stream. Every scan entry point routes through here.
+    // Centralized reset: rnd_next prefers the cursor over scan_, so a
+    // stale cursor left over from a prior read would silently shadow a
+    // fresh stream. Every scan entry point routes through here.
     void reset_scan_state() {
         scan_.reset();
-        scan_buf_.reset();
+        cursor_.reset();
+        pkt_ = nullptr;
+        pkt_len_ = 0;
         scan_buf_pos_ = 0;
         scan_buf_cols_ = 0;
         scan_buf_rows_left_ = 0;
-        scan_buf_cell_to_field_.clear();
         key_filter_active_ = false;
         range_filter_active_ = false;
     }
@@ -210,33 +230,20 @@ private:
     // read_set | write_set words scan_proj_ was last built from (see
     // projection_words); empty when built without bitmaps.
     std::vector<uint32_t> scan_proj_cols_;
+    // The direct read's projection: scan_proj_ and the cells' columns,
+    // rebuilt only when read_set | write_set changes (a join probes the
+    // same columns once per outer row).
+    void refresh_projection();
+    std::vector<uint32_t> proj_words_scratch_;
+    std::vector<uint32_t> read_cols_words_;
+    std::vector<int32_t> read_cols_;
     std::vector<uint32_t> projection_words() const;
 
-    // index_read_map reuses its SQL while the statement shape repeats
-    // (a join probes the same index once per outer row; only the
-    // parameter values change). null_mask marks key parts bound to NULL
-    // (" IS NULL", no parameter).
-    struct IndexReadShape {
-        uint index = MAX_KEY;
-        int find_flag = -1;
-        uint nparts = 0;
-        uint32_t null_mask = 0;     // part IS NULL
-        uint32_t notnull_mask = 0;  // part IS NOT NULL
-        uint32_t skip_mask = 0;     // no predicate on the part
-        uint32_t filter_mask = 0;
-        bool order = false;
-        std::vector<uint32_t> cols;
-        bool operator==(const IndexReadShape& o) const {
-            return index == o.index && find_flag == o.find_flag &&
-                   nparts == o.nparts && null_mask == o.null_mask &&
-                   notnull_mask == o.notnull_mask && skip_mask == o.skip_mask &&
-                   filter_mask == o.filter_mask && order == o.order &&
-                   cols == o.cols;
-        }
-    };
-    IndexReadShape ir_shape_;
-    std::string ir_sql_;
-    std::vector<StoolapValue> ir_params_;
+    // index_read_map's key conditions and ORDER BY columns, kept to reuse
+    // their storage across the probes of a join; ir_text_ holds the text
+    // the condition values point into.
+    std::vector<StoolapCond> ir_conds_;
+    std::vector<int32_t> ir_order_;
     std::vector<std::string> ir_text_;
 
     // INSERT SQL template; stoolap's semantic cache hashes it.

@@ -4,9 +4,9 @@
 
 MariaDB 11.4 storage engine plugin (`ha_stoolap.so`) backed by
 [Stoolap](https://github.com/stoolap/stoolap), an embedded analytical
-SQL engine written in Rust. The plugin is a C++ shim that translates
-the MariaDB handler API into calls on Stoolap's C ABI
-(`include/stoolap.h`, built with `cargo build --release --features ffi`).
+SQL engine written in Rust. The plugin is C++ over a Rust crate
+(`rust/`) that links Stoolap as a Rust crate; the crate is linked into
+`ha_stoolap.so`, so the plugin is one self-contained file.
 
 The plugin pushes whole SELECT queries, derived tables, UPDATE/DELETE
 statements, and unit operations down to Stoolap's executor when it can,
@@ -85,21 +85,23 @@ records-cache invariants live around `cached_records()` /
                  |   src/ha_stoolap_select.cc    |  pushdown handlers
                  |   src/stoolap_bridge.cc       |  RAII over C ABI
                  |   src/stoolap_thd_context.cc  |  per-THD txn / cache
-                 +---------------+---------------+
-                                 |  C ABI calls
-                                 v
-                 +-------------------------------+
-                 |  libstoolap.{so,dylib}        |  Apache-2.0
-                 |  (Rust crate, --features ffi) |
+                 |               |  C ABI (rust/include/stoolap_mariadb.h)
+                 |   rust/ (static library)      |  Apache-2.0
+                 |   stoolap crate, linked in    |
                  +-------------------------------+
 ```
 
 ### Source layout
 
 ```
-CMakeLists.txt              Build glue. Finds MariaDB headers + libstoolap,
-                            sets ABI flags (DBUG_OFF, NDEBUG), wires
+CMakeLists.txt              Build glue. Finds MariaDB headers, builds
+                            rust/ with cargo and links it in, sets ABI
+                            flags (DBUG_OFF, NDEBUG), wires
                             third_party/wsrep-* include paths.
+rust/                       The plugin's Rust crate (static library):
+                            stoolap as a dependency (git main; the
+                            commit is in rust/Cargo.lock) and the C ABI
+                            in rust/include/stoolap_mariadb.h.
 src/
   ha_stoolap.{h,cc}         handler subclass: row-pump, indexes, DDL,
                             cond_push, direct DML, status / system vars.
@@ -311,12 +313,14 @@ it. Tables created by an older build must be re-created.
 
 ## Known limitations
 
-- **`rnd_pos` over BLOB/TEXT tables**: any plan that takes the
-  filesort + rowid-sort path (e.g. `UPDATE ... ORDER BY n LIMIT 2`)
-  fails loudly with a clear error rather than corrupting the row,
-  because the BLOB Field's in-record bytes are a (length, ptr) trio
-  and restoring them blindly would resurrect a freed pointer. Plain
-  WHERE-driven UPDATE/DELETE on BLOB tables works.
+- **Ordered reads on a table without a PRIMARY KEY.** The handler
+  reads, writes and re-reads rows directly, by stoolap's row id, except
+  the ordered reads `index_first` / `index_last` / `read_range_first`,
+  which still run SQL. A row they return is named by its PRIMARY KEY,
+  which is its row id; on a table without one it cannot be updated or
+  deleted through the row pump, and is re-read by position from its
+  record bytes, which is refused on a BLOB/TEXT table (the record's
+  BLOB pointer would be stale).
 - **Composite `PRIMARY KEY` / `UNIQUE` / `FOREIGN KEY` are refused at
   `CREATE TABLE`.** Stoolap enforces single-column constraints only, so
   silently accepting a multi-column constraint would let duplicates
@@ -337,14 +341,10 @@ it. Tables created by an older build must be re-created.
   drop the constraint. Non-unique secondary keys on ci-string columns
   are allowed; the byte-wise stoolap index is just a best-effort access
   hint, not a uniqueness contract.
-- **Row-pump `UPDATE`/`DELETE` on no-PK tables is refused.** Stoolap
-  has no stable row-id and its `UPDATE/DELETE` grammar has no `LIMIT`,
-  so a fingerprint-by-all-columns WHERE could over-mutate byte-identical
-  duplicates when MariaDB's filesort+LIMIT path calls `update_row` per
-  logical row. Add a single-column `PRIMARY KEY`, or write the
-  statement so the WHERE alone selects the rows -- the direct DML hook
-  (`cond_push` -> stoolap WHERE) handles that case as one engine-side
-  query.
+- **Tables a `FOREIGN KEY` names are written through SQL.** Stoolap's
+  executor checks foreign keys, so the handler's inserts, updates and
+  deletes on a child or parent table go through it, one statement per
+  row, each committed on its own outside an explicit transaction.
 - **`ALTER TABLE AUTO_INCREMENT = N` is not propagated.** The plugin
   recomputes the next value from `MAX(col)+1` per connection, with a
   cross-connection epoch invalidating on TRUNCATE/DROP/RENAME.
@@ -366,21 +366,20 @@ it. Tables created by an older build must be re-created.
    The find module also tries `mariadb_config --prefix` as a last resort.
    Pass `-DMariaDB_ROOT=/explicit/path` to override discovery.
 
-2. **A release build of Stoolap with the FFI feature:**
-
-   ```sh
-   cd ../stoolap
-   cargo build --release --features ffi
-   ```
-
-   Produces `target/release/libstoolap.{dylib,so}`.
+2. **A Rust toolchain** (`cargo`, stable). The build fetches Stoolap
+   from git (`rust/Cargo.toml`; the commit is pinned in
+   `rust/Cargo.lock`, and `cargo update --manifest-path rust/Cargo.toml
+   -p stoolap` moves it to main's head).
 
 ### Compile
 
 ```sh
-cmake -S . -B build -DSTOOLAP_DIR=../stoolap
+cmake -S . -B build
 cmake --build build -j
 ```
+
+To build against a local Stoolap checkout instead, pass
+`-DSTOOLAP_DIR=../stoolap`.
 
 `MariaDB_ROOT` only needs to be passed if auto-discovery missed your install.
 The legacy `MARIADB_PREFIX` is accepted as a backwards-compatible alias.
@@ -416,47 +415,11 @@ Already encoded in `CMakeLists.txt`, but worth knowing:
 
 ## Install
 
-The plugin links against `libstoolap.{so,dylib}`, so both files have to
-land somewhere `mariadbd` can find at `dlopen` time.
-
-### Linux
+Stoolap is linked into `ha_stoolap.so`; copy that one file:
 
 ```sh
-sudo install -m 0755 ../stoolap/target/release/libstoolap.so /usr/local/lib/
-sudo ldconfig
 sudo install -m 0755 build/ha_stoolap.so "$(mariadb_config --plugindir)/"
 ```
-
-`/usr/local/lib` is on `ld.so`'s default search path; `ldconfig` refreshes
-the cache. The plugin's `INSTALL_RPATH` also includes `@loader_path`, so
-copying `libstoolap.so` next to the plugin works as an alternative.
-
-### macOS
-
-```sh
-PLUGIN_DIR="$(mariadb_config --plugindir)"
-sudo install -m 0755 build/ha_stoolap.so "$PLUGIN_DIR/"
-sudo install -m 0755 ../stoolap/target/release/libstoolap.dylib "$PLUGIN_DIR/"
-
-# stoolap's release dylib carries an absolute build-path install_name.
-# Rewrite to @rpath so dyld falls through to the plugin's @loader_path.
-sudo install_name_tool -id @rpath/libstoolap.dylib "$PLUGIN_DIR/libstoolap.dylib"
-sudo codesign --remove-signature "$PLUGIN_DIR/libstoolap.dylib" || true
-sudo codesign --sign - "$PLUGIN_DIR/libstoolap.dylib"
-```
-
-The `install_name_tool` step is critical: dyld checks the dylib's
-embedded `LC_ID_DYLIB` *before* the plugin's `@rpath`, and stoolap's
-release build leaves it at the absolute build-time path
-(`/Users/.../stoolap/target/release/libstoolap.dylib`), which fails
-to resolve on any other host. If you skip the rewrite and keep the
-build tree around, dyld will still find the dylib via its absolute
-install_name on your local box; new hosts (including containers and
-CI runners) will fail with `Library not loaded`.
-
-`codesign --sign -` (ad-hoc) is required after `install_name_tool`
-because it invalidates the existing codesign blob and macOS 14+
-refuses unsigned dylibs at `dlopen`.
 
 ### Plugin directory paths
 

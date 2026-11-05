@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include <stoolap.h>
+#include "stoolap_mariadb.h"
 
 #include <atomic>
 #include <cstdint>
@@ -44,10 +44,17 @@ struct StmtDeleter {
     }
 };
 
+struct CursorDeleter {
+    void operator()(StoolapCursor* p) const noexcept {
+        if (p) stoolap_cursor_close(p);
+    }
+};
+
 using DbPtr = std::unique_ptr<StoolapDB, DbDeleter>;
 using TxPtr = std::unique_ptr<StoolapTx, TxDeleter>;
 using RowsPtr = std::unique_ptr<StoolapRows, RowsDeleter>;
 using StmtPtr = std::unique_ptr<StoolapStmt, StmtDeleter>;
+using CursorPtr = std::unique_ptr<StoolapCursor, CursorDeleter>;
 
 // Owns the packed buffer from stoolap_rows_fetch_all(); destructor calls
 // stoolap_buffer_free. Avoids the std::vector::assign memcpy on the very
@@ -161,7 +168,7 @@ const char* status_label(int32_t code);
 struct PushdownStats {
     std::atomic<uint64_t> pushdown_hits{0};
     std::atomic<uint64_t> pushdown_misses{0};
-    std::atomic<uint64_t> buffered_scans{0};  // rnd_init via fetch_all
+    std::atomic<uint64_t> buffered_scans{0};  // direct reads (stoolap_read)
     std::atomic<uint64_t> buffered_rows{0};
     std::atomic<uint64_t> direct_modify_hits{0};
     // cached_records() miss that ran a live COUNT(*).

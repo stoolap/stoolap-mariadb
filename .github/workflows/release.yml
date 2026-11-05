@@ -8,79 +8,26 @@ permissions:
   contents: write
 
 env:
-  # Track stoolap main until v0.5.0 is tagged (v0.4.x lacks FFI calls the
-  # plugin uses); then pin the tag here.
-  STOOLAP_VERSION: main
   MARIADB_VERSION: '11.4'
 
 jobs:
   # ----------------------------------------------------------------------
-  # Build libstoolap once per OS from STOOLAP_VERSION. Shared with
-  # build-plugin via artifact.
-  # ----------------------------------------------------------------------
-  build-lib:
-    name: Build libstoolap (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04  # MariaDB's repo has no 11.4 for 26.04
-            target: x86_64-unknown-linux-gnu
-            lib: libstoolap.so
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            lib: libstoolap.dylib
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Clone stoolap engine
-        run: git clone --depth 1 --branch $STOOLAP_VERSION https://github.com/stoolap/stoolap.git stoolap-engine
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: |
-            stoolap-engine/target
-            ~/.cargo/registry
-          key: rust-${{ matrix.target }}-${{ env.STOOLAP_VERSION }}
-
-      - name: Build libstoolap
-        working-directory: stoolap-engine
-        run: cargo build --release --features ffi
-
-      - name: Upload libstoolap
-        uses: actions/upload-artifact@v4
-        with:
-          name: stoolap-${{ matrix.target }}
-          path: |
-            stoolap-engine/target/release/${{ matrix.lib }}
-            stoolap-engine/include/stoolap.h
-          if-no-files-found: error
-
-  # ----------------------------------------------------------------------
   # Build the plugin per OS. We sanity-check with the test runner
   # before packaging (catches "the binary built but doesn't load")
-  # but the actual release artifact is just the .so + libstoolap +
-  # README + LICENSE, packaged as a tarball.
+  # but the actual release artifact is just the .so (the engine is
+  # linked in) + README + LICENSE, packaged as a tarball.
   # ----------------------------------------------------------------------
   build-plugin:
     name: Build & package plugin (${{ matrix.platform }}-${{ matrix.arch }})
-    needs: build-lib
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            target: aarch64-apple-darwin
-            lib: libstoolap.dylib
             plugin: ha_stoolap.so
             platform: darwin
             arch: arm64
           - os: ubuntu-24.04  # MariaDB's repo has no 11.4 for 26.04
-            target: x86_64-unknown-linux-gnu
-            lib: libstoolap.so
             plugin: ha_stoolap.so
             platform: linux
             arch: x86_64
@@ -122,23 +69,12 @@ jobs:
           done
           echo "MARIADB_PREFIX=$PREFIX" >> $GITHUB_ENV
 
-      - name: Download libstoolap
-        uses: actions/download-artifact@v4
-        with:
-          name: stoolap-${{ matrix.target }}
-          path: stoolap-staging
-
-      - name: Stage stoolap (CMakeLists layout)
-        run: |
-          mkdir -p stoolap-fake/include stoolap-fake/target/release
-          cp stoolap-staging/include/stoolap.h stoolap-fake/include/
-          cp stoolap-staging/target/release/${{ matrix.lib }} stoolap-fake/target/release/
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build plugin
         run: |
-          cmake -S . -B build \
-            -DMARIADB_PREFIX=$MARIADB_PREFIX \
-            -DSTOOLAP_DIR=$PWD/stoolap-fake
+          cmake -S . -B build -DMARIADB_PREFIX=$MARIADB_PREFIX
           cmake --build build -j
 
       - name: Set up Python
@@ -159,8 +95,6 @@ jobs:
         if: runner.os == 'Linux'
         continue-on-error: true
         run: |
-          sudo install -m 0755 stoolap-staging/target/release/${{ matrix.lib }} /usr/local/lib/
-          sudo ldconfig
           sudo install -m 0755 build/${{ matrix.plugin }} /usr/lib/mysql/plugin/
           python3 -m pip install --user mysql-connector-python
           python3 tests/runner.py
@@ -170,23 +104,18 @@ jobs:
           DIST_DIR="stoolap-mariadb-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}"
           mkdir -p "$DIST_DIR"
           cp build/${{ matrix.plugin }}                      "$DIST_DIR/"
-          cp stoolap-staging/target/release/${{ matrix.lib }} "$DIST_DIR/"
           cp README.md LICENSE NOTICE                         "$DIST_DIR/"
           cat > "$DIST_DIR/INSTALL.txt" <<EOF
           stoolap-mariadb ${{ github.ref_name }} (${{ matrix.platform }}-${{ matrix.arch }})
 
           Built against:
-            - stoolap        ${{ env.STOOLAP_VERSION }}
+            - stoolap        (the commit in rust/Cargo.lock, linked in)
             - MariaDB Server ${{ env.MARIADB_VERSION }}.x
 
           Install:
-            1. Copy ${{ matrix.lib }} to a directory on the system
-               library path (e.g. /usr/local/lib on Linux,
-               $(brew --prefix 2>/dev/null || echo /usr/local)/lib
-               on macOS).
-            2. Copy ${{ matrix.plugin }} to MariaDB's plugin
+            1. Copy ${{ matrix.plugin }} to MariaDB's plugin
                directory (mariadb_config --plugindir).
-            3. Start mariadbd with --plugin-maturity=alpha and run:
+            2. Start mariadbd with --plugin-maturity=alpha and run:
                  INSTALL PLUGIN stoolap SONAME 'ha_stoolap.so';
 
           See README.md for configuration, status counters, and the

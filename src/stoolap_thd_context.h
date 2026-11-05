@@ -36,6 +36,14 @@ public:
     bool has_tx() const { return static_cast<bool>(tx_); }
 
     int begin(int32_t isolation = STOOLAP_ISOLATION_READ_COMMITTED);
+
+    // Ends the statement's direct access, committing (or rolling back) the
+    // transaction direct reads and writes opened outside an open one;
+    // called at the end of every statement.
+    int end_statement(bool commit) {
+        return db_ ? stoolap_end_statement(db_.get(), commit ? 1 : 0)
+                   : STOOLAP_OK;
+    }
     int commit();
     int rollback();
 

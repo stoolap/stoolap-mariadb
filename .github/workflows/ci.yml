@@ -36,71 +36,10 @@ jobs:
       - name: Check formatting
         run: clang-format-18 --dry-run --Werror src/*.{cc,h}
 
-  # ----------------------------------------------------------------------
-  # Build libstoolap.{so,dylib} once per OS/version; share via artifact so
-  # plugin build / test jobs don't need a Rust toolchain.
-  # ----------------------------------------------------------------------
-  build-lib:
-    name: Build libstoolap (${{ matrix.version_label }}, ${{ matrix.target }})
-    needs: format
-    strategy:
-      fail-fast: false
-      # The plugin uses FFI calls newer than the last release (v0.4.x
-      # lacks stoolap_stmt_exec_batch and the *_all one-call queries),
-      # so track stoolap `main` until v0.5.0 is tagged, then add a
-      # pinned v0.5.0 row next to it.
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            lib: libstoolap.so
-            stoolap_version: main
-            version_label: main
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            lib: libstoolap.dylib
-            stoolap_version: main
-            version_label: main
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Clone stoolap engine
-        run: git clone --depth 1 --branch ${{ matrix.stoolap_version }} https://github.com/stoolap/stoolap.git stoolap-engine
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: |
-            stoolap-engine/target
-            ~/.cargo/registry
-          key: rust-${{ matrix.target }}-${{ matrix.stoolap_version }}-${{ github.sha }}
-          restore-keys: |
-            rust-${{ matrix.target }}-${{ matrix.stoolap_version }}-
-
-      - name: Build libstoolap
-        working-directory: stoolap-engine
-        run: cargo build --release --features ffi
-
-      - name: Upload library + header
-        uses: actions/upload-artifact@v4
-        with:
-          name: stoolap-${{ matrix.version_label }}-${{ matrix.target }}
-          path: |
-            stoolap-engine/target/release/${{ matrix.lib }}
-            stoolap-engine/include/stoolap.h
-          if-no-files-found: error
-
   test-macos:
-    name: Test on macOS (${{ matrix.version_label }}, MariaDB 11.4)
-    needs: build-lib
+    name: Test on macOS (MariaDB 11.4)
+    needs: format
     runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - version_label: main
     steps:
       - uses: actions/checkout@v4
 
@@ -111,47 +50,35 @@ jobs:
           echo "MARIADB_PREFIX=$MARIADB_PREFIX" >> $GITHUB_ENV
           echo "$MARIADB_PREFIX/bin" >> $GITHUB_PATH
 
-      - name: Download libstoolap
-        uses: actions/download-artifact@v4
-        with:
-          name: stoolap-${{ matrix.version_label }}-aarch64-apple-darwin
-          path: stoolap-staging
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Stage stoolap (CMakeLists layout)
-        run: |
-          mkdir -p stoolap-fake/include stoolap-fake/target/release
-          cp stoolap-staging/include/stoolap.h stoolap-fake/include/
-          cp stoolap-staging/target/release/libstoolap.dylib stoolap-fake/target/release/
-          # Rewrite the dylib's LC_ID_DYLIB to @rpath/libstoolap.dylib
-          # BEFORE building the plugin so the linker bakes that path
-          # into the plugin's LC_LOAD_DYLIB. Otherwise the plugin
-          # records the dylib's absolute build-time path, and dyld
-          # tries to load it from there at INSTALL PLUGIN time on
-          # any other host. Re-sign because install_name_tool
-          # invalidates the codesign blob; macOS 14+ refuses unsigned
-          # dylibs at dlopen.
-          install_name_tool -id @rpath/libstoolap.dylib \
-            stoolap-fake/target/release/libstoolap.dylib
-          codesign --remove-signature \
-            stoolap-fake/target/release/libstoolap.dylib || true
-          codesign --sign - stoolap-fake/target/release/libstoolap.dylib
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/rust-target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-
+
+      - name: Follow stoolap main (nightly)
+        # Cargo.lock pins the stoolap commit PRs build against; the
+        # scheduled run moves it to main's head so upstream changes that
+        # break the crate show up here first.
+        if: github.event_name == 'schedule'
+        run: cargo update --manifest-path rust/Cargo.toml -p stoolap
 
       - name: Build plugin
         run: |
-          cmake -S . -B build \
-            -DMariaDB_ROOT=$MARIADB_PREFIX \
-            -DSTOOLAP_DIR=$PWD/stoolap-fake
+          cmake -S . -B build -DMariaDB_ROOT=$MARIADB_PREFIX
           cmake --build build -j
 
       - name: Install plugin
-        run: |
-          # The plugin's INSTALL_RPATH includes @loader_path, so the
-          # dylib must sit next to the .so in the plugin dir for dyld
-          # to resolve the @rpath/libstoolap.dylib reference baked
-          # into the plugin at link time (see the staging step above).
-          install -m 0755 build/ha_stoolap.so $MARIADB_PREFIX/lib/plugin/
-          install -m 0755 stoolap-fake/target/release/libstoolap.dylib \
-            $MARIADB_PREFIX/lib/plugin/
+        # The engine is linked into ha_stoolap.so (rust/).
+        run: install -m 0755 build/ha_stoolap.so $MARIADB_PREFIX/lib/plugin/
 
       - name: Set up Python
         # Pinned: mysql-connector-python fails to import on Python 3.15
@@ -170,22 +97,16 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.version_label }}-mariadbd-err
+          name: macos-mariadbd-err
           path: /tmp/stoolap-test.err
           if-no-files-found: ignore
 
   test-linux:
-    name: Test on Ubuntu (${{ matrix.version_label }}, MariaDB 11.4)
-    needs: build-lib
+    name: Test on Ubuntu (MariaDB 11.4)
+    needs: format
     # Pinned: ubuntu-latest moved to 26.04, which MariaDB's repo has no
-    # 11.4 packages for. build-lib's Linux row uses the same image so
-    # libstoolap.so is linked against the glibc it runs with.
+    # 11.4 packages for.
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - version_label: main
     steps:
       - uses: actions/checkout@v4
 
@@ -207,25 +128,30 @@ jobs:
             echo "MARIADB_PLUGIN_DIR=/usr/lib/mariadb/plugin" >> $GITHUB_ENV
           fi
 
-      - name: Download libstoolap
-        uses: actions/download-artifact@v4
-        with:
-          name: stoolap-${{ matrix.version_label }}-x86_64-unknown-linux-gnu
-          path: stoolap-staging
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Install libstoolap + stage CMakeLists layout
-        run: |
-          sudo install -m 0755 stoolap-staging/target/release/libstoolap.so /usr/local/lib/
-          sudo ldconfig
-          mkdir -p stoolap-fake/include stoolap-fake/target/release
-          cp stoolap-staging/include/stoolap.h stoolap-fake/include/
-          cp stoolap-staging/target/release/libstoolap.so stoolap-fake/target/release/
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/rust-target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-
+
+      - name: Follow stoolap main (nightly)
+        # Cargo.lock pins the stoolap commit PRs build against; the
+        # scheduled run moves it to main's head so upstream changes that
+        # break the crate show up here first.
+        if: github.event_name == 'schedule'
+        run: cargo update --manifest-path rust/Cargo.toml -p stoolap
 
       - name: Build plugin
         run: |
-          cmake -S . -B build \
-            -DMariaDB_ROOT=$MARIADB_PREFIX \
-            -DSTOOLAP_DIR=$PWD/stoolap-fake
+          cmake -S . -B build -DMariaDB_ROOT=$MARIADB_PREFIX
           cmake --build build -j$(nproc)
 
       - name: Install plugin
@@ -248,6 +174,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-${{ matrix.version_label }}-mariadbd-err
+          name: linux-mariadbd-err
           path: /tmp/stoolap-test.err
           if-no-files-found: ignore
