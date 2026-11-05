@@ -128,6 +128,7 @@ private:
     bool table_ref(TABLE_LIST* t);
     TABLE_LIST* mergeable_base(TABLE_LIST* t);
     bool condition(Item* it);
+    bool node(Item* it);
     bool expr(Item* it);
     bool literal(Item* it);
     bool field(Item_field* f);
@@ -685,10 +686,24 @@ bool Gen::table_ref(TABLE_LIST* t) {
 bool Gen::condition(Item* it) {
     if (!it->type_handler()->is_bool_type())
         return fail("non-boolean condition");
-    return expr(it);
+    return node(it);
 }
 
+// A value. A boolean expression (a comparison, AND, IN, ...) is the
+// integer 1 or 0 to MariaDB wherever it is used as one, in arithmetic, a
+// comparison, a CASE branch, a select list; stoolap's BOOLEAN is not a
+// number (TRUE + 1 is NULL, TRUE = 1 is false), so it is cast. As a
+// condition it stays as it is (condition()).
 bool Gen::expr(Item* it) {
+    if (it->type() == Item::FIELD_ITEM || !it->type_handler()->is_bool_type())
+        return node(it);
+    out += "CAST(";
+    if (!node(it)) return false;
+    out += " AS INTEGER)";
+    return true;
+}
+
+bool Gen::node(Item* it) {
     switch (it->type()) {
         case Item::FIELD_ITEM:
             return field(static_cast<Item_field*>(it));

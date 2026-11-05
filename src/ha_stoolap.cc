@@ -562,6 +562,25 @@ bool refuse_unenforceable_keys(TABLE* form) {
     return false;
 }
 
+// Columns the handler cannot read back faithfully. A COMPRESSED BLOB /
+// TEXT stores through its own Field::store, into the field's buffer the
+// row MariaDB builds shares: a row read next to it (UPDATE's old row,
+// REPLACE's duplicate) would overwrite that row's value. Checked for new
+// definitions only, as refuse_unenforceable_keys.
+bool refuse_unsupported_columns(TABLE* form) {
+    for (uint i = 0; i < form->s->fields; ++i) {
+        const Field* f = form->field[i];
+        if ((f->flags & BLOB_FLAG) && f->compression_method()) {
+            my_printf_error(ER_GET_ERRMSG,
+                            "stoolap: COMPRESSED BLOB / TEXT column '%s' is "
+                            "not supported. Drop COMPRESSED from the column.",
+                            MYF(0), f->field_name.str);
+            return true;
+        }
+    }
+    return false;
+}
+
 // Creates the stoolap table for `form` with its secondary indexes, from
 // the statement's text its FOREIGN KEY clauses (MariaDB strips them from
 // `form` for an engine that does not claim them); 0 or a handler error. A
@@ -783,6 +802,14 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
     return 0;
 }
 
+// After every statement that used the handler: BLOB buffers a large row
+// grew go now, not with the handler the table cache keeps.
+int ha_stoolap::reset() {
+    for (std::string& b : blob_bufs_)
+        if (b.capacity() > (size_t(1) << 20)) std::string().swap(b);
+    return 0;
+}
+
 int ha_stoolap::close() {
     // Release scan state now -- a large fetch_all buffer would otherwise
     // live until the handler is destroyed.
@@ -804,7 +831,8 @@ StoolapDB* ha_stoolap::ddl_db() {
 int ha_stoolap::create(const char* name, TABLE* form,
                        HA_CREATE_INFO* /*info*/) {
     const std::string tbl = stoolap_table_from_path(name);
-    if (refuse_unenforceable_keys(form)) return HA_ERR_UNSUPPORTED;
+    if (refuse_unenforceable_keys(form) || refuse_unsupported_columns(form))
+        return HA_ERR_UNSUPPORTED;
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
     if (int err = create_stoolap_table(db, tbl, form, /*if_not_exists=*/false,
@@ -1471,7 +1499,7 @@ int ha_stoolap::rnd_next(uchar* buf) {
         static_cast<my_ptrdiff_t>(buf - table->record[0]);
     if (table->s->null_bytes) std::memset(buf, 0, table->s->null_bytes);
     move_fields(table, row_diff);
-    stoolap_mariadb::RecordTarget target{table, 0};
+    stoolap_mariadb::RecordTarget target{table, 0, &blob_bufs_};
     int64_t id = 0;
     int32_t last = 0;
     const int rc = stoolap_cursor_next(

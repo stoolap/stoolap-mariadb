@@ -337,6 +337,10 @@ it. Tables created by an older build must be re-created.
   executor checks foreign keys, so the handler's inserts, updates and
   deletes on a child or parent table go through it, one statement per
   row, each committed on its own outside an explicit transaction.
+- **`COMPRESSED` BLOB / TEXT columns are refused at `CREATE TABLE`.**
+  MariaDB compresses them into the field's own buffer, which a row the
+  engine reads would share with the row MariaDB is building. `COMPRESSED`
+  VARCHAR works.
 - **`ALTER TABLE AUTO_INCREMENT = N` is not propagated.** The plugin
   recomputes the next value from `MAX(col)+1` per connection, with a
   cross-connection epoch invalidating on TRUNCATE/DROP/RENAME.

@@ -53,6 +53,18 @@ CREATE TABLE pp (a INT NOT NULL, b INT NOT NULL,
                     f"WHERE table_schema = '{h.db}' AND table_name = 'cc'",
                     "0")
 
+    h.section("COMPRESSED BLOB / TEXT refused")
+    # Its Field::store writes the field's own buffer, which the row MariaDB
+    # builds shares; a row read next to it (REPLACE's duplicate) would
+    # overwrite that row's value. COMPRESSED VARCHAR stores in the record.
+    h.assert_err("TEXT COMPRESSED rejected at CREATE",
+                 f"CREATE TABLE tcomp (id INT NOT NULL PRIMARY KEY, c TEXT "
+                 f"COMPRESSED) ENGINE={h.engine}",
+                 r"COMPRESSED BLOB / TEXT column 'c'")
+    h.assert_ok("VARCHAR COMPRESSED accepted",
+                f"CREATE TABLE vcomp (id INT NOT NULL PRIMARY KEY, c "
+                f"VARCHAR(100) COMPRESSED) ENGINE={h.engine}")
+
     h.section("Self-referencing FOREIGN KEY refused")
     h.assert_err("self-ref FK rejected at CREATE",
                  f"""CREATE TABLE selfref (
