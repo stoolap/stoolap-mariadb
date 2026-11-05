@@ -20,7 +20,7 @@ INSERT INTO w VALUES
   (4, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0.1, 0.1, 'abcde', 1.5, '2000-01-01', 'y', 'b');
 INSERT INTO w (id, v) SELECT id + 10, CONCAT(LEFT(v, 2), '!') FROM w WHERE id <= 4;
 SELECT * FROM w ORDER BY id;
-UPDATE w SET t = t - 1, iu = iu - 1, d = -d, v = 'ab😀', dc = dc * 2,
+UPDATE w SET t = t + 1, iu = iu - 1, d = -d, v = 'ab😀', dc = dc * 2,
   dt = '2001-01-01', e = 'y', tx = CONCAT(tx, '+') WHERE id IN (1, 4) ORDER BY id LIMIT 2;
 UPDATE w SET v = NULL, f = NULL WHERE id = 2 ORDER BY id LIMIT 1;
 UPDATE w SET i = i WHERE id = 4 ORDER BY id LIMIT 1;

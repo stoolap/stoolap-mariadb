@@ -22,7 +22,7 @@ INSERT INTO k VALUES (1), (2), (3), (4);
 SELECT STRAIGHT_JOIN r.* FROM k JOIN r ON r.id = k.id ORDER BY k.id;
 SELECT id, t, iu, bu, f, d FROM r FORCE INDEX (ki) WHERE i >= -2147483648 ORDER BY i;
 SELECT STRAIGHT_JOIN k.id, r.fd + 0, r.dd + 0, r.bo FROM k JOIN r ON r.id = k.id ORDER BY k.id;
-UPDATE r SET v = CONCAT(v, '!') WHERE v IS NOT NULL ORDER BY id LIMIT 3;
+UPDATE r SET v = CONCAT(LEFT(v, 8), '!') WHERE v IS NOT NULL ORDER BY id LIMIT 3;
 UPDATE r SET bu = bu - 1, iu = iu + 0 WHERE id = 1 ORDER BY id LIMIT 1;
 SELECT STRAIGHT_JOIN r.id, r.bu, r.iu, r.v FROM k JOIN r ON r.id = k.id ORDER BY k.id;
 
