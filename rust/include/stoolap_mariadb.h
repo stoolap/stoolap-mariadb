@@ -593,6 +593,63 @@ void stoolap_rows_close(StoolapRows* rows);
  * ========================================================================= */
 
 /* =========================================================================
+ * Tables
+ * ========================================================================= */
+
+/** The stoolap type a column is stored in. */
+#define STOOLAP_COL_INTEGER     1
+#define STOOLAP_COL_FLOAT       2
+#define STOOLAP_COL_TEXT        3
+
+typedef struct StoolapColumnDef {
+    const char* name;
+    int32_t kind;           /**< STOOLAP_COL_* */
+    int32_t nullable;
+    int32_t auto_increment;
+} StoolapColumnDef;
+
+#define STOOLAP_KEYDEF_PRIMARY  0
+#define STOOLAP_KEYDEF_UNIQUE   1
+/** A non-unique key: a stoolap index over its parts. */
+#define STOOLAP_KEYDEF_INDEX    2
+
+typedef struct StoolapKeyDef {
+    const char* name;
+    const int32_t* columns; /**< the key's columns, by position */
+    int32_t ncolumns;
+    int32_t kind;           /**< STOOLAP_KEYDEF_* */
+} StoolapKeyDef;
+
+/** The table was created, but some indexes were not (stoolap_errmsg). */
+#define STOOLAP_INDEX_FAILED 3
+
+/**
+ * Create `table` (stoolap's name) from `columns` and `keys` (in MariaDB's
+ * key order), in MariaDB's database `db_name`, with its secondary indexes.
+ * A single-column PRIMARY KEY is inline; a composite one and each UNIQUE
+ * key are table-level constraints, numbered in that order (the ordinals
+ * stoolap_error_class gives). `create_sql`, the statement's text or NULL,
+ * is read for FOREIGN KEY clauses, which MariaDB does not hand an engine
+ * that does not claim them; their parent tables get stoolap's names, and a
+ * composite or self-referencing one is refused.
+ */
+int32_t stoolap_create_table(
+    StoolapDB* db,
+    const char* table,
+    const char* db_name,
+    const StoolapColumnDef* columns, int32_t ncolumns,
+    const StoolapKeyDef* keys, int32_t nkeys,
+    const char* create_sql,
+    int32_t if_not_exists
+);
+
+/** Drop `table` if it is there. */
+int32_t stoolap_drop_table(StoolapDB* db, const char* table);
+
+/** Rename table `from` to `to`. */
+int32_t stoolap_rename_table(StoolapDB* db, const char* from, const char* to);
+
+/* =========================================================================
  * Error classes
  * ========================================================================= */
 

@@ -11,6 +11,7 @@
 //! so the plugin can reach the engine below SQL text: the C functions in
 //! include/stoolap_mariadb.h.
 
+pub mod ddl;
 pub mod ffi;
 pub mod key;
 pub mod read;

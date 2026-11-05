@@ -293,7 +293,7 @@ StoolapErrorView fetch_tx_error(StoolapTx* tx) {
 
 // MariaDB key behind stoolap's n-th table-level unique constraint, or
 // MAX_KEY. Stoolap numbers CREATE TABLE's table-level PRIMARY KEY / UNIQUE
-// clauses in order, and build_create_sql emits a composite PRIMARY KEY
+// clauses in order, and stoolap_create_table emits a composite PRIMARY KEY
 // first, then each non-PK unique key in key order. A single-column PRIMARY
 // KEY is inline and takes no number.
 uint unique_key_by_ordinal(TABLE_SHARE* share, uint n) {
@@ -425,30 +425,6 @@ std::string stoolap_table_from_path(const char* mariadb_path) {
     return out;
 }
 
-/** Stoolap-side flat name from explicit (db, tbl). Same encoding as
- *  stoolap_table_from_path so CREATE-time names line up with FK
- *  target names and DML-time names. */
-std::string stoolap_flat_name(std::string_view db, std::string_view tbl) {
-    auto append_escaped = [](std::string& out, std::string_view s) {
-        for (char c : s) {
-            if (c == '_')
-                out.append("_0");
-            else if (c == '/')
-                out.append("_1");
-            else
-                out.push_back(c);
-        }
-    };
-    std::string out;
-    out.reserve(db.size() + tbl.size() + 4);
-    if (!db.empty()) {
-        append_escaped(out, db);
-        out.append("_1");
-    }
-    append_escaped(out, tbl);
-    return out;
-}
-
 std::string quote_ident(std::string_view s) {
     std::string out;
     out.reserve(s.size() + 2);
@@ -461,16 +437,17 @@ std::string quote_ident(std::string_view s) {
     return out;
 }
 
-// Column type in stoolap; the value encodings are in stoolap_types.h.
-const char* stoolap_type_for(const Field* f) {
+// The stoolap type a column is stored in (STOOLAP_COL_*), 0 when none
+// fits; the value encodings are in stoolap_types.h.
+int32_t stoolap_column_kind(const Field* f) {
     using stoolap_mariadb::Enc;
     switch (stoolap_mariadb::field_enc(f)) {
         case Enc::PACKED_TIME:
         case Enc::UTC_MICROS:
         case Enc::INDEX:
-            return "INTEGER";
+            return STOOLAP_COL_INTEGER;
         case Enc::HEX:
-            return "TEXT";
+            return STOOLAP_COL_TEXT;
         case Enc::PLAIN:
             break;
     }
@@ -482,10 +459,10 @@ const char* stoolap_type_for(const Field* f) {
         case MYSQL_TYPE_INT24:
         case MYSQL_TYPE_YEAR:
         case MYSQL_TYPE_BIT:  // packed bitmap, val_int() gives the integer
-            return "INTEGER";
+            return STOOLAP_COL_INTEGER;
         case MYSQL_TYPE_FLOAT:
         case MYSQL_TYPE_DOUBLE:
-            return "FLOAT";
+            return STOOLAP_COL_FLOAT;
         case MYSQL_TYPE_VARCHAR:
         case MYSQL_TYPE_VAR_STRING:
         case MYSQL_TYPE_STRING:
@@ -494,243 +471,11 @@ const char* stoolap_type_for(const Field* f) {
         case MYSQL_TYPE_BLOB:        // ditto
         case MYSQL_TYPE_MEDIUM_BLOB:
         case MYSQL_TYPE_LONG_BLOB:
-            return "TEXT";
+            return STOOLAP_COL_TEXT;
         default:
-            return nullptr;
+            return 0;
     }
 }
-
-size_t fk_skip_ws(std::string_view s, size_t p) {
-    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
-        ++p;
-    return p;
-}
-
-// Case-insensitive keyword match at p with word boundaries.
-size_t fk_match_kw(std::string_view s, size_t p, std::string_view word) {
-    if (p + word.size() > s.size()) return std::string_view::npos;
-    for (size_t i = 0; i < word.size(); ++i) {
-        char a = std::toupper(static_cast<unsigned char>(s[p + i]));
-        char b = std::toupper(static_cast<unsigned char>(word[i]));
-        if (a != b) return std::string_view::npos;
-    }
-    if (p > 0) {
-        char pr = s[p - 1];
-        if (std::isalnum(static_cast<unsigned char>(pr)) || pr == '_')
-            return std::string_view::npos;
-    }
-    char nx = (p + word.size() < s.size()) ? s[p + word.size()] : ' ';
-    if (std::isalnum(static_cast<unsigned char>(nx)) || nx == '_')
-        return std::string_view::npos;
-    return p + word.size();
-}
-
-size_t fk_read_ident(std::string_view s, size_t p, std::string& out) {
-    out.clear();
-    if (p >= s.size()) return std::string_view::npos;
-    if (s[p] == '`') {
-        ++p;
-        while (p < s.size() && s[p] != '`') {
-            out.push_back(s[p++]);
-        }
-        if (p >= s.size()) return std::string_view::npos;
-        return p + 1;
-    }
-    while (p < s.size() &&
-           (std::isalnum(static_cast<unsigned char>(s[p])) || s[p] == '_')) {
-        out.push_back(s[p++]);
-    }
-    return out.empty() ? std::string_view::npos : p;
-}
-
-size_t fk_read_paren_list(std::string_view s, size_t p, std::string& out) {
-    if (p >= s.size() || s[p] != '(') return std::string_view::npos;
-    int depth = 0;
-    size_t open = p;
-    for (; p < s.size(); ++p) {
-        if (s[p] == '(')
-            ++depth;
-        else if (s[p] == ')') {
-            if (--depth == 0) {
-                out.assign(s.data() + open + 1, p - open - 1);
-                return p + 1;
-            }
-        }
-    }
-    return std::string_view::npos;
-}
-
-size_t count_commas(std::string_view s) {
-    size_t n = 0;
-    for (char c : s)
-        if (c == ',') ++n;
-    return n;
-}
-
-// Rewrites the parent table from `tbl` (or `db.tbl`) to `db__tbl`.
-// Skips self-referencing FK (parent not yet registered) and multi-column
-// FK (stoolap parser is single-column only); npos on parse failure.
-size_t copy_one_fk_clause(std::string_view sql, size_t fk_pos,
-                          const std::string& current_db,
-                          const std::string& current_tbl, std::string& out,
-                          bool& unsupported) {
-    // Confirm "FOREIGN KEY"
-    size_t p = fk_match_kw(sql, fk_pos, "FOREIGN");
-    if (p == std::string_view::npos) return std::string_view::npos;
-    p = fk_skip_ws(sql, p);
-    p = fk_match_kw(sql, p, "KEY");
-    if (p == std::string_view::npos) return std::string_view::npos;
-
-    // Optional index name before '(': skip it.
-    p = fk_skip_ws(sql, p);
-    if (p < sql.size() && sql[p] != '(') {
-        std::string ignored;
-        size_t np = fk_read_ident(sql, p, ignored);
-        if (np == std::string_view::npos) return std::string_view::npos;
-        p = fk_skip_ws(sql, np);
-    }
-
-    // Child column list
-    std::string child_cols;
-    p = fk_read_paren_list(sql, p, child_cols);
-    if (p == std::string_view::npos) return std::string_view::npos;
-    p = fk_skip_ws(sql, p);
-
-    // REFERENCES
-    p = fk_match_kw(sql, p, "REFERENCES");
-    if (p == std::string_view::npos) return std::string_view::npos;
-    p = fk_skip_ws(sql, p);
-
-    // Parent table name: either `name`, name, or db.name (any quoting combo).
-    std::string parent_db, parent_tbl;
-    size_t np = fk_read_ident(sql, p, parent_tbl);
-    if (np == std::string_view::npos) return std::string_view::npos;
-    p = np;
-    if (p < sql.size() && sql[p] == '.') {
-        parent_db = std::move(parent_tbl);
-        ++p;
-        np = fk_read_ident(sql, p, parent_tbl);
-        if (np == std::string_view::npos) return std::string_view::npos;
-        p = np;
-    }
-    p = fk_skip_ws(sql, p);
-
-    // Optional parent column list
-    std::string parent_cols;
-    if (p < sql.size() && sql[p] == '(') {
-        p = fk_read_paren_list(sql, p, parent_cols);
-        if (p == std::string_view::npos) return std::string_view::npos;
-        p = fk_skip_ws(sql, p);
-    }
-
-    // Optional ON DELETE / ON UPDATE actions: extract verbatim.
-    std::string actions;
-    for (int i = 0; i < 2; ++i) {
-        size_t after_on = fk_match_kw(sql, p, "ON");
-        if (after_on == std::string_view::npos) break;
-        size_t kwp = fk_skip_ws(sql, after_on);
-        size_t after_event = fk_match_kw(sql, kwp, "DELETE");
-        if (after_event == std::string_view::npos)
-            after_event = fk_match_kw(sql, kwp, "UPDATE");
-        if (after_event == std::string_view::npos) break;
-        size_t aw = fk_skip_ws(sql, after_event);
-        size_t end = aw;
-        while (end < sql.size() &&
-               (std::isalpha(static_cast<unsigned char>(sql[end])) ||
-                sql[end] == ' '))
-            ++end;
-        while (end > aw &&
-               std::isspace(static_cast<unsigned char>(sql[end - 1])))
-            --end;
-        if (!actions.empty()) actions.push_back(' ');
-        actions += std::string_view(sql.data() + p, end - p);
-        p = fk_skip_ws(sql, end);
-    }
-
-    // Reject multi-column FKs — stoolap's grammar is single-column only.
-    // Silently dropping them lets CREATE TABLE succeed and then accept
-    // FK-violating child rows with no client-visible warning.
-    if (count_commas(child_cols) > 0 || count_commas(parent_cols) > 0) {
-        my_printf_error(ER_GET_ERRMSG,
-                        "stoolap: composite FOREIGN KEY (%s) is not "
-                        "supported -- stoolap enforces single-column "
-                        "foreign keys only.",
-                        MYF(0), child_cols.c_str());
-        unsupported = true;
-        return p;
-    }
-    // Reject self-referencing FK — stoolap looks up the parent table at
-    // CREATE-time, before our just-being-created table is registered.
-    const std::string& db = parent_db.empty() ? current_db : parent_db;
-    std::string parent_full = stoolap_flat_name(db, parent_tbl);
-    if (parent_full == current_tbl) {
-        my_printf_error(ER_GET_ERRMSG,
-                        "stoolap: self-referencing FOREIGN KEY on '%s' is "
-                        "not supported -- stoolap resolves the parent at "
-                        "CREATE-time, before the table is registered.",
-                        MYF(0), current_tbl.c_str());
-        unsupported = true;
-        return p;
-    }
-
-    // Emit the rewritten clause. Parent table name uses our db__tbl form.
-    out += ", FOREIGN KEY (";
-    out += child_cols;
-    out += ") REFERENCES ";
-    out += quote_ident(parent_full);
-    if (!parent_cols.empty()) {
-        out += " (";
-        out += parent_cols;
-        out.push_back(')');
-    }
-    if (!actions.empty()) {
-        out.push_back(' ');
-        out += actions;
-    }
-    return p;
-}
-
-// Append every FOREIGN KEY clause from the THD's CREATE SQL to `extra`,
-// prefixed with ", " for splicing into the table body. False when the user's
-// CREATE has an FK shape stoolap can't enforce (my_printf_error already raised).
-bool collect_foreign_keys(THD* thd, const std::string& current_db,
-                          const std::string& current_tbl, std::string& extra) {
-    if (!thd) return true;
-    LEX_STRING* qs = thd_query_string(thd);
-    if (!qs || !qs->str || qs->length == 0) return true;
-
-    std::string_view sql(qs->str, qs->length);
-    bool unsupported = false;
-    for (size_t i = 0; i < sql.size();) {
-        if (sql[i] == '\'' || sql[i] == '"' || sql[i] == '`') {
-            char q = sql[i++];
-            while (i < sql.size() && sql[i] != q) {
-                if (sql[i] == '\\' && i + 1 < sql.size())
-                    i += 2;
-                else
-                    ++i;
-            }
-            if (i < sql.size()) ++i;
-            continue;
-        }
-        if (fk_match_kw(sql, i, "FOREIGN") != std::string_view::npos) {
-            size_t end = copy_one_fk_clause(sql, i, current_db, current_tbl,
-                                            extra, unsupported);
-            if (unsupported) return false;
-            if (end == std::string_view::npos)
-                ++i;
-            else
-                i = end;
-            continue;
-        }
-        ++i;
-    }
-    return true;
-}
-
-// Single-column PK is emitted inline (stoolap only builds PkIndex from
-// the column-level form). UNIQUE goes table-level. Multi-column PK/UNIQUE
-// and ci-collated PK/UNIQUE are refused before we get here.
 
 // Returns the offending field name when any PK/UNIQUE part is a ci string
 // (stoolap's TEXT equality is byte-wise; ci_general would accept 'a'/'A').
@@ -817,78 +562,62 @@ bool refuse_unenforceable_keys(TABLE* form) {
     return false;
 }
 
-std::string build_create_sql(const std::string& table_name, TABLE* form,
-                             bool if_not_exists) {
-    // A single-column PRIMARY KEY is emitted inline; a composite one goes
-    // first among the table-level constraints, which stoolap enforces as a
-    // NOT NULL unique index (numbering: see unique_key_by_ordinal).
-    int pk_col = -1;
-    const KEY* composite_pk = nullptr;
-    if (form->s->primary_key < form->s->keys) {
-        const KEY& pk = form->key_info[form->s->primary_key];
-        if (pk.user_defined_key_parts == 1) {
-            pk_col = static_cast<int>(pk.key_part[0].field->field_index);
-        } else {
-            composite_pk = &pk;
-        }
-    }
-    auto append_key_columns = [](std::string& out, const KEY& k) {
-        out.push_back('(');
-        for (uint j = 0; j < k.user_defined_key_parts; ++j) {
-            if (j) out += ", ";
-            const Field* f = k.key_part[j].field;
-            out += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-        }
-        out.push_back(')');
-    };
-
-    std::string sql = "CREATE TABLE ";
-    if (if_not_exists) sql += "IF NOT EXISTS ";
-    sql += quote_ident(table_name);
-    sql += " (";
+// Creates the stoolap table for `form` with its secondary indexes, from
+// the statement's text its FOREIGN KEY clauses (MariaDB strips them from
+// `form` for an engine that does not claim them); 0 or a handler error. A
+// secondary index that fails is a warning: queries on its key full-scan.
+int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
+                         bool if_not_exists, const char* what) {
+    std::vector<StoolapColumnDef> columns;
+    columns.reserve(form->s->fields);
     for (uint i = 0; i < form->s->fields; ++i) {
-        Field* f = form->field[i];
-        const char* type = stoolap_type_for(f);
-        if (!type) {
+        const Field* f = form->field[i];
+        const int32_t kind = stoolap_column_kind(f);
+        if (!kind) {
             sql_print_error(
                 "stoolap: unsupported column type for '%s' (mysql type=%d)",
                 f->field_name.str, (int)f->real_type());
-            return std::string();
+            return HA_ERR_UNSUPPORTED;
         }
-        if (i) sql += ", ";
-        sql += quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length));
-        sql.push_back(' ');
-        sql += type;
-        if (!f->real_maybe_null()) sql += " NOT NULL";
-        if (static_cast<int>(i) == pk_col) sql += " PRIMARY KEY";
-        if (f->flags & AUTO_INCREMENT_FLAG) sql += " AUTO_INCREMENT";
+        columns.push_back({f->field_name.str, kind, f->real_maybe_null(),
+                           (f->flags & AUTO_INCREMENT_FLAG) != 0});
     }
-    if (composite_pk) {
-        sql += ", PRIMARY KEY ";
-        append_key_columns(sql, *composite_pk);
-    }
+    std::vector<std::vector<int32_t>> parts(form->s->keys);
+    std::vector<StoolapKeyDef> keys;
     for (uint i = 0; i < form->s->keys; ++i) {
-        if (static_cast<uint>(i) == form->s->primary_key) continue;
-        KEY& k = form->key_info[i];
-        if (!(k.flags & HA_NOSAME)) continue;  // skip non-unique
-        sql += ", UNIQUE ";
-        append_key_columns(sql, k);
+        const KEY& k = form->key_info[i];
+        for (uint j = 0; j < k.user_defined_key_parts; ++j)
+            parts[i].push_back(
+                static_cast<int32_t>(k.key_part[j].field->field_index));
+        const int32_t kind = i == form->s->primary_key ? STOOLAP_KEYDEF_PRIMARY
+                             : (k.flags & HA_NOSAME)   ? STOOLAP_KEYDEF_UNIQUE
+                                                       : STOOLAP_KEYDEF_INDEX;
+        keys.push_back({k.name.str, parts[i].data(),
+                        static_cast<int32_t>(parts[i].size()), kind});
     }
-    // FOREIGN KEY clauses aren't in form->key_info — MariaDB strips them when
-    // the engine doesn't claim FK support. Recover them by scanning the
-    // current THD's original CREATE TABLE text and rewrite the parent table
-    // name into our `db__tbl` convention. Empty for ALTER ADD FK (which is a
-    // follow-up).
-    {
-        std::string db_name(form->s->db.str, form->s->db.length);
-        if (!collect_foreign_keys(current_thd, db_name, table_name, sql)) {
-            return std::string();  // unsupported FK shape; caller bails
-        }
+    const std::string db_name(form->s->db.str, form->s->db.length);
+    LEX_STRING* qs = current_thd ? thd_query_string(current_thd) : nullptr;
+    const std::string sql =
+        qs && qs->str ? std::string(qs->str, qs->length) : std::string();
+    const int rc = stoolap_create_table(
+        db, tbl.c_str(), db_name.c_str(), columns.data(),
+        static_cast<int32_t>(columns.size()), keys.data(),
+        static_cast<int32_t>(keys.size()),
+        qs && qs->str ? sql.c_str() : nullptr, if_not_exists);
+    if (rc == STOOLAP_INDEX_FAILED) {
+        sql_print_warning(
+            "stoolap: failed to create indexes of '%s': %s -- queries on "
+            "these keys will full-scan",
+            tbl.c_str(), stoolap_errmsg(db));
+        return 0;
     }
-    sql.push_back(')');
-    return sql;
+    if (rc != STOOLAP_OK) {
+        auto verr = fetch_db_error(db);
+        sql_print_error("stoolap: %s of '%s' failed: %s", what, tbl.c_str(),
+                        verr.message);
+        return report_stoolap_error(verr);
+    }
+    return 0;
 }
 
 int stoolap_init_func(void* p) {
@@ -1018,8 +747,6 @@ StoolapDB* ha_stoolap::db_ensure() {
 
 // Forward decl: defined below alongside create(). Used by both create()
 // (after a fresh CREATE TABLE) and open()'s reconcile path.
-void create_secondary_indexes(StoolapDB* db, const std::string& tbl,
-                              TABLE* form);
 
 int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
     stoolap_table_ = stoolap_table_from_path(name);
@@ -1043,18 +770,12 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
                 "ALTER TABLE ... DROP INDEX it, or key the whole column.",
                 stoolap_table_.c_str(), bad.c_str());
         }
-        std::string sql = build_create_sql(stoolap_table_, table,
-                                           /*if_not_exists=*/true);
-        if (sql.empty()) return HA_ERR_UNSUPPORTED;
-        if (stoolap_exec(d, sql.c_str(), nullptr) != STOOLAP_OK) {
-            auto verr = fetch_db_error(d);
-            sql_print_error("stoolap: schema reconcile failed for '%s': %s",
-                            stoolap_table_.c_str(), verr.message);
-            return report_stoolap_error(verr);
-        }
-        // Re-emit secondary indexes too: a wiped stoolap-side table comes
-        // back without them, leaving "index-served" queries on a full scan.
-        create_secondary_indexes(d, stoolap_table_, table);
+        // Secondary indexes too: a wiped stoolap-side table comes back
+        // without them, leaving "index-served" queries on a full scan.
+        if (int err = create_stoolap_table(d, stoolap_table_, table,
+                                           /*if_not_exists=*/true,
+                                           "schema reconcile"))
+            return err;
         g_engine.mark_reconciled(stoolap_table_);
     }
     return 0;
@@ -1067,39 +788,6 @@ int ha_stoolap::close() {
     db_.reset();
     stoolap_table_.clear();
     return 0;
-}
-
-// One stoolap index per non-unique KEY, over all of its parts (stoolap
-// serves leading-part equality and ranges from a composite index too).
-// Without it, MariaDB advertises an index with no physical backing and
-// degrades to a full scan. UNIQUE / PRIMARY KEY are created inline.
-void create_secondary_indexes(StoolapDB* db, const std::string& tbl,
-                              TABLE* form) {
-    for (uint i = 0; i < form->s->keys; ++i) {
-        if (i == form->s->primary_key) continue;
-        KEY& k = form->key_info[i];
-        if (k.flags & HA_NOSAME) continue;  // UNIQUE handled inline
-        if (k.user_defined_key_parts == 0 || !k.key_part) continue;
-        std::string idx_sql = "CREATE INDEX IF NOT EXISTS ";
-        idx_sql +=
-            quote_ident(tbl + "__" + std::string(k.name.str, k.name.length));
-        idx_sql += " ON ";
-        idx_sql += quote_ident(tbl);
-        idx_sql += " (";
-        for (uint j = 0; j < k.user_defined_key_parts; ++j) {
-            const Field* f = k.key_part[j].field;
-            if (j) idx_sql += ", ";
-            idx_sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-        }
-        idx_sql += ")";
-        if (stoolap_exec(db, idx_sql.c_str(), nullptr) != STOOLAP_OK) {
-            sql_print_warning(
-                "stoolap: failed to create index '%s': %s -- "
-                "queries on this key will full-scan",
-                k.name.str, stoolap_errmsg(db));
-        }
-    }
 }
 
 // A single StoolapDB* is unsafe for concurrent use: concurrent DDL
@@ -1115,29 +803,20 @@ int ha_stoolap::create(const char* name, TABLE* form,
                        HA_CREATE_INFO* /*info*/) {
     const std::string tbl = stoolap_table_from_path(name);
     if (refuse_unenforceable_keys(form)) return HA_ERR_UNSUPPORTED;
-    std::string sql = build_create_sql(tbl, form, /*if_not_exists=*/false);
-    if (sql.empty()) return HA_ERR_UNSUPPORTED;
-
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
-    if (stoolap_exec(db, sql.c_str(), nullptr) != STOOLAP_OK) {
-        auto verr = fetch_db_error(db);
-        sql_print_error("stoolap: CREATE TABLE failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
+    if (int err = create_stoolap_table(db, tbl, form, /*if_not_exists=*/false,
+                                       "CREATE TABLE"))
+        return err;
     g_engine.mark_reconciled(tbl);
-    create_secondary_indexes(db, tbl, form);
     return 0;
 }
 
 int ha_stoolap::delete_table(const char* name) {
     const std::string flat = stoolap_table_from_path(name);
-    std::string sql = "DROP TABLE IF EXISTS ";
-    sql += quote_ident(flat);
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
-    int rc = stoolap_exec(db, sql.c_str(), nullptr);
-    if (rc != STOOLAP_OK) {
+    if (stoolap_drop_table(db, flat.c_str()) != STOOLAP_OK) {
         auto verr = fetch_db_error(db);
         sql_print_error("stoolap: DROP TABLE failed: %s", verr.message);
         return report_stoolap_error(verr);
@@ -1153,14 +832,10 @@ int ha_stoolap::delete_table(const char* name) {
 int ha_stoolap::rename_table(const char* from, const char* to) {
     const std::string flat_from = stoolap_table_from_path(from);
     const std::string flat_to = stoolap_table_from_path(to);
-    std::string sql = "ALTER TABLE ";
-    sql += quote_ident(flat_from);
-    sql += " RENAME TO ";
-    sql += quote_ident(flat_to);
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
-    int rc = stoolap_exec(db, sql.c_str(), nullptr);
-    if (rc != STOOLAP_OK) {
+    if (stoolap_rename_table(db, flat_from.c_str(), flat_to.c_str()) !=
+        STOOLAP_OK) {
         auto verr = fetch_db_error(db);
         sql_print_error("stoolap: RENAME TABLE failed: %s", verr.message);
         return report_stoolap_error(verr);
