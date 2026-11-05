@@ -581,12 +581,13 @@ bool refuse_unsupported_columns(TABLE* form) {
     return false;
 }
 
-// Creates the stoolap table for `form` with its secondary indexes, from
-// the statement's text its FOREIGN KEY clauses (MariaDB strips them from
-// `form` for an engine that does not claim them); 0 or a handler error. A
-// secondary index that fails is a warning: queries on its key full-scan.
+// Creates the stoolap table for `form` with its secondary indexes, and,
+// when `with_fks`, the FOREIGN KEY clauses of the statement's text
+// (MariaDB strips them from `form` for an engine that does not claim
+// them); 0 or a handler error. A secondary index that fails is a warning:
+// queries on its key full-scan.
 int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
-                         bool if_not_exists, const char* what) {
+                         bool if_not_exists, bool with_fks, const char* what) {
     std::vector<StoolapColumnDef> columns;
     columns.reserve(form->s->fields);
     for (uint i = 0; i < form->s->fields; ++i) {
@@ -617,7 +618,8 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
     const std::string db_name(form->s->db.str, form->s->db.length);
     // The statement's bytes, by their length: a literal may hold a NUL,
     // and the text is in the client's character set.
-    LEX_STRING* qs = current_thd ? thd_query_string(current_thd) : nullptr;
+    LEX_STRING* qs =
+        with_fks && current_thd ? thd_query_string(current_thd) : nullptr;
     const bool has_sql = qs && qs->str;
     const int rc = stoolap_create_table(
         db, tbl.c_str(), db_name.c_str(), columns.data(),
@@ -793,9 +795,12 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
         }
         // Secondary indexes too: a wiped stoolap-side table comes back
         // without them, leaving "index-served" queries on a full scan.
-        if (int err = create_stoolap_table(d, stoolap_table_, table,
-                                           /*if_not_exists=*/true,
-                                           "schema reconcile"))
+        // Not the statement's FOREIGN KEYs: they belong to the table it
+        // creates, if any, and MariaDB keeps none for this one.
+        if (int err =
+                create_stoolap_table(d, stoolap_table_, table,
+                                     /*if_not_exists=*/true,
+                                     /*with_fks=*/false, "schema reconcile"))
             return err;
         g_engine.mark_reconciled(stoolap_table_);
     }
@@ -836,7 +841,7 @@ int ha_stoolap::create(const char* name, TABLE* form,
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
     if (int err = create_stoolap_table(db, tbl, form, /*if_not_exists=*/false,
-                                       "CREATE TABLE"))
+                                       /*with_fks=*/true, "CREATE TABLE"))
         return err;
     g_engine.mark_reconciled(tbl);
     return 0;
@@ -1768,8 +1773,9 @@ int ha_stoolap::index_end_read(uchar* buf, bool desc) {
     if (int err = open_read(nullptr, 0, ir_order_.data(),
                             static_cast<int32_t>(ir_order_.size()), desc))
         return err;
-    const int rc = rnd_next(buf);
-    return rc == HA_ERR_END_OF_FILE ? HA_ERR_KEY_NOT_FOUND : rc;
+    // An empty table is the end of the index: READ_RECORD's index_first
+    // (UPDATE / DELETE ... ORDER BY) takes any other code as an error.
+    return rnd_next(buf);
 }
 
 int ha_stoolap::read_range_first(const key_range* start_key,

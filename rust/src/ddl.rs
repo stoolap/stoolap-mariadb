@@ -188,49 +188,108 @@ fn is_word(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
+/// The comment at `p` and its end, as MariaDB's lexer skips them between
+/// tokens: /* ... */ (not /*! ... */ or /*M! ... */, whose text it runs),
+/// # and -- to the end of the line
+fn comment_end(s: &[u8], p: usize) -> Option<usize> {
+    let rest = &s[p..];
+    if rest.starts_with(b"/*") && !rest.starts_with(b"/*!") && !rest.starts_with(b"/*M!") {
+        return Some(
+            s[p + 2..]
+                .windows(2)
+                .position(|w| w == b"*/")
+                .map_or(s.len(), |at| p + 2 + at + 2),
+        );
+    }
+    if rest.starts_with(b"#")
+        || (rest.starts_with(b"--") && rest.get(2).is_none_or(|c| c.is_ascii_whitespace()))
+    {
+        return Some(
+            s[p..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(s.len(), |at| p + at + 1),
+        );
+    }
+    None
+}
+
+/// Past the white space and comments at `p`
 fn skip_ws(s: &[u8], mut p: usize) -> usize {
-    while p < s.len() && s[p].is_ascii_whitespace() {
-        p += 1;
+    while p < s.len() {
+        if s[p].is_ascii_whitespace() {
+            p += 1;
+        } else if let Some(end) = comment_end(s, p) {
+            p = end;
+        } else {
+            break;
+        }
     }
     p
 }
 
-/// `word` at `p`, any case, on word boundaries: the position after it
+/// `word` at `p`, any case, a word of its own: not part of an identifier
+/// (x$FOREIGN) nor a qualified name's part (d.foreign). The position
+/// after it
 fn keyword(s: &[u8], p: usize, word: &str) -> Option<usize> {
     let end = p + word.len();
     if end > s.len() || !s[p..end].eq_ignore_ascii_case(word.as_bytes()) {
         return None;
     }
-    if p > 0 && is_word(s[p - 1]) {
+    if p > 0 && (is_ident_byte(s[p - 1]) || s[p - 1] == b'.') {
         return None;
     }
-    if end < s.len() && is_word(s[end]) {
+    if end < s.len() && is_ident_byte(s[end]) {
         return None;
     }
     Some(end)
 }
 
-/// An identifier at `p`, `quoted` or bare, as its bytes
-fn ident(s: &[u8], mut p: usize) -> Option<(&[u8], usize)> {
+/// A byte of a bare identifier: MariaDB's [0-9a-zA-Z$_] and the bytes of
+/// a character past ASCII
+fn is_ident_byte(c: u8) -> bool {
+    is_word(c) || c == b'$' || c >= 0x80
+}
+
+/// An identifier at `p`, as its bytes: `quoted` or "quoted" (ANSI_QUOTES,
+/// where the plain sql_mode would not have parsed the statement), a
+/// doubled quote standing for one, or bare
+fn ident(s: &[u8], mut p: usize) -> Option<(Vec<u8>, usize)> {
     if p >= s.len() {
         return None;
     }
-    if s[p] == b'`' {
+    let q = s[p];
+    if q == b'`' || q == b'"' {
+        let mut out = Vec::new();
         p += 1;
-        let start = p;
-        while p < s.len() && s[p] != b'`' {
+        while p < s.len() {
+            if s[p] == q {
+                if p + 1 < s.len() && s[p + 1] == q {
+                    out.push(q);
+                    p += 2;
+                    continue;
+                }
+                return Some((out, p + 1));
+            }
+            out.push(s[p]);
             p += 1;
         }
-        if p >= s.len() {
-            return None;
-        }
-        return Some((&s[start..p], p + 1));
+        return None;
     }
     let start = p;
-    while p < s.len() && is_word(s[p]) {
+    while p < s.len() && is_ident_byte(s[p]) {
         p += 1;
     }
-    (p > start).then(|| (&s[start..p], p))
+    (p > start).then(|| (s[start..p].to_vec(), p))
+}
+
+/// Whether the word before `at` is DROP: ALTER TABLE ... DROP FOREIGN KEY
+fn after_drop(s: &[u8], at: usize) -> bool {
+    let mut end = at;
+    while end > 0 && s[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    end >= 4 && s[end - 4..end].eq_ignore_ascii_case(b"DROP") && (end == 4 || !is_word(s[end - 5]))
 }
 
 /// The bytes inside the parentheses at `p`, and the position after them
@@ -263,7 +322,7 @@ fn foreign_key(
     table: &str,
     out: &mut String,
 ) -> Result<Option<usize>> {
-    type Clause<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8], Vec<u8>, usize);
+    type Clause<'a> = (&'a [u8], Vec<u8>, Vec<u8>, &'a [u8], Vec<u8>, usize);
     let parse = || -> Option<Clause<'_>> {
         let mut p = keyword(s, at, "FOREIGN")?;
         p = keyword(s, skip_ws(s, p), "KEY")?;
@@ -277,7 +336,7 @@ fn foreign_key(
         p = skip_ws(s, p);
         let (mut parent_table, np) = ident(s, p)?;
         p = np;
-        let mut parent_db: &[u8] = &[];
+        let mut parent_db = Vec::new();
         if p < s.len() && s[p] == b'.' {
             parent_db = parent_table;
             let (t, np) = ident(s, p + 1)?;
@@ -310,16 +369,34 @@ fn foreign_key(
             while end > action && s[end - 1].is_ascii_whitespace() {
                 end -= 1;
             }
+            // Rebuilt from its words: a comment between them stays out of
+            // stoolap's SQL
             if !actions.is_empty() {
                 actions.push(b' ');
             }
-            actions.extend_from_slice(&s[p..end]);
+            actions.extend_from_slice(b"ON ");
+            actions.extend_from_slice(&s[kw..after_event]);
+            actions.push(b' ');
+            actions.extend_from_slice(&s[action..end]);
             p = skip_ws(s, end);
         }
         Some((child, parent_db, parent_table, parent_columns, actions, p))
     };
     let Some((child, parent_db, parent_table, parent_columns, actions, end)) = parse() else {
-        return Ok(None);
+        // FOREIGN not followed by KEY is no clause; DROP FOREIGN KEY names
+        // a key to drop; anything else is a clause that would be lost, and
+        // with it the key
+        let is_clause = keyword(s, at, "FOREIGN")
+            .and_then(|p| keyword(s, skip_ws(s, p), "KEY"))
+            .is_some();
+        if !is_clause || after_drop(s, at) {
+            return Ok(None);
+        }
+        return Err(Error::NotSupported(
+            "a FOREIGN KEY clause the plugin cannot read: write it as FOREIGN KEY \
+             [name] (column) REFERENCES table (column)"
+                .into(),
+        ));
     };
     // The names as written, in the client's character set: as UTF-8 only,
     // since a lossy one could name another column ('\u{FFFD}' is one)
@@ -334,8 +411,8 @@ fn foreign_key(
     };
     let (child, parent_db, parent_table, parent_columns, actions) = (
         utf8(child)?,
-        utf8(parent_db)?,
-        utf8(parent_table)?,
+        utf8(&parent_db)?,
+        utf8(&parent_table)?,
         utf8(parent_columns)?,
         utf8(&actions)?,
     );
@@ -349,10 +426,22 @@ fn foreign_key(
             child
         )));
     }
-    let parent = flat_name(
-        if parent_db.is_empty() { db } else { &parent_db },
-        &parent_table,
-    );
+    // Stoolap's name for the parent comes from MariaDB's file name for it,
+    // which encodes every character past [0-9A-Za-z_] (p$1 is p@00241)
+    let plain = |n: &str| n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+    let parent_db = if parent_db.is_empty() {
+        db.to_string()
+    } else {
+        parent_db
+    };
+    if !plain(&parent_table) || !plain(&parent_db) {
+        return Err(Error::NotSupported(format!(
+            "FOREIGN KEY parent '{}': the plugin names a parent table only \
+             when its database and table names are letters, digits and _",
+            parent_table
+        )));
+    }
+    let parent = flat_name(&parent_db, &parent_table);
     // Stoolap looks the parent up at CREATE, before this table exists
     if parent == table {
         return Err(Error::NotSupported(format!(
@@ -383,6 +472,10 @@ fn foreign_key(
 fn foreign_keys(s: &[u8], db: &str, table: &str, out: &mut String) -> Result<()> {
     let mut i = 0;
     while i < s.len() {
+        if let Some(end) = comment_end(s, i) {
+            i = end;
+            continue;
+        }
         match s[i] {
             q @ (b'\'' | b'"' | b'`') => {
                 i += 1;
@@ -461,6 +554,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id)");
+        // ANSI_QUOTES
+        assert_eq!(
+            fks(
+                "CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES \"p\" (id))",
+                "d_1c"
+            )
+            .unwrap(),
+            ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id)"
+        );
+        // A parent whose MariaDB file name is encoded (p$1 is p@00241) is
+        // refused rather than named wrong
+        for parent in ["p$1", "`a``b`", "p\u{e9}"] {
+            let sql =
+                format!("CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES {parent} (id))");
+            assert!(fks(&sql, "d_1c").is_err(), "{parent}");
+        }
+        // FOREIGN in a name is no clause
+        for sql in [
+            "CREATE TABLE c (x$FOREIGN INT, y\u{e9}foreign INT)",
+            "CREATE TABLE d.foreign (id INT)",
+            "CREATE TABLE c (foreign_id INT)",
+        ] {
+            assert_eq!(fks(sql, "d_1c").unwrap(), "", "{sql}");
+        }
+        // Comments between the tokens of a clause, as MariaDB's lexer skips them
+        assert_eq!(
+            fks(
+                "CREATE TABLE c (pid INT, FOREIGN /* a */ KEY # b\n (pid) -- c\n REFERENCES /*d*/ p (id) ON /* e */ DELETE CASCADE)",
+                "d_1c"
+            )
+            .unwrap(),
+            ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id) ON DELETE CASCADE"
+        );
+        // So is the current database's
+        let mut out = String::new();
+        assert!(foreign_keys(
+            b"CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES p (id))",
+            "my-db",
+            "my@002ddb_1c",
+            &mut out,
+        )
+        .is_err());
+        // DROP FOREIGN KEY names a key, comments are skipped, /*! */ runs
+        assert_eq!(
+            fks(
+                "ALTER TABLE c DROP FOREIGN KEY fk_1, ADD COLUMN x INT",
+                "d_1c"
+            )
+            .unwrap(),
+            ""
+        );
+        assert_eq!(
+            fks(
+                "CREATE TABLE c (pid INT /* FOREIGN KEY later */, x INT) -- FOREIGN KEY\n",
+                "d_1c"
+            )
+            .unwrap(),
+            ""
+        );
+        assert_eq!(
+            fks(
+                "CREATE TABLE c (pid INT /*! , FOREIGN KEY (pid) REFERENCES p (id) */)",
+                "d_1c"
+            )
+            .unwrap(),
+            ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id)"
+        );
+        // A clause that does not read is refused, not dropped with its key
+        assert!(fks(
+            "CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES (id))",
+            "d_1c"
+        )
+        .is_err());
         // A name in another character set is refused, not read lossily
         // (which could name another column)
         let mut out = String::new();

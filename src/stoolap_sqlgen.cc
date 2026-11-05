@@ -776,6 +776,18 @@ bool Gen::literal(Item* it) {
             if (!d) return fail("decimal literal");
             String s;
             if (!d->to_string(&s)) return fail("decimal literal");
+            // Stoolap reads a decimal literal as a double: past 15
+            // significant digits it would not give the same number back.
+            int digits = 0;
+            bool leading = true;
+            for (size_t i = 0; i < s.length(); ++i) {
+                const char c = s.ptr()[i];
+                if (c < '0' || c > '9') continue;
+                if (leading && c == '0') continue;
+                leading = false;
+                ++digits;
+            }
+            if (digits > 15) return fail("decimal literal past a double");
             out.append(s.ptr(), s.length());
             if (!std::memchr(s.ptr(), '.', s.length())) out += ".0";
             return true;

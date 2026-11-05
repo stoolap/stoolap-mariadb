@@ -956,6 +956,11 @@ INSERT INTO reck VALUES (1);
     h.assert_pushed("record_reads expressions",
                     "SELECT id, t + 1, i - 1, -m, f * 2, d / 2, CONCAT(v, 'x'), "
                     "CHAR_LENGTH(v) FROM recr ORDER BY id")
+    h.assert_pushed("review_fixes short decimal literals",
+                    "SELECT 12345678901234.5, 0.000000000000000123456789, "
+                    "-98765.4321 FROM recr")
+    h.assert_not_pushed("review_fixes long decimal literal",
+                        "SELECT 12345678901234567890.5 FROM recr")
     h.assert_pushed("bool_values select list",
                     "SELECT id, (t + 1 > 1) + 1, (i > 0) * 10, i > 0, (i > 0) = (m > 0) "
                     "FROM recr ORDER BY id")
