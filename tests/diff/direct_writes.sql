@@ -39,3 +39,16 @@ UPDATE t4 SET id = id + 100 ORDER BY id LIMIT 1;
 SELECT id, u FROM t4 ORDER BY id;
 UPDATE t4 SET id = 11 ORDER BY id DESC LIMIT 1;
 SELECT id, u FROM t4 ORDER BY id;
+
+-- A read in index order goes on after the rows it gave when the
+-- statement's own writes stop the index from answering: no row skipped,
+-- none given twice.
+CREATE TABLE t5 (id INT NOT NULL PRIMARY KEY, k INT, v INT, KEY kk (k)) ENGINE={E};
+INSERT INTO t5 WITH RECURSIVE s (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 40)
+  SELECT n, 7, 0 FROM s;
+DELETE FROM t5 ORDER BY id LIMIT 20;
+SELECT MIN(id), MAX(id), COUNT(*) FROM t5;
+UPDATE t5 FORCE INDEX (kk) SET v = v + 1 ORDER BY k LIMIT 18;
+SELECT COUNT(*), SUM(v), MAX(v) FROM t5;
+DELETE FROM t5 ORDER BY id DESC LIMIT 17;
+SELECT MIN(id), MAX(id), COUNT(*) FROM t5;

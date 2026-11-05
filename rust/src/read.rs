@@ -79,6 +79,9 @@ struct Pager {
     page: usize,
     rows: std::vec::IntoIter<(i64, Row)>,
     done: bool,
+    /// The column's value in the last row given, and the ids of the rows
+    /// given with it: where a sorted scan goes on
+    last: Option<(Value, Vec<i64>)>,
 }
 
 impl Pager {
@@ -101,13 +104,28 @@ impl Pager {
             }
             None => {
                 // The index cannot answer now (the transaction wrote the
-                // table): the rest from a sorted scan
+                // table, maybe the rows given): the rest from a sorted
+                // scan, after the last row given, as an index cursor goes
+                // on from its position
                 self.done = true;
                 let desc = self.desc;
                 let all = self.session.with_table(&self.table, |t| {
                     sorted_rows(t.scan(&[], None)?, &[column], desc)
                 })?;
-                all.into_iter().skip(offset).collect()
+                match &self.last {
+                    None => all,
+                    Some((value, ids)) => all
+                        .into_iter()
+                        .filter(|(id, row)| {
+                            let o = compare_values(row.get(column), Some(value));
+                            match if desc { o.reverse() } else { o } {
+                                Ordering::Greater => true,
+                                Ordering::Equal => !ids.contains(id),
+                                Ordering::Less => false,
+                            }
+                        })
+                        .collect(),
+                }
             }
         };
         self.offset += rows.len();
@@ -331,6 +349,7 @@ impl Cursor {
                 page: 16,
                 rows: Vec::new().into_iter(),
                 done: false,
+                last: None,
             }),
             columns: spec.columns.to_vec(),
         })
@@ -371,6 +390,16 @@ impl Cursor {
                         }
                         break;
                     };
+                    let value = row.get(pager.column);
+                    match &mut pager.last {
+                        Some((v, ids)) if compare_values(value, Some(v)) == Ordering::Equal => {
+                            ids.push(id)
+                        }
+                        last => {
+                            *last =
+                                Some((value.cloned().unwrap_or_else(Value::null_unknown), vec![id]))
+                        }
+                    }
                     emit(id, &row, &self.columns)?;
                     n += 1;
                 }
@@ -383,18 +412,22 @@ impl Cursor {
 /// MariaDB's key order: NULL before any value
 fn compare_by(a: &Row, b: &Row, columns: &[usize]) -> Ordering {
     for &c in columns {
-        let (x, y) = (a.get(c), b.get(c));
-        let x = x.filter(|v| !v.is_null());
-        let y = y.filter(|v| !v.is_null());
-        let o = match (x, y) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Less,
-            (Some(_), None) => Ordering::Greater,
-            (Some(x), Some(y)) => x.cmp(y),
-        };
+        let o = compare_values(a.get(c), b.get(c));
         if o != Ordering::Equal {
             return o;
         }
     }
     Ordering::Equal
+}
+
+/// MariaDB's order of two values: NULL (or none) before any value
+fn compare_values(x: Option<&Value>, y: Option<&Value>) -> Ordering {
+    let x = x.filter(|v| !v.is_null());
+    let y = y.filter(|v| !v.is_null());
+    match (x, y) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(x), Some(y)) => x.cmp(y),
+    }
 }
