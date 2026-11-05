@@ -27,3 +27,15 @@ CREATE TRIGGER t3ai AFTER INSERT ON t3 FOR EACH ROW
   SET @seen = (SELECT MAX(id) FROM t3);
 INSERT INTO t3 VALUES (2);
 SELECT @seen;
+
+-- A row moved to a new PRIMARY KEY keeps UNIQUE per row: IGNORE skips
+-- the second row's duplicate, its own unchanged key is no conflict, and
+-- a taken id is a duplicate of the key.
+CREATE TABLE t4 (id INT NOT NULL PRIMARY KEY, u INT, UNIQUE KEY uu (u)) ENGINE={E};
+INSERT INTO t4 VALUES (1, 1), (2, 2);
+UPDATE IGNORE t4 SET id = id + 10, u = 7 ORDER BY id LIMIT 2;
+SELECT id, u FROM t4 ORDER BY id;
+UPDATE t4 SET id = id + 100 ORDER BY id LIMIT 1;
+SELECT id, u FROM t4 ORDER BY id;
+UPDATE t4 SET id = 11 ORDER BY id DESC LIMIT 1;
+SELECT id, u FROM t4 ORDER BY id;

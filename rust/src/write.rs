@@ -96,6 +96,11 @@ pub fn update(
     for (&c, v) in columns.iter().zip(values) {
         row.set(c, v)?;
     }
+    // Before the old row goes: the insert below misses pending rows, and
+    // the row's own keys, which it gives up, are no conflict
+    if table.has_unique_non_pk_indexes() {
+        check_unique(table, row_id, &row, columns)?;
+    }
     table.delete_by_row_ids(&[row_id])?;
     if let Err(e) = table.insert_discard(row) {
         // Put the row back: the statement fails, the transaction goes on
