@@ -2204,50 +2204,58 @@ int ha_stoolap::open_read(const StoolapCond* conds, int32_t nconds,
         bitmap_is_set(table->write_set,
                       table->key_info[pk].key_part[0].fieldnr - 1))
         flags |= STOOLAP_READ_FIXED;
-    StoolapCursor* cur = nullptr;
-    if (stoolap_read(db, stoolap_table_.c_str(), static_cast<int32_t>(fields),
-                     read_cols_.data(), static_cast<int32_t>(read_cols_.size()),
-                     conds, nconds, order, norder, flags, &cur) != STOOLAP_OK) {
-        auto verr = fetch_db_error(db);
-        sql_print_error("stoolap: read failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    cursor_.reset(cur);
+    StoolapCursor* cursor = read_cursor();
+    if (!cursor) return HA_ERR_OUT_OF_MEM;
     cursor_chunk_ = first_chunk                                ? first_chunk
                     : stoolap_thd_has_explicit_limit(ha_thd()) ? 64
                                                                : 1024;
     stoolap_mariadb::g_stats.buffered_scans.fetch_add(
         1, std::memory_order_relaxed);
-    return next_chunk();
+    const uint8_t* buf = nullptr;
+    int64_t len = 0;
+    const int rc =
+        stoolap_read(db, stoolap_table_.c_str(), static_cast<int32_t>(fields),
+                     read_cols_.data(), static_cast<int32_t>(read_cols_.size()),
+                     conds, nconds, order, norder, flags, cursor,
+                     static_cast<int32_t>(cursor_chunk_), &buf, &len);
+    return load_chunk(rc, buf, len);
 }
 
-// Loads the cursor's next chunk; at the end, drops the cursor and leaves
-// no rows.
+// The handler's cursor, made on its first read.
+StoolapCursor* ha_stoolap::read_cursor() {
+    if (!cursor_) cursor_.reset(stoolap_cursor_new());
+    return cursor_.get();
+}
+
+// Loads the cursor's next chunk; at the end, leaves no rows.
 int ha_stoolap::next_chunk() {
-    pkt_ = nullptr;
-    pkt_len_ = 0;
-    scan_buf_rows_left_ = 0;
     const uint8_t* buf = nullptr;
     int64_t len = 0;
     const int rc = stoolap_cursor_fetch(
         cursor_.get(), static_cast<int32_t>(cursor_chunk_), &buf, &len);
+    return load_chunk(rc, buf, len);
+}
+
+// Takes the chunk a read or fetch of cursor_chunk_ rows gave; the read has
+// more only when the chunk is full.
+int ha_stoolap::load_chunk(int rc, const uint8_t* buf, int64_t len) {
+    pkt_ = nullptr;
+    pkt_len_ = 0;
+    scan_buf_rows_left_ = 0;
+    reading_ = false;
+    const uint32_t asked = cursor_chunk_;
     if (cursor_chunk_ < 65536) cursor_chunk_ *= 4;
-    if (rc == STOOLAP_DONE) {
-        cursor_.reset();
-        return 0;
-    }
+    if (rc == STOOLAP_DONE) return 0;
     if (rc != STOOLAP_ROW) {
         StoolapErrorView verr{stoolap_cursor_errmsg(cursor_.get())};
         sql_print_error("stoolap: read failed: %s", verr.message);
-        const int err = report_stoolap_error(verr);
-        cursor_.reset();
-        return err;
+        return report_stoolap_error(verr);
     }
     size_t pos = 0;
     uint32_t cols = 0;
     if (!pkt_parse_header(buf, static_cast<size_t>(len), &pos, &cols) ||
         pos + 4 > static_cast<size_t>(len)) {
-        cursor_.reset();
+        stoolap_cursor_end(cursor_.get());
         sql_print_error("stoolap: malformed read chunk");
         return HA_ERR_GENERIC;
     }
@@ -2256,6 +2264,7 @@ int ha_stoolap::next_chunk() {
     scan_buf_cols_ = cols;
     scan_buf_rows_left_ = pkt_le32(buf + pos);
     scan_buf_pos_ = pos + 4;
+    reading_ = scan_buf_rows_left_ >= asked;
     stoolap_mariadb::g_stats.buffered_rows.fetch_add(scan_buf_rows_left_,
                                                      std::memory_order_relaxed);
     return 0;
@@ -2268,9 +2277,9 @@ int ha_stoolap::rnd_end() {
 
 int ha_stoolap::rnd_next(uchar* buf) {
     // Direct read: parse the next row of the cursor's chunk.
-    if (cursor_ || pkt_) {
+    if (reading_ || pkt_) {
         if (scan_buf_rows_left_ == 0) {
-            if (!cursor_) return HA_ERR_END_OF_FILE;
+            if (!reading_) return HA_ERR_END_OF_FILE;
             if (int err = next_chunk()) return err;
             if (scan_buf_rows_left_ == 0) return HA_ERR_END_OF_FILE;
         }
@@ -2312,7 +2321,7 @@ int ha_stoolap::rnd_next(uchar* buf) {
         // (the buffer offset is unrecoverable).
         if (err) {
             scan_buf_rows_left_ = 0;
-            cursor_.reset();
+            end_read();
         } else
             scan_buf_rows_left_--;
 
@@ -2340,19 +2349,16 @@ int ha_stoolap::rnd_pos(uchar* buf, uchar* pos) {
         auto* ctx = get_thd_ctx(ha_thd());
         StoolapDB* db = ctx->db();
         if (!db) return HA_ERR_INTERNAL_ERROR;
-        StoolapCursor* cur = nullptr;
-        if (stoolap_read_row(db, stoolap_table_.c_str(),
-                             static_cast<int32_t>(table->s->fields),
-                             read_cols_.data(),
-                             static_cast<int32_t>(read_cols_.size()), id,
-                             &cur) != STOOLAP_OK) {
-            auto verr = fetch_db_error(db);
-            sql_print_error("stoolap: read by row id failed: %s", verr.message);
-            return report_stoolap_error(verr);
-        }
-        cursor_.reset(cur);
+        StoolapCursor* cursor = read_cursor();
+        if (!cursor) return HA_ERR_OUT_OF_MEM;
+        const uint8_t* rbuf = nullptr;
+        int64_t len = 0;
         cursor_chunk_ = 1;
-        if (int err = next_chunk()) return err;
+        const int read = stoolap_read_row(
+            db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
+            read_cols_.data(), static_cast<int32_t>(read_cols_.size()), id,
+            cursor, &rbuf, &len);
+        if (int err = load_chunk(read, rbuf, len)) return err;
         const int rc = rnd_next(buf);
         return rc == HA_ERR_END_OF_FILE ? HA_ERR_RECORD_DELETED : rc;
     }

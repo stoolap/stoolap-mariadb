@@ -366,7 +366,14 @@ typedef struct StoolapCond {
     StoolapValue value;
 } StoolapCond;
 
+/**
+ * Where a read's rows come out. Keep one and read into it again and
+ * again: a key lookup is then one call, with no allocation once its
+ * buffer has grown. Errors of its reads go to stoolap_cursor_errmsg().
+ */
 typedef struct StoolapCursor StoolapCursor;
+
+StoolapCursor* stoolap_cursor_new(void);
 
 /** stoolap_read() flags: order descending */
 #define STOOLAP_READ_DESC       1
@@ -378,11 +385,12 @@ typedef struct StoolapCursor StoolapCursor;
 #define STOOLAP_READ_FIXED      2
 
 /**
- * Open a read of `table`: the rows meeting every condition, each carrying
- * `columns`, ordered by `order` (NULL first, all descending with
- * STOOLAP_READ_DESC in `flags`), or in no set order when `norder` is 0.
- * `table_columns` is the column count MariaDB knows; a table that differs
- * is refused. Errors go to stoolap_errmsg(db).
+ * Open a read of `table` into `cursor`, ending the one it had: the rows
+ * meeting every condition, each carrying `columns`, ordered by `order`
+ * (NULL first, all descending with STOOLAP_READ_DESC in `flags`), or in
+ * no set order when `norder` is 0. `table_columns` is the column count
+ * MariaDB knows; a table that differs is refused. Packs the first
+ * `first_rows` rows and returns as stoolap_cursor_fetch().
  */
 int32_t stoolap_read(
     StoolapDB* db,
@@ -392,15 +400,19 @@ int32_t stoolap_read(
     const StoolapCond* conds, int32_t nconds,
     const int32_t* order, int32_t norder,
     int32_t flags,
-    StoolapCursor** out_cursor
+    StoolapCursor* cursor,
+    int32_t first_rows,
+    const uint8_t** out_buf,
+    int64_t* out_len
 );
 
 /**
- * Pack the cursor's next rows, at most `max_rows`, in the
+ * Pack the read's next rows, at most `max_rows`, in the
  * stoolap_rows_fetch_all() format with empty column names, each row's id
- * as one more INTEGER cell after its columns. The buffer is
- * the cursor's, valid until the next fetch or close. Returns STOOLAP_ROW
- * with at least one row, STOOLAP_DONE at the end, STOOLAP_ERROR.
+ * as one more INTEGER cell after its columns. The buffer is the
+ * cursor's, valid until its next read, fetch or close. Returns
+ * STOOLAP_ROW with at least one row, STOOLAP_DONE at the end,
+ * STOOLAP_ERROR. A short chunk is the last and ends the read.
  */
 int32_t stoolap_cursor_fetch(
     StoolapCursor* cursor,
@@ -411,6 +423,9 @@ int32_t stoolap_cursor_fetch(
 
 const char* stoolap_cursor_errmsg(const StoolapCursor* cursor);
 
+/** End the cursor's read, if one is open; the cursor stays. */
+void stoolap_cursor_end(StoolapCursor* cursor);
+
 /** As stoolap_read(), for the one row `row_id` (no row if not visible). */
 int32_t stoolap_read_row(
     StoolapDB* db,
@@ -418,13 +433,15 @@ int32_t stoolap_read_row(
     int32_t table_columns,
     const int32_t* columns, int32_t ncolumns,
     int64_t row_id,
-    StoolapCursor** out_cursor
+    StoolapCursor* cursor,
+    const uint8_t** out_buf,
+    int64_t* out_len
 );
 
 /**
  * End the statement's direct access, and the transaction it opened
  * outside an open one: committed when `commit`, else rolled back. Call at
- * the end of every statement, with its cursors closed. A failed commit
+ * the end of every statement, with its cursors' reads ended. A failed commit
  * rolls back and reports to stoolap_errmsg(db).
  */
 int32_t stoolap_end_statement(StoolapDB* db, int32_t commit);
