@@ -120,3 +120,31 @@ INSERT INTO np VALUES (1);
             h._fail("latin1 FK name refused", str(e))
     finally:
         c.close()
+
+    # Every spelling of a parent the clause reader takes, and refuses
+    # rather than drop or misname: an FK it cannot read would leave the
+    # table without the key.
+    h.section("FOREIGN KEY clause spellings")
+    h.exec_script(f"""
+CREATE TABLE sp (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+INSERT INTO sp VALUES (1);
+""")
+    c, cur = h.open_session()
+    try:
+        cur.execute("SET SESSION sql_mode = 'ANSI_QUOTES'")
+        cur.execute("CREATE TABLE sa (pid INT, FOREIGN KEY (pid) REFERENCES "
+                    f"\"sp\" (id)) ENGINE={h.engine}")
+        h._pass("FK to a \"quoted\" parent under ANSI_QUOTES")
+    except mysql.connector.Error as e:
+        h._fail("FK to a \"quoted\" parent under ANSI_QUOTES", str(e))
+    finally:
+        c.close()
+    h.assert_err("the ANSI_QUOTES FK is enforced",
+                 "INSERT INTO sa VALUES (99)", r"foreign key constraint fails")
+    h.assert_ok("a comment naming FOREIGN KEY is not a clause",
+                "CREATE TABLE sm (pid INT /* FOREIGN KEY later */, "
+                f"x INT) ENGINE={h.engine}")
+    h.assert_err("a parent with an encoded file name is refused",
+                 "CREATE TABLE sd (pid INT, FOREIGN KEY (pid) REFERENCES "
+                 f"`sp$1` (id)) ENGINE={h.engine}",
+                 r"FOREIGN KEY parent 'sp\$1'")
