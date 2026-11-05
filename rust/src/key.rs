@@ -121,6 +121,25 @@ fn compare(f: &StoolapField, op: i32, v: KeyValue) -> Pred {
     }
 }
 
+/// Appends `compare(f, op, v)` to `out`; false when it is never true
+fn compare_into(f: &StoolapField, op: i32, v: KeyValue, out: &mut Vec<Node>) -> bool {
+    match v {
+        // The usual case, without the Vec a Pred holds
+        KeyValue::Value(v) => {
+            out.push(cond(f, cond_op(op), v));
+            true
+        }
+        v => match compare(f, op, v) {
+            Pred::False => false,
+            Pred::True => true,
+            Pred::Nodes(mut nodes) => {
+                out.append(&mut nodes);
+                true
+            }
+        },
+    }
+}
+
 /// The AND of `preds` (None: never true), as nodes and their count of
 /// top-level conditions
 fn all(preds: Vec<Pred>) -> Option<(Vec<Node>, usize)> {
@@ -222,19 +241,17 @@ pub unsafe fn bound_nodes(
         return Ok(true);
     }
 
-    let mut preds = Vec::with_capacity(n);
+    // A lookup, the probe of every join: straight into `out`
+    let start = out.len();
     for (i, f) in parts[..n].iter().enumerate() {
         if bound.skip & (1 << i) != 0 {
             continue;
         }
         let op = if i == n - 1 { bound.op } else { STOOLAP_OP_EQ };
-        preds.push(compare(f, op, key_value(f, src)?));
-    }
-    match all(preds) {
-        None => Ok(false),
-        Some((mut nodes, _)) => {
-            out.append(&mut nodes);
-            Ok(true)
+        if !compare_into(f, op, key_value(f, src)?, out) {
+            out.truncate(start);
+            return Ok(false);
         }
     }
+    Ok(true)
 }
