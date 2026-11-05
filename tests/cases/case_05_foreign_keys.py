@@ -179,6 +179,15 @@ INSERT INTO `my-db`.`P\u00e9` VALUES (1);
                  "INSERT INTO `my-db`.c VALUES (99)",
                  r"foreign key constraint fails")
     h.exec_script("DROP TABLE `my-db`.c; DROP DATABASE `my-db`")
+    # A TEMPORARY child's parent is in its database, not the tmpdir its
+    # file sits in
+    h.assert_ok("FK of a TEMPORARY child",
+                "CREATE TEMPORARY TABLE tc (pid INT, FOREIGN KEY (pid) "
+                f"REFERENCES sp (id)) ENGINE={h.engine}")
+    h.assert_ok("TEMPORARY child row", "INSERT INTO tc VALUES (1)")
+    h.assert_err("the TEMPORARY child's FK is enforced",
+                 "INSERT INTO tc VALUES (99)", r"foreign key constraint fails")
+    h.exec_stmt("DROP TEMPORARY TABLE tc")
     # The actions come from the parser too
     h.exec_script(f"""
 CREATE TABLE ap (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};

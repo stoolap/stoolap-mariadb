@@ -44,6 +44,7 @@ extern "C" int stoolap_thd_needs_per_row_dup_handling(THD* thd) {
 }
 
 bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
+                              size_t child_db_length,
                               std::vector<StoolapThdForeignKey>* out) {
     if (!thd || !thd->lex) return true;
     // A name as MariaDB names its file: lowercased first when it keeps
@@ -65,8 +66,9 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
         StoolapThdForeignKey def;
         const Key_part_spec* col = fk->columns.head();
         def.column.assign(col->field_name.str, col->field_name.length);
-        def.parent_path =
-            fk->ref_db.length ? file_name(fk->ref_db) : std::string(child_db);
+        def.parent_path = file_name(
+            fk->ref_db.length ? fk->ref_db
+                              : LEX_CSTRING{child_db, child_db_length});
         def.parent_path += '/';
         def.parent_path += file_name(fk->ref_table);
         if (const Key_part_spec* ref = fk->ref_columns.head())

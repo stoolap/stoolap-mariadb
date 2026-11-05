@@ -616,17 +616,10 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
     std::vector<std::string> parents;
     std::vector<StoolapForeignKeyDef> fk_defs;
     if (with_fks) {
-        // The child's database directory: the path is "./db/table".
-        const std::string_view path(form->s->normalized_path.str,
-                                    form->s->normalized_path.length);
-        const size_t slash = path.rfind('/');
-        const size_t start =
-            slash == std::string_view::npos ? 0 : path.rfind('/', slash - 1);
-        const std::string child_db(
-            slash == std::string_view::npos || start == std::string_view::npos
-                ? std::string_view()
-                : path.substr(start + 1, slash - start - 1));
-        if (!stoolap_thd_foreign_keys(current_thd, child_db.c_str(), &fks)) {
+        // By the child's database name: a TEMPORARY table's path is a file
+        // in the tmpdir, not under its database.
+        if (!stoolap_thd_foreign_keys(current_thd, form->s->db.str,
+                                      form->s->db.length, &fks)) {
             my_printf_error(ER_GET_ERRMSG,
                             "stoolap: composite FOREIGN KEY: stoolap "
                             "enforces single-column foreign keys only.",

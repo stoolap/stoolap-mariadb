@@ -27,9 +27,11 @@ struct StoolapThdForeignKey {
 
 // The FOREIGN KEYs of the statement's CREATE / ALTER TABLE: MariaDB keeps
 // none for an engine that does not claim them. A parent naming no
-// database is in `child_db`, the child's (encoded) database directory.
-// False for a composite one, which stoolap does not enforce.
+// database is in `child_db` (`child_db_length` bytes), the child's
+// database by name. False for a composite one, which stoolap does not
+// enforce.
 bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
+                              size_t child_db_length,
                               std::vector<StoolapThdForeignKey>* out);
 
 // sql_class.h-dependent helpers: live in stoolap_thd_inspect.cc to keep
