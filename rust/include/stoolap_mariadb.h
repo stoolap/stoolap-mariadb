@@ -289,20 +289,25 @@ const char* stoolap_tx_errmsg(const StoolapTx* tx);
 #define STOOLAP_OP_LT           3
 #define STOOLAP_OP_LE           4
 
-/** Every bound part compared exactly: = on all but the last, `op` there. */
+/** A key lookup: = on every bound part but the last, `op` there. */
 #define STOOLAP_BOUND_KEY       0
 /**
  * Only the first part, inclusive whatever `op` says (GE lower, LE upper;
  * an upper bound keeps the NULLs, which sort first).
  */
 #define STOOLAP_BOUND_LEADING   1
+/**
+ * A range bound: a composite one compares in MariaDB's lexicographic key
+ * order, (a, b) >= (1, 5) being a > 1 OR (a = 1 AND b >= 5).
+ */
+#define STOOLAP_BOUND_RANGE     2
 
 /**
  * One bound of a read on a key: the key restored into a record
- * (key_restore), the parts it binds from the first, and how. A composite
- * non-equality bound means MariaDB's lexicographic order over its parts;
- * NULL and a BIGINT UNSIGNED past INT64_MAX bind as MariaDB's index order
- * puts them (first, and past every stored value).
+ * (key_restore), the parts it binds from the first, and how. Values
+ * compare in MariaDB's index order: NULL before every value (so an upper
+ * bound keeps the NULLs), a BIGINT UNSIGNED past INT64_MAX after every
+ * stored one.
  */
 typedef struct StoolapKeyBound {
     const uint8_t* record;

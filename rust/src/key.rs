@@ -22,11 +22,14 @@ pub const STOOLAP_OP_GE: i32 = 2;
 pub const STOOLAP_OP_LT: i32 = 3;
 pub const STOOLAP_OP_LE: i32 = 4;
 
-/// Every bound part compared exactly: `=` on all but the last, `op` there
+/// A key lookup: `=` on every bound part but the last, `op` there
 pub const STOOLAP_BOUND_KEY: i32 = 0;
 /// Only the first part, inclusive whatever `op` says (`GE` lower, `LE`
 /// upper; an upper bound keeps the NULLs, which sort first)
 pub const STOOLAP_BOUND_LEADING: i32 = 1;
+/// A range bound: a composite one compares in MariaDB's lexicographic key
+/// order, (a, b) >= (1, 5) being a > 1 OR (a = 1 AND b >= 5)
+pub const STOOLAP_BOUND_RANGE: i32 = 2;
 
 /// One bound of a read on a key
 #[repr(C)]
@@ -44,6 +47,7 @@ pub struct StoolapKeyBound {
 }
 
 /// A key part's value in a bound
+#[derive(Clone)]
 enum KeyValue {
     Null,
     /// Past every value stoolap holds: a BIGINT UNSIGNED above INT64_MAX,
@@ -83,30 +87,56 @@ fn cond(f: &StoolapField, op: CondOp, value: Value) -> Node {
     })
 }
 
-/// What `op` keeps of the rows when the bound's value is NULL (before
-/// every value, in MariaDB's index order) or beyond them all: no row, the
-/// NULLs, the others, or every row
-enum Keeps {
-    None,
-    Null,
-    NotNull,
-    All,
+/// A comparison in MariaDB's index order: always true, never, or one
+/// condition (its nodes)
+enum Pred {
+    True,
+    False,
+    Nodes(Vec<Node>),
 }
 
-fn keeps(op: i32, null: bool) -> Keeps {
+/// `f op v` in MariaDB's index order, where NULL sorts before every value
+/// and a value past INT64_MAX after every stored one. (Against a value, an
+/// upper bound leaves the NULLs out, as stoolap compares: a range whose
+/// lower bound keeps them loses them.)
+fn compare(f: &StoolapField, op: i32, v: KeyValue) -> Pred {
     let upper = matches!(op, STOOLAP_OP_LT | STOOLAP_OP_LE);
-    let inclusive = matches!(op, STOOLAP_OP_EQ | STOOLAP_OP_GE | STOOLAP_OP_LE);
-    match (null, op == STOOLAP_OP_EQ, upper, inclusive) {
-        // = and <= keep the NULLs, > the rest, >= all, < nothing
-        (true, true, _, _) => Keeps::Null,
-        (true, false, true, true) => Keeps::Null,
-        (true, false, true, false) => Keeps::None,
-        (true, false, false, true) => Keeps::All,
-        (true, false, false, false) => Keeps::NotNull,
-        // Beyond every value: < and <= keep all, the rest nothing
-        (false, _, true, _) => Keeps::All,
-        (false, _, false, _) => Keeps::None,
+    match v {
+        KeyValue::Value(v) => Pred::Nodes(vec![cond(f, cond_op(op), v)]),
+        KeyValue::Null => match op {
+            STOOLAP_OP_EQ | STOOLAP_OP_LE => {
+                Pred::Nodes(vec![cond(f, CondOp::IsNull, Value::null_unknown())])
+            }
+            STOOLAP_OP_GT => Pred::Nodes(vec![cond(f, CondOp::IsNotNull, Value::null_unknown())]),
+            STOOLAP_OP_GE => Pred::True,
+            _ => Pred::False,
+        },
+        KeyValue::Beyond => {
+            if upper {
+                Pred::True
+            } else {
+                Pred::False
+            }
+        }
     }
+}
+
+/// The AND of `preds` (None: never true), as nodes and their count of
+/// top-level conditions
+fn all(preds: Vec<Pred>) -> Option<(Vec<Node>, usize)> {
+    let mut nodes = Vec::new();
+    let mut n = 0;
+    for p in preds {
+        match p {
+            Pred::False => return None,
+            Pred::True => {}
+            Pred::Nodes(mut v) => {
+                nodes.append(&mut v);
+                n += 1;
+            }
+        }
+    }
+    Some((nodes, n))
 }
 
 /// Appends the conditions `bound` means over the key `parts`; false when
@@ -140,65 +170,71 @@ pub unsafe fn bound_nodes(
         return Ok(true);
     }
 
-    // A composite non-equality bound is lexicographic: (a, b) >= (1, 5) is
-    // a > 1 OR (a = 1 AND b >= 5), not a >= 1 AND b >= 5
-    if n > 1 && bound.op != STOOLAP_OP_EQ {
+    if bound.mode == STOOLAP_BOUND_RANGE && n > 1 && bound.op != STOOLAP_OP_EQ {
+        // Lexicographic: a OR of legs, leg k = (the parts before k equal,
+        // part k strictly past, the last part by `op`), and the bound it
+        // implies on the leading part, which an index can read (an OR
+        // alone is not)
         let mut values = Vec::with_capacity(n);
         for f in &parts[..n] {
-            match key_value(f, src)? {
-                KeyValue::Null => return Ok(false),
-                KeyValue::Beyond => {
-                    return Err(stoolap::core::Error::NotSupported(
-                        "a BIGINT UNSIGNED bound past INT64_MAX".into(),
-                    ))
-                }
-                KeyValue::Value(v) => values.push(v),
-            }
+            values.push(key_value(f, src)?);
         }
         let lower = matches!(bound.op, STOOLAP_OP_GT | STOOLAP_OP_GE);
-        let strict = if lower { CondOp::Gt } else { CondOp::Lt };
-        // The bound it implies on the leading part, which an index can
-        // read (an OR alone is not)
-        let lead = if lower { CondOp::Ge } else { CondOp::Le };
-        out.push(cond(&parts[0], lead, values[0].clone()));
+        let strict = if lower { STOOLAP_OP_GT } else { STOOLAP_OP_LT };
+        let mut legs = Vec::new();
         for leg in 0..n {
-            for (i, f) in parts[..=leg].iter().enumerate() {
-                let op = if i < leg {
-                    CondOp::Eq
-                } else if leg < n - 1 {
-                    strict
-                } else {
-                    cond_op(bound.op)
-                };
-                out.push(cond(f, op, values[i].clone()));
-            }
-            if leg > 0 {
-                out.push(Node::And(leg + 1));
+            let preds = (0..=leg)
+                .map(|i| {
+                    let op = if i < leg {
+                        STOOLAP_OP_EQ
+                    } else if leg < n - 1 {
+                        strict
+                    } else {
+                        bound.op
+                    };
+                    compare(&parts[i], op, values[i].clone())
+                })
+                .collect();
+            match all(preds) {
+                None => {}
+                // A leg every row meets: so does the bound
+                Some((_, 0)) => return Ok(true),
+                Some(leg) => legs.push(leg),
             }
         }
-        out.push(Node::Or(n));
+        if legs.is_empty() {
+            return Ok(false);
+        }
+        let lead = if lower { STOOLAP_OP_GE } else { STOOLAP_OP_LE };
+        if let Pred::Nodes(mut nodes) = compare(&parts[0], lead, values[0].clone()) {
+            out.append(&mut nodes);
+        }
+        let nlegs = legs.len();
+        for (mut nodes, count) in legs {
+            out.append(&mut nodes);
+            if count > 1 {
+                out.push(Node::And(count));
+            }
+        }
+        if nlegs > 1 {
+            out.push(Node::Or(nlegs));
+        }
         return Ok(true);
     }
 
+    let mut preds = Vec::with_capacity(n);
     for (i, f) in parts[..n].iter().enumerate() {
         if bound.skip & (1 << i) != 0 {
             continue;
         }
         let op = if i == n - 1 { bound.op } else { STOOLAP_OP_EQ };
-        let null = match key_value(f, src)? {
-            KeyValue::Value(v) => {
-                out.push(cond(f, cond_op(op), v));
-                continue;
-            }
-            KeyValue::Null => true,
-            KeyValue::Beyond => false,
-        };
-        match keeps(op, null) {
-            Keeps::None => return Ok(false),
-            Keeps::Null => out.push(cond(f, CondOp::IsNull, Value::null_unknown())),
-            Keeps::NotNull => out.push(cond(f, CondOp::IsNotNull, Value::null_unknown())),
-            Keeps::All => {}
+        preds.push(compare(f, op, key_value(f, src)?));
+    }
+    match all(preds) {
+        None => Ok(false),
+        Some((mut nodes, _)) => {
+            out.append(&mut nodes);
+            Ok(true)
         }
     }
-    Ok(true)
 }

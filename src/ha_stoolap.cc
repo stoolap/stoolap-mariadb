@@ -2262,7 +2262,7 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         std::memset(rec, 0, table->s->reclength);
         key_restore(rec, range->key, &key_info, klen);
         bounds[nbounds++] = {rec, static_cast<int32_t>(nparts), op, 0,
-                             STOOLAP_BOUND_KEY};
+                             STOOLAP_BOUND_RANGE};
         return 0;
     };
     if (start_key) {
@@ -2292,9 +2292,11 @@ int ha_stoolap::read_range_first(const key_range* start_key,
                 static_cast<int32_t>(key_info.key_part[i].field->field_index));
     }
 
+    // An empty range is the end of it, as handler::read_range_first has
+    // it: HA_ERR_KEY_NOT_FOUND here is an error to the caller.
     if (int err = open_read(bounds, nbounds, ir_order_.data(),
                             static_cast<int32_t>(ir_order_.size()), false))
-        return err;
+        return err == HA_ERR_KEY_NOT_FOUND ? HA_ERR_END_OF_FILE : err;
     return rnd_next(table->record[0]);
 }
 
