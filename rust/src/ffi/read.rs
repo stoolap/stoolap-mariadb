@@ -17,31 +17,14 @@ use std::panic;
 
 use stoolap::core::{Error, Result};
 
-use super::types::{StoolapDB, StoolapRows, StoolapValue};
-use super::{value, STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
-use crate::read::{Cond, CondOp, Cursor, Node, ReadSpec};
-use crate::record::{write_record, Sink, StoolapField, StoreFn};
+use super::types::{StoolapDB, StoolapRows};
+use super::{STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
+use crate::key::{bound_nodes, StoolapKeyBound};
+use crate::read::{Cursor, ReadSpec};
+use crate::record::{write_record, EncodeFn, RecordIn, Sink, StoolapField, StoreFn};
 
 pub const STOOLAP_READ_DESC: i32 = 1;
 pub const STOOLAP_READ_FIXED: i32 = 2;
-pub const STOOLAP_OP_EQ: i32 = 0;
-pub const STOOLAP_OP_GT: i32 = 1;
-pub const STOOLAP_OP_GE: i32 = 2;
-pub const STOOLAP_OP_LT: i32 = 3;
-pub const STOOLAP_OP_LE: i32 = 4;
-pub const STOOLAP_OP_IS_NULL: i32 = 5;
-pub const STOOLAP_OP_IS_NOT_NULL: i32 = 6;
-/// Joins the `column` (a count) conditions before it
-pub const STOOLAP_OP_AND: i32 = 7;
-pub const STOOLAP_OP_OR: i32 = 8;
-
-/// `column op value`, the column by position
-#[repr(C)]
-pub struct StoolapCond {
-    pub column: i32,
-    pub op: i32,
-    pub value: StoolapValue,
-}
 
 pub struct StoolapCursor {
     /// The open read, if any
@@ -102,7 +85,7 @@ unsafe fn read_into(
     fields: *const StoolapField,
     nfields: i32,
     what: &str,
-    open: impl FnOnce(&[usize]) -> Result<Cursor>,
+    open: impl FnOnce(&[usize]) -> Result<Option<Cursor>>,
 ) -> i32 {
     let Some(handle) = cursor.as_mut() else {
         return STOOLAP_ERROR;
@@ -110,14 +93,15 @@ unsafe fn read_into(
     handle.last_error = None;
     handle.cursor = None;
     handle.width = None;
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| -> Result<()> {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| -> Result<bool> {
         handle.fields = field_list(fields, nfields)?;
         let columns: Vec<usize> = handle.fields.iter().map(|f| f.column as usize).collect();
-        handle.cursor = Some(open(&columns)?);
-        Ok(())
+        handle.cursor = open(&columns)?;
+        Ok(handle.cursor.is_some())
     }));
     match result {
-        Ok(Ok(())) => STOOLAP_OK,
+        Ok(Ok(true)) => STOOLAP_OK,
+        Ok(Ok(false)) => STOOLAP_DONE,
         Ok(Err(e)) => {
             handle.set_error(&e.to_string());
             STOOLAP_ERROR
@@ -143,17 +127,20 @@ pub extern "C" fn stoolap_cursor_new() -> *mut StoolapCursor {
 
 /// Opens a read of `table` into `cursor`, in the open transaction or else
 /// in a read transaction of the statement's own, which
-/// `stoolap_end_statement` ends: the rows meeting every condition, each
-/// filling `fields`, ordered by `order` (descending with
-/// `STOOLAP_READ_DESC` in `flags`) or in no set order when `norder` is 0.
-/// `stoolap_cursor_next` gives the rows; errors go to
-/// `stoolap_cursor_errmsg(cursor)`.
+/// `stoolap_end_statement` ends: the rows within every bound on the key
+/// `keys` describes (none: every row), each filling `fields`, ordered by
+/// `order` (descending with `STOOLAP_READ_DESC` in `flags`) or in no set
+/// order when `norder` is 0. `encode(ctx, ...)` gives the bound values the
+/// key's fields do not read themselves. `STOOLAP_DONE` when no row can be
+/// within the bounds (no read opens); `stoolap_cursor_next` gives the rows;
+/// errors go to `stoolap_cursor_errmsg(cursor)`.
 ///
 /// # Safety
 ///
 /// `db` must be a valid `StoolapDB`, `cursor` a valid `StoolapCursor`,
-/// `table` a NUL-terminated UTF-8 string, and the arrays must hold their
-/// stated lengths.
+/// `table` a NUL-terminated UTF-8 string, the arrays must hold their stated
+/// lengths, and each bound's record be a record buffer of the layout
+/// `keys` describe.
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_read(
     db: *mut StoolapDB,
@@ -161,54 +148,42 @@ pub unsafe extern "C" fn stoolap_read(
     table_columns: i32,
     fields: *const StoolapField,
     nfields: i32,
-    conds: *const StoolapCond,
-    nconds: i32,
+    keys: *const StoolapField,
+    nkeys: i32,
+    bounds: *const StoolapKeyBound,
+    nbounds: i32,
     order: *const i32,
     norder: i32,
     flags: i32,
+    encode: Option<EncodeFn>,
+    ctx: *mut c_void,
     cursor: *mut StoolapCursor,
 ) -> i32 {
     read_into(cursor, fields, nfields, "stoolap_read", |columns| {
         let db = db.as_ref().ok_or_else(|| Error::internal("NULL db"))?;
         let name = table_name(table)?;
         let order = positions(order, norder)?;
-        let mut cond_list = Vec::with_capacity(nconds.max(0) as usize);
-        for c in slice(conds, nconds)? {
-            let column =
-                usize::try_from(c.column).map_err(|_| Error::internal("negative column"))?;
-            let op = match c.op {
-                STOOLAP_OP_AND => {
-                    cond_list.push(Node::And(column));
-                    continue;
-                }
-                STOOLAP_OP_OR => {
-                    cond_list.push(Node::Or(column));
-                    continue;
-                }
-                STOOLAP_OP_EQ => CondOp::Eq,
-                STOOLAP_OP_GT => CondOp::Gt,
-                STOOLAP_OP_GE => CondOp::Ge,
-                STOOLAP_OP_LT => CondOp::Lt,
-                STOOLAP_OP_LE => CondOp::Le,
-                STOOLAP_OP_IS_NULL => CondOp::IsNull,
-                STOOLAP_OP_IS_NOT_NULL => CondOp::IsNotNull,
-                _ => return Err(Error::internal("invalid condition operator")),
+        let parts = slice(keys, nkeys)?;
+        let mut conds = Vec::new();
+        for bound in slice(bounds, nbounds)? {
+            let src = RecordIn {
+                record: bound.record,
+                encode,
+                ctx,
             };
-            let value = match op {
-                CondOp::IsNull | CondOp::IsNotNull => stoolap::core::Value::null_unknown(),
-                _ => value::ffi_value_to_rust(&c.value)?,
-            };
-            cond_list.push(Node::Cond(Cond { column, op, value }));
+            if !bound_nodes(parts, bound, &src, &mut conds)? {
+                return Ok(None);
+            }
         }
         let spec = ReadSpec {
             table_columns: usize::try_from(table_columns).unwrap_or(usize::MAX),
             columns,
-            conds: cond_list,
+            conds,
             order: &order,
             desc: flags & STOOLAP_READ_DESC != 0,
             fixed: flags & STOOLAP_READ_FIXED != 0,
         };
-        Cursor::ordered(&db.session, name, spec)
+        Cursor::ordered(&db.session, name, spec).map(Some)
     })
 }
 
@@ -351,6 +326,7 @@ pub unsafe extern "C" fn stoolap_read_row(
         let table_columns = usize::try_from(table_columns).unwrap_or(usize::MAX);
         db.session
             .with_table(name, |t| Cursor::by_id(t, table_columns, columns, row_id))
+            .map(Some)
     })
 }
 

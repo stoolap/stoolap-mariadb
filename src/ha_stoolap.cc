@@ -30,7 +30,6 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <deque>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1810,7 +1809,7 @@ void ha_stoolap::refresh_projection() {
 }
 
 // Opens a direct read of the projected columns.
-int ha_stoolap::open_read(const StoolapCond* conds, int32_t nconds,
+int ha_stoolap::open_read(const StoolapKeyBound* bounds, int32_t nbounds,
                           const int32_t* order, int32_t norder, bool desc) {
     refresh_projection();
     const uint fields = table->s->fields;
@@ -1829,16 +1828,46 @@ int ha_stoolap::open_read(const StoolapCond* conds, int32_t nconds,
     if (!cursor) return HA_ERR_OUT_OF_MEM;
     stoolap_mariadb::g_stats.buffered_scans.fetch_add(
         1, std::memory_order_relaxed);
-    if (stoolap_read(db, stoolap_table_.c_str(), static_cast<int32_t>(fields),
-                     read_fields_.data(),
-                     static_cast<int32_t>(read_fields_.size()), conds, nconds,
-                     order, norder, flags, cursor) != STOOLAP_OK) {
+    const std::vector<StoolapField>* keys = nbounds ? &index_parts() : nullptr;
+    RecordSource src(table);
+    const int rc = stoolap_read(
+        db, stoolap_table_.c_str(), static_cast<int32_t>(fields),
+        read_fields_.data(), static_cast<int32_t>(read_fields_.size()),
+        keys ? keys->data() : nullptr,
+        keys ? static_cast<int32_t>(keys->size()) : 0, bounds, nbounds, order,
+        norder, flags, &encode_cell, &src, cursor);
+    // No row can be within the bounds.
+    if (rc == STOOLAP_DONE) return HA_ERR_KEY_NOT_FOUND;
+    if (rc != STOOLAP_OK) {
+        if (src.err) return src.err;
         StoolapErrorView verr{stoolap_cursor_errmsg(cursor)};
         sql_print_error("stoolap: read failed: %s", verr.message);
         return report_stoolap_error(verr);
     }
     reading_ = true;
     return 0;
+}
+
+// The active index's parts, as a read's bounds describe them.
+const std::vector<StoolapField>& ha_stoolap::index_parts() {
+    if (key_parts_index_ != active_index) {
+        key_parts_.clear();
+        const KEY& ki = table->key_info[active_index];
+        for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
+            const uint f = ki.key_part[i].fieldnr - 1;
+            key_parts_.push_back(stoolap_mariadb::record_field(
+                table, f, static_cast<int32_t>(f)));
+        }
+        key_parts_index_ = active_index;
+    }
+    return key_parts_;
+}
+
+// A record an end bound's key is restored into, the start's being in
+// record[1].
+uchar* ha_stoolap::bound_record() {
+    bound_rec_.resize(table->s->reclength);
+    return bound_rec_.data();
 }
 
 // The handler's cursor, made on its first read.
@@ -1990,42 +2019,6 @@ int ha_stoolap::index_end() {
     return 0;
 }
 
-namespace {
-
-// A key value stoolap holds no row for: NULL, or a BIGINT UNSIGNED above
-// INT64_MAX (the writer refuses those). What a bound on it selects, in
-// MariaDB's index order, where NULLs come first.
-enum class Beyond { NONE, IS_NULL, NOT_NULL, ALL };
-
-bool unsigned_beyond_i64(Field* f) {
-    return f->real_type() == MYSQL_TYPE_LONGLONG && f->is_unsigned() &&
-           !f->is_null() && f->val_int() < 0;
-}
-
-Beyond bound_beyond(const char* op, bool is_null) {
-    const bool eq = op[0] == '=' && op[1] == '\0';
-    const bool upper = op[0] == '<';
-    const bool inclusive = op[1] == '=' || eq;
-    if (is_null) {
-        // Before every value: = and <= keep the NULLs, > keeps the rest,
-        // >= keeps all, < nothing.
-        if (eq) return Beyond::IS_NULL;
-        if (upper) return inclusive ? Beyond::IS_NULL : Beyond::NONE;
-        return inclusive ? Beyond::ALL : Beyond::NOT_NULL;
-    }
-    // After every stored value: < and <= keep all, the rest nothing.
-    return upper ? Beyond::ALL : Beyond::NONE;
-}
-
-// A comparison's STOOLAP_OP_*.
-int32_t cond_op(const char* op) {
-    if (op[0] == '=') return STOOLAP_OP_EQ;
-    if (op[0] == '>') return op[1] == '=' ? STOOLAP_OP_GE : STOOLAP_OP_GT;
-    return op[1] == '=' ? STOOLAP_OP_LE : STOOLAP_OP_LT;
-}
-
-}  // namespace
-
 int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
                                key_part_map keypart_map,
                                enum ha_rkey_function find_flag) {
@@ -2033,30 +2026,28 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     if (active_index >= table->s->keys) return HA_ERR_INTERNAL_ERROR;
     reset_scan_state();
 
-    // Pick the comparison operator for the LAST bound key part and the
-    // resulting iteration direction. Earlier key parts are always equality.
-    const char* last_op = "=";
+    // The comparison on the LAST bound key part and the direction; earlier
+    // key parts are always equality.
+    int32_t op = STOOLAP_OP_EQ;
     bool desc = false;
     switch (find_flag) {
         case HA_READ_KEY_EXACT:
-            last_op = "=";
+        case HA_READ_PREFIX:
+            op = STOOLAP_OP_EQ;
             break;
         case HA_READ_KEY_OR_NEXT:
-            last_op = ">=";
+            op = STOOLAP_OP_GE;
             break;
         case HA_READ_AFTER_KEY:
-            last_op = ">";
+            op = STOOLAP_OP_GT;
             break;
         case HA_READ_KEY_OR_PREV:
-            last_op = "<=";
+            op = STOOLAP_OP_LE;
             desc = true;
             break;
         case HA_READ_BEFORE_KEY:
-            last_op = "<";
+            op = STOOLAP_OP_LT;
             desc = true;
-            break;
-        case HA_READ_PREFIX:
-            last_op = "=";
             break;
         default:
             return HA_ERR_UNSUPPORTED;
@@ -2076,13 +2067,6 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
     std::memset(table->record[1], 0, table->s->reclength);
     key_restore(table->record[1], key, &key_info, klen);
 
-    const my_ptrdiff_t d =
-        static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
-    move_fields(table, d);
-
-    ir_conds_.clear();
-    ir_text_.resize(nparts);
-
     // Exact-lookup parts stoolap cannot test as MariaDB does stay out of
     // the engine conditions; index_next filters them (see
     // key_part_needs_filter).
@@ -2094,39 +2078,6 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
                 filter_mask |= uint32_t(1) << i;
         }
     }
-
-    // One condition per bound part: '=' on all but the last.
-    for (uint i = 0; i < nparts; ++i) {
-        if (filter_mask & (uint32_t(1) << i)) continue;
-        Field* f = key_info.key_part[i].field;
-        const char* op = (i == nparts - 1) ? last_op : "=";
-        StoolapCond c{};
-        c.column = static_cast<int32_t>(f->field_index);
-        c.op = cond_op(op);
-        if (f->is_null() || unsigned_beyond_i64(f)) {
-            switch (bound_beyond(op, f->is_null())) {
-                case Beyond::NONE:
-                    move_fields(table, -d);
-                    return HA_ERR_KEY_NOT_FOUND;
-                case Beyond::IS_NULL:
-                    c.op = STOOLAP_OP_IS_NULL;
-                    break;
-                case Beyond::NOT_NULL:
-                    c.op = STOOLAP_OP_IS_NOT_NULL;
-                    break;
-                case Beyond::ALL:
-                    continue;  // no predicate on the part
-            }
-            ir_conds_.push_back(c);
-            continue;
-        }
-        if (!extract_field(f, c.value, ir_text_[i])) {
-            move_fields(table, -d);
-            return HA_ERR_UNSUPPORTED;
-        }
-        ir_conds_.push_back(c);
-    }
-    move_fields(table, -d);
 
     // Order when the caller wants sorted rows or reads backward, except
     // for an exact lookup bound by a unique key (one row at most).
@@ -2141,7 +2092,7 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         // bytes would break the order of the parts after it. So is a part
         // bound by '=' (or IS NULL): every row has the same value there,
         // and sorting by it only costs a sort.
-        const bool last_eq = std::strcmp(last_op, "=") == 0;
+        const bool last_eq = op == STOOLAP_OP_EQ;
         for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
             if (filter_mask & (uint32_t(1) << i)) continue;
             if (i + 1 < nparts || (i + 1 == nparts && last_eq)) continue;
@@ -2150,9 +2101,10 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         }
     }
 
-    if (int err = open_read(
-            ir_conds_.data(), static_cast<int32_t>(ir_conds_.size()),
-            ir_order_.data(), static_cast<int32_t>(ir_order_.size()), desc))
+    const StoolapKeyBound bound{table->record[1], static_cast<int32_t>(nparts),
+                                op, filter_mask, STOOLAP_BOUND_KEY};
+    if (int err = open_read(&bound, 1, ir_order_.data(),
+                            static_cast<int32_t>(ir_order_.size()), desc))
         return err;
 
     if (filter_mask) {
@@ -2259,34 +2211,33 @@ int ha_stoolap::read_range_first(const key_range* start_key,
     }
 
     // The comparison for the last bound part; earlier parts are equality.
-    auto op_for_start = [](ha_rkey_function f) -> const char* {
+    auto op_for_start = [](ha_rkey_function f) -> int32_t {
         switch (f) {
             case HA_READ_KEY_EXACT:
-                return "=";
-            case HA_READ_KEY_OR_NEXT:
-                return ">=";
-            case HA_READ_AFTER_KEY:
-                return ">";
-            case HA_READ_KEY_OR_PREV:
-                return "<=";
-            case HA_READ_BEFORE_KEY:
-                return "<";
             case HA_READ_PREFIX:
-                return "=";
+                return STOOLAP_OP_EQ;
+            case HA_READ_KEY_OR_NEXT:
+                return STOOLAP_OP_GE;
+            case HA_READ_AFTER_KEY:
+                return STOOLAP_OP_GT;
+            case HA_READ_KEY_OR_PREV:
+                return STOOLAP_OP_LE;
+            case HA_READ_BEFORE_KEY:
+                return STOOLAP_OP_LT;
             default:
-                return nullptr;  // unsupported
+                return -1;  // unsupported
         }
     };
-    auto op_for_end = [](ha_rkey_function f) -> const char* {
+    auto op_for_end = [](ha_rkey_function f) -> int32_t {
         // Upper bound convention: HA_READ_AFTER_KEY = "<= K" (inclusive),
         // HA_READ_BEFORE_KEY = "< K" (exclusive).
         switch (f) {
             case HA_READ_AFTER_KEY:
-                return "<=";
+                return STOOLAP_OP_LE;
             case HA_READ_BEFORE_KEY:
-                return "<";
+                return STOOLAP_OP_LT;
             default:
-                return nullptr;
+                return -1;
         }
     };
 
@@ -2300,110 +2251,31 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         }
     };
 
-    ir_conds_.clear();
-    ir_order_.clear();
-    // deque: the conditions' text values point into these.
-    std::deque<std::string> text_holders;
-    auto push_cond = [&](Field* f, int32_t op, const StoolapValue& v) {
-        StoolapCond c{};
-        c.column = static_cast<int32_t>(f->field_index);
-        c.op = op;
-        c.value = v;
-        ir_conds_.push_back(c);
-    };
-    auto push_join = [&](int32_t op, int32_t n) {
-        StoolapCond c{};
-        c.column = n;
-        c.op = op;
-        ir_conds_.push_back(c);
-    };
-
-    auto append_bound = [&](const key_range* range,
-                            const char* (*op_fn)(ha_rkey_function)) -> int {
-        if (!range) return 0;
-        const char* last_op = op_fn(range->flag);
-        if (!last_op) return HA_ERR_UNSUPPORTED;
-        const bool is_eq_op = (last_op[0] == '=' && last_op[1] == '\0');
-        // Strict variant for the chain's prefix legs: ">=" / ">" -> ">".
-        const char* strict = (last_op[0] == '>') ? ">" : "<";
-
+    // Each bound's key restored into a record of its own.
+    StoolapKeyBound bounds[2];
+    int32_t nbounds = 0;
+    auto add_bound = [&](const key_range* range, int32_t op, uchar* rec) {
+        if (op < 0) return HA_ERR_UNSUPPORTED;
         uint nparts = 0, klen = 0;
         count_parts(key_info, range->keypart_map, nparts, klen);
         if (nparts == 0) return 0;
-
-        // Stage the key bytes into record[1] so Field accessors can read.
-        std::memset(table->record[1], 0, table->s->reclength);
-        key_restore(table->record[1], range->key, &key_info, klen);
-        const my_ptrdiff_t d =
-            static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
-        move_fields(table, d);
-
-        // A composite non-equality bound is lexicographic: (a,b) >= (1,5)
-        // is (a > 1) OR (a = 1 AND b >= 5), not a >= 1 AND b >= 5.
-        if (nparts > 1 && !is_eq_op) {
-            std::vector<StoolapValue> vals(nparts);
-            for (uint i = 0; i < nparts; ++i) {
-                Field* f = key_info.key_part[i].field;
-                if (f->is_null()) {
-                    move_fields(table, -d);
-                    return HA_ERR_KEY_NOT_FOUND;  // NULL in lex bound: no rows.
-                }
-                text_holders.emplace_back();
-                if (!extract_field(f, vals[i], text_holders.back())) {
-                    move_fields(table, -d);
-                    return HA_ERR_UNSUPPORTED;
-                }
-            }
-            // The bound it implies on the leading part, which an index
-            // can read (an OR alone is not).
-            push_cond(key_info.key_part[0].field,
-                      strict[0] == '>' ? STOOLAP_OP_GE : STOOLAP_OP_LE,
-                      vals[0]);
-            for (uint leg = 0; leg < nparts; ++leg) {
-                for (uint i = 0; i <= leg; ++i) {
-                    const char* op = i < leg            ? "="
-                                     : leg < nparts - 1 ? strict
-                                                        : last_op;
-                    push_cond(key_info.key_part[i].field, cond_op(op), vals[i]);
-                }
-                if (leg)
-                    push_join(STOOLAP_OP_AND, static_cast<int32_t>(leg + 1));
-            }
-            push_join(STOOLAP_OP_OR, static_cast<int32_t>(nparts));
-            move_fields(table, -d);
-            return 0;
-        }
-
-        for (uint i = 0; i < nparts; ++i) {
-            Field* f = key_info.key_part[i].field;
-            const char* op = (i == nparts - 1) ? last_op : "=";
-            if (f->is_null() || unsigned_beyond_i64(f)) {
-                const Beyond beyond = bound_beyond(op, f->is_null());
-                if (beyond == Beyond::NONE) {
-                    move_fields(table, -d);
-                    return HA_ERR_KEY_NOT_FOUND;
-                }
-                if (beyond == Beyond::ALL) continue;
-                push_cond(f,
-                          beyond == Beyond::IS_NULL ? STOOLAP_OP_IS_NULL
-                                                    : STOOLAP_OP_IS_NOT_NULL,
-                          StoolapValue{});
-                continue;
-            }
-            StoolapValue v{};
-            text_holders.emplace_back();
-            if (!extract_field(f, v, text_holders.back())) {
-                move_fields(table, -d);
-                return HA_ERR_UNSUPPORTED;
-            }
-            push_cond(f, cond_op(op), v);
-        }
-        move_fields(table, -d);
+        std::memset(rec, 0, table->s->reclength);
+        key_restore(rec, range->key, &key_info, klen);
+        bounds[nbounds++] = {rec, static_cast<int32_t>(nparts), op, 0,
+                             STOOLAP_BOUND_RANGE};
         return 0;
     };
-
-    if (int rc = append_bound(start_key, op_for_start)) return rc;
-    if (int rc = append_bound(end_key, op_for_end)) return rc;
+    if (start_key) {
+        if (int rc = add_bound(start_key, op_for_start(start_key->flag),
+                               table->record[1]))
+            return rc;
+    }
+    if (end_key) {
+        if (int rc =
+                add_bound(end_key, op_for_end(end_key->flag), bound_record()))
+            return rc;
+    }
+    ir_order_.clear();
 
     // Skip the order when an exact unique-index lookup (one row) or when
     // MariaDB's `sorted` flag says the range plan doesn't need it.
@@ -2420,10 +2292,11 @@ int ha_stoolap::read_range_first(const key_range* start_key,
                 static_cast<int32_t>(key_info.key_part[i].field->field_index));
     }
 
-    if (int err = open_read(
-            ir_conds_.data(), static_cast<int32_t>(ir_conds_.size()),
-            ir_order_.data(), static_cast<int32_t>(ir_order_.size()), false))
-        return err;
+    // An empty range is the end of it, as handler::read_range_first has
+    // it: HA_ERR_KEY_NOT_FOUND here is an error to the caller.
+    if (int err = open_read(bounds, nbounds, ir_order_.data(),
+                            static_cast<int32_t>(ir_order_.size()), false))
+        return err == HA_ERR_KEY_NOT_FOUND ? HA_ERR_END_OF_FILE : err;
     return rnd_next(table->record[0]);
 }
 
@@ -2498,41 +2371,21 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
         }
     }
 
-    ir_conds_.clear();
     ir_order_.clear();
-    std::deque<std::string> holders;
+    StoolapKeyBound bounds[2];
+    int32_t nbounds = 0;
     if (part_safe(0)) {
         // Every row of the range has its first part between the bounds'
         // first parts (inclusive, whatever the flags); NULLs sort first,
         // so an upper bound keeps them.
-        Field* f = ki.key_part[0].field;
         for (const key_range* r : {start_key, end_key}) {
             if (!r || !(r->keypart_map & 1)) continue;
-            std::memset(table->record[1], 0, table->s->reclength);
-            key_restore(table->record[1], r->key, &ki,
-                        ki.key_part[0].store_length);
-            const my_ptrdiff_t d =
-                static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
-            move_fields(table, d);
-            StoolapCond c{};
-            c.column = static_cast<int32_t>(f->field_index);
-            c.op = r == start_key ? STOOLAP_OP_GE : STOOLAP_OP_LE;
-            holders.emplace_back();
-            const bool bind = !f->is_null() && !unsigned_beyond_i64(f) &&
-                              extract_field(f, c.value, holders.back());
-            move_fields(table, -d);
-            if (!bind) continue;
-            ir_conds_.push_back(c);
-            if (r == end_key && f->real_maybe_null()) {
-                StoolapCond n{};
-                n.column = c.column;
-                n.op = STOOLAP_OP_IS_NULL;
-                ir_conds_.push_back(n);
-                StoolapCond either{};
-                either.column = 2;
-                either.op = STOOLAP_OP_OR;
-                ir_conds_.push_back(either);
-            }
+            uchar* rec = r == start_key ? table->record[1] : bound_record();
+            std::memset(rec, 0, table->s->reclength);
+            key_restore(rec, r->key, &ki, ki.key_part[0].store_length);
+            bounds[nbounds++] = {rec, 1,
+                                 r == start_key ? STOOLAP_OP_GE : STOOLAP_OP_LE,
+                                 0, STOOLAP_BOUND_LEADING};
         }
     }
     if (sorted) {
@@ -2556,9 +2409,8 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
         }
     }
 
-    if (int err = open_read(
-            ir_conds_.data(), static_cast<int32_t>(ir_conds_.size()),
-            ir_order_.data(), static_cast<int32_t>(ir_order_.size()), false))
+    if (int err = open_read(bounds, nbounds, ir_order_.data(),
+                            static_cast<int32_t>(ir_order_.size()), false))
         return err;
 
     range_has_start_ = start_key != nullptr;

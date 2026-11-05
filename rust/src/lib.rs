@@ -12,6 +12,7 @@
 //! include/stoolap_mariadb.h.
 
 pub mod ffi;
+pub mod key;
 pub mod read;
 pub mod record;
 pub mod session;

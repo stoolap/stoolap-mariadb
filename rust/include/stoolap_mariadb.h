@@ -282,26 +282,41 @@ const char* stoolap_tx_errmsg(const StoolapTx* tx);
  * order (the plugin creates every table that way).
  * ========================================================================= */
 
+/** A key bound's comparison on its last part (earlier parts are =). */
 #define STOOLAP_OP_EQ           0
 #define STOOLAP_OP_GT           1
 #define STOOLAP_OP_GE           2
 #define STOOLAP_OP_LT           3
 #define STOOLAP_OP_LE           4
-#define STOOLAP_OP_IS_NULL      5  /**< value unused */
-#define STOOLAP_OP_IS_NOT_NULL  6  /**< value unused */
-/** Joins the `column` (a count) conditions before it; postfix order. */
-#define STOOLAP_OP_AND          7
-#define STOOLAP_OP_OR           8
+
+/** A key lookup: = on every bound part but the last, `op` there. */
+#define STOOLAP_BOUND_KEY       0
+/**
+ * Only the first part, inclusive whatever `op` says (GE lower, LE upper;
+ * an upper bound keeps the NULLs, which sort first).
+ */
+#define STOOLAP_BOUND_LEADING   1
+/**
+ * A range bound: a composite one compares in MariaDB's lexicographic key
+ * order, (a, b) >= (1, 5) being a > 1 OR (a = 1 AND b >= 5).
+ */
+#define STOOLAP_BOUND_RANGE     2
 
 /**
- * `column op value`, or an AND / OR of the conditions before it. The list
- * is in postfix order; the conditions left at its end are ANDed.
+ * One bound of a read on a key: the key restored into a record
+ * (key_restore), the parts it binds from the first, and how. Values
+ * compare in MariaDB's index order: NULL before every value (so an upper
+ * bound keeps the NULLs), a BIGINT UNSIGNED past INT64_MAX after every
+ * stored one.
  */
-typedef struct StoolapCond {
-    int32_t column;
+typedef struct StoolapKeyBound {
+    const uint8_t* record;
+    int32_t nparts;
     int32_t op;
-    StoolapValue value;
-} StoolapCond;
+    /** Parts left out for the caller's own comparison (bit i) */
+    uint32_t skip;
+    int32_t mode;
+} StoolapKeyBound;
 
 /**
  * Where a read's rows come out. Keep one and read into it again and
@@ -372,19 +387,24 @@ typedef int32_t (*StoolapStoreFn)(void* ctx, int32_t field,
 
 /**
  * Open a read of `table` into `cursor`, ending the one it had: the rows
- * meeting every condition, each filling `fields`, ordered by `order`
- * (NULL first, all descending with STOOLAP_READ_DESC in `flags`), or in
- * no set order when `norder` is 0. `table_columns` is the column count
- * MariaDB knows; a table that differs is refused.
+ * within every bound on the key `keys` describes (no bound: every row),
+ * each filling `fields`, ordered by `order` (NULL first, all descending
+ * with STOOLAP_READ_DESC in `flags`), or in no set order when `norder` is
+ * 0. `encode(ctx, ...)` gives the bound values the key's fields do not
+ * read themselves. STOOLAP_DONE when no row can be within the bounds (no
+ * read opens). `table_columns` is the column count MariaDB knows; a table
+ * that differs is refused.
  */
 int32_t stoolap_read(
     StoolapDB* db,
     const char* table,
     int32_t table_columns,
     const StoolapField* fields, int32_t nfields,
-    const StoolapCond* conds, int32_t nconds,
+    const StoolapField* keys, int32_t nkeys,
+    const StoolapKeyBound* bounds, int32_t nbounds,
     const int32_t* order, int32_t norder,
     int32_t flags,
+    StoolapEncodeFn encode, void* ctx,
     StoolapCursor* cursor
 );
 

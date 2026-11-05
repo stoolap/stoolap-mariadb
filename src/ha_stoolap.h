@@ -153,7 +153,7 @@ private:
     }
     // At the end of a scan.
     void release_read() { reset_scan_state(); }
-    int open_read(const StoolapCond* conds, int32_t nconds,
+    int open_read(const StoolapKeyBound* bounds, int32_t nbounds,
                   const int32_t* order, int32_t norder, bool desc);
     int index_end_read(uchar* buf, bool desc);
     // stoolap's row id of the row the last read returned, which
@@ -214,12 +214,17 @@ private:
     std::vector<uint32_t> read_cols_words_;
     std::vector<StoolapField> read_fields_;
 
-    // index_read_map's key conditions and ORDER BY columns, kept to reuse
-    // their storage across the probes of a join; ir_text_ holds the text
-    // the condition values point into.
-    std::vector<StoolapCond> ir_conds_;
+    // A key read's ORDER BY columns, kept to reuse their storage across
+    // the probes of a join.
     std::vector<int32_t> ir_order_;
-    std::vector<std::string> ir_text_;
+    // The active index's parts as a read's bounds describe them (rebuilt
+    // when the index changes), and the record an end bound is restored
+    // into (the start bound takes record[1]).
+    std::vector<StoolapField> key_parts_;
+    uint key_parts_index_ = MAX_KEY;
+    const std::vector<StoolapField>& index_parts();
+    std::vector<uchar> bound_rec_;
+    uchar* bound_record();
 
     // A bulk insert's rows wait in Rust (row_buffer_, bulk_rows_ of them)
     // until a flush writes them.
