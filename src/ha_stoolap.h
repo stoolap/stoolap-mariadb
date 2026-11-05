@@ -165,8 +165,6 @@ private:
     int64_t cur_row_id_ = 0;
     bool cur_row_id_valid_ = false;
     // Direct writes; -1 for a table a foreign key names (write via SQL).
-    int insert_direct(const StoolapValue* values, int32_t nrows,
-                      int64_t* affected);
     int update_row_direct(const uchar* old_data, const uchar* new_data);
     int write_error(StoolapDB* db, const char* what);
     StoolapDB* direct_write_db();
@@ -243,6 +241,19 @@ private:
     // deque, not vector: bulk_params_[i].text.ptr points into the i-th
     // holder; vector realloc would dangle short-string pointers.
     std::deque<std::string> bulk_text_holders_;
+    // A table no foreign key names: the bulk rows wait in Rust
+    // (row_buffer_, bulk_rows_ of them) and go in with one direct insert.
+    bool bulk_direct_ = false;
+    stoolap_mariadb::RowBufferPtr row_buffer_;
+    int64_t bulk_rows_ = 0;
+
+    // Direct writes read the record by these: every field (inserts), and
+    // the fields write_set names (updates), rebuilt when it changes.
+    std::vector<StoolapField> write_fields_;
+    std::vector<StoolapField> update_fields_;
+    std::vector<uint32_t> update_words_;
+    const std::vector<StoolapField>& insert_fields();
+    const std::vector<StoolapField>& refresh_update_fields();
 
     // Approximate row-count cache (HA_STATS_RECORDS_IS_EXACT isn't set).
     // Invalidated by local writes; cross-connection writes leave it

@@ -403,9 +403,19 @@ typedef struct StoolapField {
     uint32_t length;
     uint32_t max_chars;
     uint32_t is_unsigned;
-    /** The field's index, passed to the store callback */
+    /** The field's index, passed to the store and encode callbacks */
     int32_t field;
+    /** The bytes it takes in the record */
+    uint32_t pack_length;
 } StoolapField;
+
+/**
+ * Encodes field `field` of the record a write reads into `out`, for the
+ * kinds StoolapField does not read itself; returns 0, else the write
+ * fails. Text `out` points to must stay valid until the next call.
+ */
+typedef int32_t (*StoolapEncodeFn)(void* ctx, int32_t field,
+                                   StoolapValue* out);
 
 /**
  * Stores one value, `cell` (one cell of the packed format below), in
@@ -501,27 +511,73 @@ int32_t stoolap_end_statement(StoolapDB* db, int32_t commit);
 #define STOOLAP_FALLBACK 2
 
 /**
- * Insert `nrows` rows of `table_columns` values each (field order). The
- * table checks types, NOT NULL, the primary key and UNIQUE per row.
+ * 1 when a foreign key names `table` (as child or parent), so its direct
+ * writes return STOOLAP_FALLBACK; 0 when they go direct; STOOLAP_ERROR.
  */
-int32_t stoolap_insert(
+int32_t stoolap_writes_through_sql(StoolapDB* db, const char* table);
+
+/**
+ * Insert the row in `record`: `fields` describe every column, in order;
+ * `encode(ctx, ...)` gives the values they do not read themselves.
+ */
+int32_t stoolap_insert_record(
     StoolapDB* db,
     const char* table,
     int32_t table_columns,
-    const StoolapValue* values,
-    int32_t nrows,
+    const StoolapField* fields, int32_t nfields,
+    const uint8_t* record,
+    StoolapEncodeFn encode, void* ctx,
     int64_t* rows_affected
 );
 
-/** Set `ncolumns` columns of row `row_id`; 0 affected when it is gone. */
-int32_t stoolap_update_row(
+/** Rows a bulk insert holds until stoolap_insert_buffer() writes them. */
+typedef struct StoolapRowBuffer StoolapRowBuffer;
+
+StoolapRowBuffer* stoolap_row_buffer_new(void);
+void stoolap_row_buffer_free(StoolapRowBuffer* buffer);
+
+/**
+ * Add the row in `record`, read as stoolap_insert_record() reads it.
+ * Returns the buffer's row count, or -1 (stoolap_row_buffer_errmsg()).
+ */
+int64_t stoolap_row_buffer_add(
+    StoolapRowBuffer* buffer,
+    const StoolapField* fields, int32_t nfields,
+    const uint8_t* record,
+    StoolapEncodeFn encode, void* ctx
+);
+
+/** Drop the rows the buffer holds, and their memory. */
+void stoolap_row_buffer_clear(StoolapRowBuffer* buffer);
+
+const char* stoolap_row_buffer_errmsg(const StoolapRowBuffer* buffer);
+
+/**
+ * Insert the rows `buffer` holds, which it gives up: it is empty after,
+ * whatever the outcome.
+ */
+int32_t stoolap_insert_buffer(
+    StoolapDB* db,
+    const char* table,
+    int32_t table_columns,
+    StoolapRowBuffer* buffer,
+    int64_t* rows_affected
+);
+
+/**
+ * Set row `row_id` from `new_record` where `fields` (the columns the
+ * statement writes) differ from `old_record`. 1 affected when nothing
+ * differs, 0 when the row is gone.
+ */
+int32_t stoolap_update_record(
     StoolapDB* db,
     const char* table,
     int32_t table_columns,
     int64_t row_id,
-    const int32_t* columns,
-    const StoolapValue* values,
-    int32_t ncolumns,
+    const StoolapField* fields, int32_t nfields,
+    const uint8_t* old_record,
+    const uint8_t* new_record,
+    StoolapEncodeFn encode, void* ctx,
     int64_t* rows_affected
 );
 

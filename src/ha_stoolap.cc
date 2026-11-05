@@ -1367,6 +1367,22 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
     }
 }
 
+// The encode callback of a direct write, for a value the record path does
+// not read itself: extract_field, with the fields pointing into the record
+// the write reads. `holder` keeps the text until the next call.
+struct RecordSource {
+    TABLE* table;
+    int err = 0;
+    std::string holder;
+};
+
+int32_t encode_cell(void* ctx, int32_t field, StoolapValue* out) {
+    auto* src = static_cast<RecordSource*>(ctx);
+    if (!extract_field(src->table->field[field], *out, src->holder))
+        src->err = HA_ERR_UNSUPPORTED;
+    return src->err;
+}
+
 /**
  * Build a WHERE clause that uniquely identifies a row in `table->record[0]`
  * (after move_fields has been applied): `WHERE pk1 = $N [AND pk2 = $M ...]`
@@ -1440,6 +1456,7 @@ static constexpr size_t kBulkFlushRows = 50000;
 
 void ha_stoolap::start_bulk_insert(ha_rows rows, uint /*flags*/) {
     bulk_active_ = false;
+    bulk_direct_ = false;
     bulk_owns_tx_ = false;
     bulk_params_.clear();
     bulk_text_holders_.clear();
@@ -1457,6 +1474,16 @@ void ha_stoolap::start_bulk_insert(ha_rows rows, uint /*flags*/) {
 
     bulk_active_ = true;
 
+    // A table no foreign key names: the rows wait in Rust.
+    StoolapDB* db = get_thd_ctx(ha_thd())->db();
+    bulk_rows_ = 0;
+    if (db && stoolap_writes_through_sql(db, stoolap_table_.c_str()) == 0) {
+        if (!row_buffer_) row_buffer_.reset(stoolap_row_buffer_new());
+        stoolap_row_buffer_clear(row_buffer_.get());
+        bulk_direct_ = row_buffer_ != nullptr;
+        if (bulk_direct_) return;
+    }
+
     // Cap the up-front reserve at the flush threshold so multi-million-row
     // INSERT...VALUES doesn't allocate the whole batch before flushing.
     // INSERT...SELECT often passes 0 (unknown source size); use the cap.
@@ -1471,6 +1498,7 @@ int ha_stoolap::end_bulk_insert() {
     if (!bulk_active_) return 0;
     bulk_active_ = false;
     const int err = flush_bulk_buffer();
+    bulk_direct_ = false;
     // mysql_insert reports a failed end_bulk_insert by my_errno (with the
     // duplicate key from get_dup_key), not by this return value.
     if (err) my_errno = err;
@@ -1478,6 +1506,23 @@ int ha_stoolap::end_bulk_insert() {
 }
 
 int ha_stoolap::flush_bulk_buffer(bool partial) {
+    if (bulk_direct_) {
+        if (bulk_rows_ == 0) return 0;
+        bulk_rows_ = 0;
+        StoolapDB* db = direct_write_db();
+        if (!db) return HA_ERR_INTERNAL_ERROR;
+        int64_t affected = 0;
+        const int rc = stoolap_insert_buffer(
+            db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
+            row_buffer_.get(), &affected);
+        cur_row_id_valid_ = false;
+        if (rc != STOOLAP_OK) {
+            invalidate_records_cache();
+            return write_error(db, "INSERT");
+        }
+        apply_count_delta(affected);
+        return 0;
+    }
     if (bulk_params_.empty()) return 0;
     if (insert_sql_.empty()) {
         bulk_params_.clear();
@@ -1485,19 +1530,6 @@ int ha_stoolap::flush_bulk_buffer(bool partial) {
         return 0;
     }
 
-    {
-        const int32_t cols = static_cast<int32_t>(table->s->fields);
-        int64_t affected = 0;
-        const int rc = insert_direct(
-            bulk_params_.data(),
-            static_cast<int32_t>(bulk_params_.size() / cols), &affected);
-        if (rc != -1) {
-            bulk_params_.clear();
-            bulk_text_holders_.clear();
-            if (rc) invalidate_records_cache();
-            return rc;
-        }
-    }
     // A table a foreign key names: through SQL. In autocommit mode, wrap
     // the chunked flushes in one outer tx so the whole bulk statement is
     // atomic (stmt_exec_batch otherwise commits per-chunk).
@@ -1644,6 +1676,26 @@ int ha_stoolap::write_row(const uchar* buf) {
     int err = 0;
 
     // Buffer for end_bulk_insert / kBulkFlushRows-triggered flush.
+    if (bulk_active_ && bulk_direct_) {
+        const auto& fields = insert_fields();
+        RecordSource src{table};
+        const int64_t n = stoolap_row_buffer_add(
+            row_buffer_.get(), fields.data(),
+            static_cast<int32_t>(fields.size()), buf, &encode_cell, &src);
+        if (n < 0) {
+            err = src.err;
+            if (!err) {
+                sql_print_error("stoolap: INSERT failed: %s",
+                                stoolap_row_buffer_errmsg(row_buffer_.get()));
+                err = HA_ERR_GENERIC;
+            }
+            goto done;
+        }
+        bulk_rows_ = n;
+        if (static_cast<size_t>(n) >= kBulkFlushRows)
+            err = flush_bulk_buffer(/*partial=*/true);
+        goto done;
+    }
     if (bulk_active_) {
         const size_t holders_base = bulk_text_holders_.size();
         const size_t params_base = bulk_params_.size();
@@ -1683,6 +1735,30 @@ int ha_stoolap::write_row(const uchar* buf) {
     }
 
     {
+        const auto& fields = insert_fields();
+        StoolapDB* db = direct_write_db();
+        if (!db) {
+            err = HA_ERR_INTERNAL_ERROR;
+            goto done;
+        }
+        RecordSource src{table};
+        int64_t affected = 0;
+        const int rc = stoolap_insert_record(
+            db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
+            fields.data(), static_cast<int32_t>(fields.size()), buf,
+            &encode_cell, &src, &affected);
+        if (rc != STOOLAP_FALLBACK) {
+            cur_row_id_valid_ = false;
+            if (rc != STOOLAP_OK)
+                err = src.err ? src.err : write_error(db, "INSERT");
+            else
+                apply_count_delta(affected);
+            goto done;
+        }
+    }
+
+    {
+        // A table a foreign key names: through SQL.
         std::vector<StoolapValue> params;
         std::vector<std::string> text_holders;
         params.reserve(table->s->fields);
@@ -1699,10 +1775,6 @@ int ha_stoolap::write_row(const uchar* buf) {
             params.push_back(v);
         }
 
-        if (int rc = insert_direct(params.data(), 1, nullptr); rc != -1) {
-            err = rc;
-            goto done;
-        }
         {
             auto* ctx = get_thd_ctx(ha_thd());
             int64_t affected = 0;
@@ -1727,22 +1799,31 @@ done:
     return err;
 }
 
-// Inserts `nrows` rows of values directly; -1 for a table a foreign key
-// names, which the caller writes through SQL.
-int ha_stoolap::insert_direct(const StoolapValue* values, int32_t nrows,
-                              int64_t* affected_out) {
-    StoolapDB* db = direct_write_db();
-    if (!db) return HA_ERR_INTERNAL_ERROR;
-    int64_t affected = 0;
-    const int rc = stoolap_insert(db, stoolap_table_.c_str(),
-                                  static_cast<int32_t>(table->s->fields),
-                                  values, nrows, &affected);
-    if (rc == STOOLAP_FALLBACK) return -1;
-    cur_row_id_valid_ = false;
-    if (rc != STOOLAP_OK) return write_error(db, "INSERT");
-    apply_count_delta(affected);
-    if (affected_out) *affected_out = affected;
-    return 0;
+// Every field, as a direct insert reads the record.
+const std::vector<StoolapField>& ha_stoolap::insert_fields() {
+    if (write_fields_.empty())
+        for (uint i = 0; i < table->s->fields; ++i)
+            write_fields_.push_back(stoolap_mariadb::record_field(
+                table, i, static_cast<int32_t>(i)));
+    return write_fields_;
+}
+
+// The fields write_set names, as a direct update reads the records.
+const std::vector<StoolapField>& ha_stoolap::refresh_update_fields() {
+    const uint fields = table->s->fields;
+    std::vector<uint32_t>& w = proj_words_scratch_;
+    w.assign((fields + 31) / 32, 0);
+    for (uint i = 0; i < fields; ++i)
+        if (bitmap_is_set(table->write_set, i))
+            w[i / 32] |= uint32_t(1) << (i % 32);
+    if (w == update_words_ && !update_fields_.empty()) return update_fields_;
+    update_fields_.clear();
+    for (uint i = 0; i < fields; ++i)
+        if (w[i / 32] & (uint32_t(1) << (i % 32)))
+            update_fields_.push_back(stoolap_mariadb::record_field(
+                table, i, static_cast<int32_t>(i)));
+    update_words_ = w;
+    return update_fields_;
 }
 
 // The session handle direct writes go through. A write outside an open
@@ -1772,46 +1853,23 @@ int ha_stoolap::write_error(StoolapDB* db, const char* what) {
 // written columns whose value changed; -1 for a table a foreign key names.
 int ha_stoolap::update_row_direct(const uchar* old_data,
                                   const uchar* new_data) {
-    const uint fields = table->s->fields;
-    std::vector<int32_t> cols;
-    std::vector<StoolapValue> vals;
-    std::vector<std::string> holders;
-    holders.reserve(fields);  // the values point into these
+    const auto& fields = refresh_update_fields();
+    if (fields.empty()) return 0;
+    StoolapDB* db = direct_write_db();
+    if (!db) return HA_ERR_INTERNAL_ERROR;
+    // The encode callback reads the new values.
     const my_ptrdiff_t d =
         static_cast<my_ptrdiff_t>(new_data - table->record[0]);
     move_fields(table, d);
-    for (uint i = 0; i < fields; ++i) {
-        if (!bitmap_is_set(table->write_set, i)) continue;
-        Field* f = table->field[i];
-        const size_t off = f->ptr - table->record[0];
-        const bool null_match =
-            f->null_ptr
-                ? ((new_data[f->null_ptr - table->record[0]] & f->null_bit) ==
-                   (old_data[f->null_ptr - table->record[0]] & f->null_bit))
-                : true;
-        if (null_match &&
-            std::memcmp(new_data + off, old_data + off, f->pack_length()) == 0)
-            continue;
-        StoolapValue v{};
-        holders.emplace_back();
-        if (!extract_field(f, v, holders.back())) {
-            move_fields(table, -d);
-            return HA_ERR_UNSUPPORTED;
-        }
-        cols.push_back(static_cast<int32_t>(i));
-        vals.push_back(v);
-    }
-    move_fields(table, -d);
-    if (cols.empty()) return 0;
-
-    StoolapDB* db = direct_write_db();
-    if (!db) return HA_ERR_INTERNAL_ERROR;
+    RecordSource src{table};
     int64_t affected = 0;
-    const int rc = stoolap_update_row(
-        db, stoolap_table_.c_str(), static_cast<int32_t>(fields), cur_row_id_,
-        cols.data(), vals.data(), static_cast<int32_t>(cols.size()), &affected);
+    const int rc = stoolap_update_record(
+        db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
+        cur_row_id_, fields.data(), static_cast<int32_t>(fields.size()),
+        old_data, new_data, &encode_cell, &src, &affected);
+    move_fields(table, -d);
     if (rc == STOOLAP_FALLBACK) return -1;
-    if (rc != STOOLAP_OK) return write_error(db, "UPDATE");
+    if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "UPDATE");
     return affected == 0 ? HA_ERR_RECORD_DELETED : 0;
 }
 

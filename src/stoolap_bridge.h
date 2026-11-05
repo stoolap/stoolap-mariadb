@@ -56,6 +56,13 @@ using RowsPtr = std::unique_ptr<StoolapRows, RowsDeleter>;
 using StmtPtr = std::unique_ptr<StoolapStmt, StmtDeleter>;
 using CursorPtr = std::unique_ptr<StoolapCursor, CursorDeleter>;
 
+struct RowBufferDeleter {
+    void operator()(StoolapRowBuffer* p) const noexcept {
+        if (p) stoolap_row_buffer_free(p);
+    }
+};
+using RowBufferPtr = std::unique_ptr<StoolapRowBuffer, RowBufferDeleter>;
+
 // Process-wide handle; each handler clones via stoolap_clone for thread safety.
 class Engine {
 public:

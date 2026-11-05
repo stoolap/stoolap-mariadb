@@ -25,8 +25,8 @@ mod read;
 pub(crate) mod rows;
 mod statement;
 mod transaction;
-mod types;
-mod value;
+pub(crate) mod types;
+pub(crate) mod value;
 mod write;
 
 // Re-export all extern "C" functions
