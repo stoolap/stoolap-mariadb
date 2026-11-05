@@ -15,7 +15,7 @@ use std::os::raw::c_void;
 
 use stoolap::core::{Error, Result, Row, Value};
 
-use crate::ffi::rows::write_value;
+use crate::ffi::rows::{reset_packed, write_value};
 
 /// Handed to the plugin's store callback
 pub const STOOLAP_FIELD_STORE: i32 = 0;
@@ -163,6 +163,9 @@ pub unsafe fn write_record(
         scratch.clear();
         write_value(v, scratch)?;
         let rc = store(sink.ctx, f.field, scratch.as_ptr(), scratch.len());
+        // The store copied the value: a buffer a large one grew goes now,
+        // not with the handler the table cache keeps
+        reset_packed(scratch);
         if rc != 0 {
             return Err(Error::internal(format!(
                 "storing field {} failed ({})",
