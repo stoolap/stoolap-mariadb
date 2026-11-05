@@ -170,7 +170,8 @@ fn sorted_rows(
 /// The rows of a read, handed out in chunks
 pub struct Cursor {
     source: Source,
-    columns: Vec<usize>,
+    /// The last row a sorted or paged read gave
+    current: Option<Row>,
 }
 
 /// Refuses a table whose column count is not the one MariaDB knows
@@ -206,7 +207,7 @@ impl Cursor {
             .collect();
         Ok(Cursor {
             source: Source::Sorted(rows.into_iter()),
-            columns: columns.to_vec(),
+            current: None,
         })
     }
 
@@ -244,7 +245,7 @@ impl Cursor {
                     let rows = table.fetch_rows_by_ids(&[id], &ConstBoolExpr::true_expr())?;
                     return Ok(Cursor {
                         source: Source::Sorted(rows.into_iter().collect::<Vec<_>>().into_iter()),
-                        columns: spec.columns.to_vec(),
+                        current: None,
                     });
                 }
             }
@@ -316,12 +317,8 @@ impl Cursor {
         };
         Ok(Cursor {
             source,
-            columns: spec.columns.to_vec(),
+            current: None,
         })
-    }
-
-    pub fn column_count(&self) -> usize {
-        self.columns.len()
     }
 
     /// A read of `table` with no condition, ordered by one column: from the
@@ -354,45 +351,31 @@ impl Cursor {
                 done: false,
                 last: None,
             }),
-            columns: spec.columns.to_vec(),
+            current: None,
         })
     }
 
-    /// Calls `emit` with each of up to `max` rows, its row id and the
-    /// columns to read; the count is short only at the end
-    pub fn next_rows(
-        &mut self,
-        max: usize,
-        mut emit: impl FnMut(i64, &Row, &[usize]) -> Result<()>,
-    ) -> Result<usize> {
-        let mut n = 0;
-        match &mut self.source {
+    /// The next row and its id; the row stays valid until the next call
+    pub fn next_row(&mut self) -> Result<Option<(i64, &Row)>> {
+        let Cursor {
+            source, current, ..
+        } = self;
+        let (id, row) = match source {
             Source::Scan(scanner) => {
-                while n < max && scanner.next() {
-                    emit(scanner.current_row_id(), scanner.row(), &self.columns)?;
-                    n += 1;
-                }
-                if n < max {
-                    if let Some(e) = scanner.err() {
-                        return Err(e.clone());
-                    }
-                }
-            }
-            Source::Sorted(rows) => {
-                while n < max {
-                    let Some((id, row)) = rows.next() else { break };
-                    emit(id, &row, &self.columns)?;
-                    n += 1;
-                }
-            }
-            Source::Paged(pager) => {
-                while n < max {
-                    let Some((id, row)) = pager.rows.next() else {
-                        if pager.fill()? {
-                            continue;
-                        }
-                        break;
+                if !scanner.next() {
+                    return match scanner.err() {
+                        Some(e) => Err(e.clone()),
+                        None => Ok(None),
                     };
+                }
+                return Ok(Some((scanner.current_row_id(), scanner.row())));
+            }
+            Source::Sorted(rows) => match rows.next() {
+                Some(next) => next,
+                None => return Ok(None),
+            },
+            Source::Paged(pager) => loop {
+                if let Some((id, row)) = pager.rows.next() {
                     let value = row.get(pager.column);
                     match &mut pager.last {
                         Some((v, ids)) if compare_values(value, Some(v)) == Ordering::Equal => {
@@ -403,12 +386,24 @@ impl Cursor {
                                 Some((value.cloned().unwrap_or_else(Value::null_unknown), vec![id]))
                         }
                     }
-                    emit(id, &row, &self.columns)?;
-                    n += 1;
+                    break (id, row);
                 }
-            }
+                if !pager.fill()? {
+                    return Ok(None);
+                }
+            },
+        };
+        Ok(Some((id, current.insert(row))))
+    }
+
+    /// Whether the read has no row left, when that is known without
+    /// reading one
+    pub fn exhausted(&self) -> bool {
+        match &self.source {
+            Source::Scan(_) => false,
+            Source::Sorted(rows) => rows.len() == 0,
+            Source::Paged(pager) => pager.done && pager.rows.len() == 0,
         }
-        Ok(n)
     }
 }
 

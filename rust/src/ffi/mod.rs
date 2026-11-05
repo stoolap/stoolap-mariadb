@@ -22,7 +22,7 @@
 mod database;
 mod error;
 mod read;
-mod rows;
+pub(crate) mod rows;
 mod statement;
 mod transaction;
 mod types;
