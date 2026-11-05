@@ -205,7 +205,8 @@ inline void store_text(Field* f, const char* s, size_t n) {
         // A utf8mb4 VARCHAR takes valid UTF-8 as it is: no more bytes
         // than the field has characters always fits, so the bytes go in
         // without the copy that checks and counts each character.
-        if (f->real_type() == MYSQL_TYPE_VARCHAR &&
+        // A COMPRESSED one reports VARCHAR too but stores its own header.
+        if (f->real_type() == MYSQL_TYPE_VARCHAR && !f->compression_method() &&
             cs->cset == my_charset_utf8mb4_bin.cset && n <= f->char_length()) {
             auto* v = static_cast<Field_varstring*>(f);
             if (v->length_bytes == 1)
