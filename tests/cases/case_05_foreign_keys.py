@@ -232,6 +232,32 @@ INSERT INTO `my-db`.`P\u00e9` VALUES (1);
                   "INSERT INTO si VALUES (1)")
     h.assert_ok("ALTER ... ENGINE=STOOLAP", f"ALTER TABLE si ENGINE={h.engine}")
     h.assert_scalar("converted rows", "SELECT COUNT(*) FROM si", "1")
+    # A value whose text reads like a parent-side error is still the
+    # child's missing parent (1452), not a referenced parent (1451)
+    h.exec_script(f"""
+CREATE TABLE vp (id INT NOT NULL PRIMARY KEY,
+  code VARCHAR(30) COLLATE utf8mb4_bin NOT NULL UNIQUE) ENGINE={h.engine};
+CREATE TABLE vc (code VARCHAR(30) COLLATE utf8mb4_bin,
+  FOREIGN KEY (code) REFERENCES vp (code))
+  ENGINE={h.engine};
+""")
+    h.assert_err("a missing parent named 'still reference it'",
+                 "INSERT INTO vc VALUES ('still reference it')",
+                 r"add or update a child row")
+    h.assert_err("a missing parent named 'still referenced by table'",
+                 "INSERT INTO vc VALUES ('still referenced by table')",
+                 r"add or update a child row")
+    # DROP DATABASE takes its own children with it, though their stoolap
+    # names are shortened past its prefix
+    longdb = "$" * 36 + "_" * 28
+    h.exec_script(f"""
+CREATE DATABASE `{longdb}`;
+CREATE TABLE `{longdb}`.a (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+CREATE TABLE `{longdb}`.`{"z" * 20}` (aid INT, FOREIGN KEY (aid) REFERENCES a (id))
+  ENGINE={h.engine};
+""")
+    h.assert_ok("DROP DATABASE with a shortened child",
+                f"DROP DATABASE `{longdb}`")
     # The actions come from the parser too
     h.exec_script(f"""
 CREATE TABLE ap (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};

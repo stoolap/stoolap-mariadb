@@ -79,15 +79,29 @@ thread_local! {
     static LAST: RefCell<Option<(String, (i32, i32))>> = const { RefCell::new(None) };
 }
 
+/// Whether a foreign key violation's `detail` is the parent side's: a
+/// referenced row's delete or update, or a referenced table's drop. By how
+/// the detail starts: the values it names later are the user's text
+fn parent_side(detail: &str) -> bool {
+    [
+        "cannot delete row with ",
+        "cannot update row with ",
+        "cannot cascade-delete row with ",
+        "cannot cascade-update row with ",
+        "cannot drop/truncate table ",
+        "cannot drop table ",
+    ]
+    .iter()
+    .any(|p| detail.starts_with(p))
+}
+
 /// Notes `e`, which a handle has just recorded as its message
 pub(crate) fn note_error(e: &Error) {
     let class = match e {
         Error::PrimaryKeyConstraint { .. } => (STOOLAP_ERR_DUP_KEY, STOOLAP_KEY_PRIMARY),
         Error::UniqueConstraint { index, .. } => (STOOLAP_ERR_DUP_KEY, unique_ordinal(index)),
         Error::ForeignKeyViolation { detail, .. } => {
-            // A parent row's delete, or a parent table's drop
-            if detail.contains("still referenced by table") || detail.contains("still reference it")
-            {
+            if parent_side(detail) {
                 (STOOLAP_ERR_ROW_IS_REFERENCED, STOOLAP_KEY_NONE)
             } else {
                 (STOOLAP_ERR_NO_REFERENCED_ROW, STOOLAP_KEY_NONE)
@@ -129,12 +143,14 @@ fn class_of_text(m: &str) -> (i32, i32) {
         return (STOOLAP_ERR_DUP_KEY, unique_ordinal(index));
     } else if starts("unique constraint failed") {
         STOOLAP_ERR_DUP_KEY
-    } else if has("still referenced by table") || has("still reference it") {
-        // The parent side; the child side's "referenced row ... does not
-        // exist" is the violation below
-        STOOLAP_ERR_ROW_IS_REFERENCED
-    } else if starts("foreign key constraint violation") {
-        STOOLAP_ERR_NO_REFERENCED_ROW
+    } else if let Some(rest) = m.strip_prefix("foreign key constraint violation: ") {
+        // The detail follows the parent's "'table(column)' \u{2014} "
+        let detail = rest.split_once(")' \u{2014} ").map_or("", |(_, d)| d);
+        if parent_side(detail) {
+            STOOLAP_ERR_ROW_IS_REFERENCED
+        } else {
+            STOOLAP_ERR_NO_REFERENCED_ROW
+        }
     } else if starts("not null constraint failed") || starts("CHECK constraint failed") {
         STOOLAP_ERR_GENERIC
     } else if has("; retry the statement") {
@@ -217,7 +233,11 @@ mod tests {
             (STOOLAP_ERR_DUP_KEY, STOOLAP_KEY_PRIMARY)
         );
         assert_eq!(c("unique constraint failed for index unique_t_on_x_2 on column a, b with value (1, 2)"), (STOOLAP_ERR_DUP_KEY, 2));
-        assert_eq!(c("foreign key constraint violation: column 'p' ... — cannot delete row with id = 1 — still referenced by table 'c'"), (STOOLAP_ERR_ROW_IS_REFERENCED, STOOLAP_KEY_NONE));
+        assert_eq!(c("foreign key constraint violation: column 'p' in table 'c' references 'p(id)' — cannot delete row with id = 1 — still referenced by table 'c'"), (STOOLAP_ERR_ROW_IS_REFERENCED, STOOLAP_KEY_NONE));
+        assert_eq!(c("foreign key constraint violation: column 'p' in table 'c' references 'p(id)' — cannot drop/truncate table 'p' — rows in 'c' still reference it").0, STOOLAP_ERR_ROW_IS_REFERENCED);
+        // A missing parent value reading like the parent side's wording
+        assert_eq!(c("foreign key constraint violation: column 'p' in table 'c' references 'p(code)' — referenced row with code = still reference it does not exist").0, STOOLAP_ERR_NO_REFERENCED_ROW);
+        assert_eq!(c("foreign key constraint violation: column 'p' in table 'c' references 'p(code)' — referenced row with code = x — still referenced by table 'c' does not exist").0, STOOLAP_ERR_NO_REFERENCED_ROW);
         assert_eq!(c("foreign key constraint violation: column 'p' in table 'c' references 'p(id)' — referenced row does not exist").0, STOOLAP_ERR_NO_REFERENCED_ROW);
         assert_eq!(
             c("write conflict: row 3 was modified by another transaction").0,

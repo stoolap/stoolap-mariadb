@@ -177,17 +177,17 @@ pub fn create_table(
 
 /// Drops `table` if it is there. A parent other tables' foreign keys name
 /// is refused, as InnoDB refuses it, unless `check_fks` is false; the
-/// children in `dropped_db` (DROP DATABASE: its tables' stoolap prefix)
-/// go with it, dropped first.
+/// children among `dropping` (DROP DATABASE: the database's tables) go
+/// with it, dropped first.
 pub fn drop_table(
     session: &Session,
     table: &str,
     check_fks: bool,
-    dropped_db: Option<&str>,
+    dropping: &[String],
 ) -> Result<()> {
-    let prefix = dropped_db.map(str::to_lowercase);
+    let dropping: Vec<String> = dropping.iter().map(|t| t.to_lowercase()).collect();
     for (child, column, parent_column) in session.referencing_tables(table) {
-        if prefix.as_deref().is_some_and(|p| child.starts_with(p)) {
+        if dropping.contains(&child) {
             session.run(
                 &format!("DROP TABLE IF EXISTS {}", quote(&child)),
                 ParamVec::new(),
