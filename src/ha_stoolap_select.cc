@@ -204,6 +204,31 @@ bool name_at(const std::string& s, size_t i, std::string_view name) {
     return strncasecmp(s.data() + i, name.data(), name.size()) == 0;
 }
 
+/** The first position at or after `i` past white space and comments
+ *  (C style, `-- ` and `#`); npos at an executable C comment (`!` or
+ *  `M!` after its opening), whose text MariaDB runs. */
+size_t skip_space_and_comments(const std::string& s, size_t i) {
+    while (i < s.size()) {
+        if (isspace(static_cast<unsigned char>(s[i]))) {
+            ++i;
+        } else if (s.compare(i, 2, "/*") == 0) {
+            if (s.compare(i, 3, "/*!") == 0 || s.compare(i, 4, "/*M!") == 0)
+                return std::string::npos;
+            const size_t close = s.find("*/", i + 2);
+            i = close == std::string::npos ? s.size() : close + 2;
+        } else if (s[i] == '#' ||
+                   (s.compare(i, 2, "--") == 0 &&
+                    (i + 2 == s.size() ||
+                     isspace(static_cast<unsigned char>(s[i + 2]))))) {
+            const size_t nl = s.find('\n', i);
+            i = nl == std::string::npos ? s.size() : nl + 1;
+        } else {
+            break;
+        }
+    }
+    return i;
+}
+
 /** Word-boundary identifier replacement that skips literal regions. The
  *  `.` exclusion on the left side prevents mangling the table half of a
  *  qualified `db.tbl` reference when iterating a different leaf. False when
@@ -233,11 +258,11 @@ bool replace_ident_word(std::string& s, std::string_view from,
             !is_ident_char(static_cast<unsigned char>(s[end]));
         if (ok_left && ok_right) {
             if (keyword) return false;
-            size_t next = end;
-            while (next < s.size() &&
-                   isspace(static_cast<unsigned char>(s[next])))
-                ++next;
-            if (next < s.size() && s[next] == '(') return false;
+            const size_t next = skip_space_and_comments(s, end);
+            // An executable comment (/*! ... */) may hold the call's `(`
+            if (next == std::string::npos ||
+                (next < s.size() && s[next] == '('))
+                return false;
             s.replace(i, from.size(), to);
             i += to.size();
         } else {

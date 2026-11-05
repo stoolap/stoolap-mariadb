@@ -550,6 +550,8 @@ SELECT n FROM mixq_other.q;
             f"CREATE TABLE concat (id INT PRIMARY KEY, v INT) "
             f"ENGINE={h.engine}",
             "INSERT INTO concat VALUES (1, 0)",
+            f"CREATE TABLE `abs` (id INT PRIMARY KEY, v INT) ENGINE={h.engine}",
+            "INSERT INTO `abs` VALUES (1, 0), (2, 0), (3, 0)",
         ]:
             cur.execute(stmt)
         before = _direct_hits(h)
@@ -557,17 +559,24 @@ SELECT n FROM mixq_other.q;
             "UPDATE `set` SET v = 1 WHERE id = 1",
             "UPDATE `set` set v = 2 WHERE id = 2",
             "UPDATE concat SET v = concat('1', '2') WHERE id = 1",
+            # A comment between the call's name and its `(`
+            "UPDATE `abs` SET v = ABS/**/(-id) WHERE id = 1",
+            "UPDATE `abs` SET v = abs -- x\n (-id) WHERE id = 2",
+            "UPDATE `abs` SET v = abs /*! (-id) */ WHERE id = 3",
         ]:
             cur.execute(stmt)
-        # Without case folding the first one's SET is no match: direct
+        # Without case folding SET and ABS are no match: direct
         cur.execute("SELECT @@lower_case_table_names")
         folds = int(cur.fetchone()[0]) != 0
-        h.assert_eq("keyword and call words fall back", 0 if folds else 1,
+        h.assert_eq("keyword and call words fall back", 0 if folds else 2,
                     _direct_hits(h) - before)
         cur.execute("SELECT id, v FROM `set` ORDER BY id")
         h.assert_eq("a table named set", [(1, 1), (2, 2)], cur.fetchall())
         cur.execute("SELECT v FROM concat")
         h.assert_eq("a table named like a function", [(12,)], cur.fetchall())
+        cur.execute("SELECT id, v FROM `abs` ORDER BY id")
+        h.assert_eq("a call with a comment before its (",
+                    [(1, 1), (2, 2), (3, 3)], cur.fetchall())
         cur.execute("DROP DATABASE `DmlCase`")
         cur.execute("DROP DATABASE `my-db`")
     finally:
