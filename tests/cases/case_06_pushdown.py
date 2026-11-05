@@ -551,7 +551,7 @@ SELECT n FROM mixq_other.q;
             f"ENGINE={h.engine}",
             "INSERT INTO concat VALUES (1, 0)",
             f"CREATE TABLE `abs` (id INT PRIMARY KEY, v INT) ENGINE={h.engine}",
-            "INSERT INTO `abs` VALUES (1, 0), (2, 0), (3, 0)",
+            "INSERT INTO `abs` VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)",
         ]:
             cur.execute(stmt)
         before = _direct_hits(h)
@@ -563,12 +563,15 @@ SELECT n FROM mixq_other.q;
             "UPDATE `abs` SET v = ABS/**/(-id) WHERE id = 1",
             "UPDATE `abs` SET v = abs -- x\n (-id) WHERE id = 2",
             "UPDATE `abs` SET v = abs /*! (-id) */ WHERE id = 3",
+            "UPDATE `abs` SET v = `ABS`(-id) WHERE id = 4",
+            # MariaDB takes -- before a control character as a comment
+            "UPDATE `abs` SET v = abs--\x01 x\n(-id) WHERE id = 5",
         ]:
             cur.execute(stmt)
-        # Without case folding SET and ABS are no match: direct
+        # Without case folding SET, ABS and `ABS` are no match: direct
         cur.execute("SELECT @@lower_case_table_names")
         folds = int(cur.fetchone()[0]) != 0
-        h.assert_eq("keyword and call words fall back", 0 if folds else 2,
+        h.assert_eq("keyword and call words fall back", 0 if folds else 3,
                     _direct_hits(h) - before)
         cur.execute("SELECT id, v FROM `set` ORDER BY id")
         h.assert_eq("a table named set", [(1, 1), (2, 2)], cur.fetchall())
@@ -576,7 +579,8 @@ SELECT n FROM mixq_other.q;
         h.assert_eq("a table named like a function", [(12,)], cur.fetchall())
         cur.execute("SELECT id, v FROM `abs` ORDER BY id")
         h.assert_eq("a call with a comment before its (",
-                    [(1, 1), (2, 2), (3, 3)], cur.fetchall())
+                    [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)],
+                    cur.fetchall())
         cur.execute("DROP DATABASE `DmlCase`")
         cur.execute("DROP DATABASE `my-db`")
     finally:

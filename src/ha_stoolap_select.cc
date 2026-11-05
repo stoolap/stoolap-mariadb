@@ -219,7 +219,8 @@ size_t skip_space_and_comments(const std::string& s, size_t i) {
         } else if (s[i] == '#' ||
                    (s.compare(i, 2, "--") == 0 &&
                     (i + 2 == s.size() ||
-                     isspace(static_cast<unsigned char>(s[i + 2]))))) {
+                     isspace(static_cast<unsigned char>(s[i + 2])) ||
+                     iscntrl(static_cast<unsigned char>(s[i + 2]))))) {
             const size_t nl = s.find('\n', i);
             i = nl == std::string::npos ? s.size() : nl + 1;
         } else {
@@ -227,6 +228,13 @@ size_t skip_space_and_comments(const std::string& s, size_t i) {
         }
     }
     return i;
+}
+
+/** Whether a call may follow a name ending at `end`: its `(` next, or an
+ *  executable comment that may hold it */
+bool call_follows(const std::string& s, size_t end) {
+    const size_t next = skip_space_and_comments(s, end);
+    return next == std::string::npos || (next < s.size() && s[next] == '(');
 }
 
 /** Word-boundary identifier replacement that skips literal regions. The
@@ -257,12 +265,7 @@ bool replace_ident_word(std::string& s, std::string_view from,
             (end >= s.size()) ||
             !is_ident_char(static_cast<unsigned char>(s[end]));
         if (ok_left && ok_right) {
-            if (keyword) return false;
-            const size_t next = skip_space_and_comments(s, end);
-            // An executable comment (/*! ... */) may hold the call's `(`
-            if (next == std::string::npos ||
-                (next < s.size() && s[next] == '('))
-                return false;
+            if (keyword || call_follows(s, end)) return false;
             s.replace(i, from.size(), to);
             i += to.size();
         } else {
@@ -282,10 +285,11 @@ bool replace_ident_word(std::string& s, std::string_view from,
  *  rather than string literals, but treating them as opaque regions is
  *  fine here. A backticked table reference like `t` IS itself such a
  *  region, so any nested occurrence we skip past was already part of
- *  an identifier we'd not want to rewrite. */
-void replace_all_literal_aware(std::string& s, std::string_view from,
+ *  an identifier we'd not want to rewrite. False at a call (`from`(),
+ *  as replace_ident_word. */
+bool replace_all_literal_aware(std::string& s, std::string_view from,
                                std::string_view to) {
-    if (from.empty()) return;
+    if (from.empty()) return true;
     const char first = from[0];
     size_t i = 0;
     while (i < s.size()) {
@@ -310,9 +314,11 @@ void replace_all_literal_aware(std::string& s, std::string_view from,
             ++i;
             continue;
         }
+        if (call_follows(s, i + from.size())) return false;
         s.replace(i, from.size(), to);
         i += to.size();
     }
+    return true;
 }
 
 /**
@@ -337,8 +343,8 @@ void replace_all_literal_aware(std::string& s, std::string_view from,
  * not the other -- that omitting them dropped direct-DML to a stoolap parse
  * error like "expected SET after <db>, got '.'".
  *
- * False when a bare word may not be the table (replace_ident_word): the
- * caller leaves the statement to the row-pump.
+ * False when a name may not be the table (a call, or a bare keyword;
+ * replace_ident_word): the caller leaves the statement to the row-pump.
  */
 bool rewrite_table_names(const std::string& sql,
                          const std::vector<LeafName>& leaves,
@@ -354,11 +360,12 @@ bool rewrite_table_names(const std::string& sql,
         const std::string bt_tb_qual = l.db + ".`" + l.tbl + "`";
         // Backticked-both first; the mixed forms are stricter substrings
         // of all-bare so they need their own pass before bare-bare runs.
-        replace_all_literal_aware(out, bt_qual, quoted);
-        replace_all_literal_aware(out, bt_db_qual, quoted);
-        replace_all_literal_aware(out, bt_tb_qual, quoted);
         const std::string bare_qual = l.db + "." + l.tbl;
-        if (!replace_ident_word(out, bare_qual, quoted)) return false;
+        if (!replace_all_literal_aware(out, bt_qual, quoted) ||
+            !replace_all_literal_aware(out, bt_db_qual, quoted) ||
+            !replace_all_literal_aware(out, bt_tb_qual, quoted) ||
+            !replace_ident_word(out, bare_qual, quoted))
+            return false;
     }
 
     // Bare-form rewrites only fire when the bare name is unambiguous
@@ -381,8 +388,8 @@ bool rewrite_table_names(const std::string& sql,
 
         const std::string quoted = std::string("\"") + l.stoolap + "\"";
         const std::string bt_bare = "`" + l.tbl + "`";
-        replace_all_literal_aware(out, bt_bare, quoted);
-        if (!replace_ident_word(out, l.tbl, quoted,
+        if (!replace_all_literal_aware(out, bt_bare, quoted) ||
+            !replace_ident_word(out, l.tbl, quoted,
                                 is_keyword(l.tbl.c_str(), l.tbl.size())))
             return false;
     }
