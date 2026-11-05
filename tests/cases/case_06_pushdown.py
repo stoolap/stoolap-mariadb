@@ -541,6 +541,30 @@ SELECT n FROM mixq_other.q;
         cur.execute("SELECT id FROM `my-db`.`t$1`")
         h.assert_eq("a table name with $", [(2,)], cur.fetchall())
         h.assert_eq("every statement ran as direct DML", 7, hits)
+        # A bare word the rewriter cannot tell from the table: the keyword
+        # SET for a table `set` (any case, as MariaDB may fold), a call of
+        # a function the table shares its name with. Left to the row-pump.
+        for stmt in [
+            f"CREATE TABLE `set` (id INT PRIMARY KEY, v INT) ENGINE={h.engine}",
+            "INSERT INTO `set` VALUES (1, 0), (2, 0)",
+            f"CREATE TABLE concat (id INT PRIMARY KEY, v INT) "
+            f"ENGINE={h.engine}",
+            "INSERT INTO concat VALUES (1, 0)",
+        ]:
+            cur.execute(stmt)
+        before = _direct_hits(h)
+        for stmt in [
+            "UPDATE `set` SET v = 1 WHERE id = 1",
+            "UPDATE `set` set v = 2 WHERE id = 2",
+            "UPDATE concat SET v = concat('1', '2') WHERE id = 1",
+        ]:
+            cur.execute(stmt)
+        h.assert_eq("keyword and call words fall back", 0,
+                    _direct_hits(h) - before)
+        cur.execute("SELECT id, v FROM `set` ORDER BY id")
+        h.assert_eq("a table named set", [(1, 1), (2, 2)], cur.fetchall())
+        cur.execute("SELECT v FROM concat")
+        h.assert_eq("a table named like a function", [(12,)], cur.fetchall())
         cur.execute("DROP DATABASE `DmlCase`")
         cur.execute("DROP DATABASE `my-db`")
     finally:

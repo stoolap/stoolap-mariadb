@@ -206,10 +206,12 @@ bool name_at(const std::string& s, size_t i, std::string_view name) {
 
 /** Word-boundary identifier replacement that skips literal regions. The
  *  `.` exclusion on the left side prevents mangling the table half of a
- *  qualified `db.tbl` reference when iterating a different leaf. */
-void replace_ident_word(std::string& s, std::string_view from,
-                        std::string_view to) {
-    if (from.empty()) return;
+ *  qualified `db.tbl` reference when iterating a different leaf. False when
+ *  a word may not be the table: a call (`from(`), or any word when `from`
+ *  is an SQL keyword (a table `set` matches `SET` with case folded). */
+bool replace_ident_word(std::string& s, std::string_view from,
+                        std::string_view to, bool keyword = false) {
+    if (from.empty()) return true;
     size_t i = 0;
     while (i < s.size()) {
         const char c = s[i];
@@ -230,12 +232,19 @@ void replace_ident_word(std::string& s, std::string_view from,
             (end >= s.size()) ||
             !is_ident_char(static_cast<unsigned char>(s[end]));
         if (ok_left && ok_right) {
+            if (keyword) return false;
+            size_t next = end;
+            while (next < s.size() &&
+                   isspace(static_cast<unsigned char>(s[next])))
+                ++next;
+            if (next < s.size() && s[next] == '(') return false;
             s.replace(i, from.size(), to);
             i += to.size();
         } else {
             i += from.size();
         }
     }
+    return true;
 }
 
 /** Replace every occurrence of `from` with `to`, skipping single-quoted,
@@ -302,12 +311,15 @@ void replace_all_literal_aware(std::string& s, std::string_view from,
  * variants are common enough -- MariaDB users sometimes quote one half but
  * not the other -- that omitting them dropped direct-DML to a stoolap parse
  * error like "expected SET after <db>, got '.'".
+ *
+ * False when a bare word may not be the table (replace_ident_word): the
+ * caller leaves the statement to the row-pump.
  */
-std::string rewrite_table_names(const std::string& sql,
-                                const std::vector<LeafName>& leaves,
-                                const char* current_db) {
-    if (leaves.empty()) return sql;
-    std::string out = sql;
+bool rewrite_table_names(const std::string& sql,
+                         const std::vector<LeafName>& leaves,
+                         const char* current_db, std::string& out) {
+    out = sql;
+    if (leaves.empty()) return true;
     const std::string cur_db = current_db ? current_db : "";
 
     for (const LeafName& l : leaves) {
@@ -321,7 +333,7 @@ std::string rewrite_table_names(const std::string& sql,
         replace_all_literal_aware(out, bt_db_qual, quoted);
         replace_all_literal_aware(out, bt_tb_qual, quoted);
         const std::string bare_qual = l.db + "." + l.tbl;
-        replace_ident_word(out, bare_qual, quoted);
+        if (!replace_ident_word(out, bare_qual, quoted)) return false;
     }
 
     // Bare-form rewrites only fire when the bare name is unambiguous
@@ -345,9 +357,11 @@ std::string rewrite_table_names(const std::string& sql,
         const std::string quoted = std::string("\"") + l.stoolap + "\"";
         const std::string bt_bare = "`" + l.tbl + "`";
         replace_all_literal_aware(out, bt_bare, quoted);
-        replace_ident_word(out, l.tbl, quoted);
+        if (!replace_ident_word(out, l.tbl, quoted,
+                                is_keyword(l.tbl.c_str(), l.tbl.size())))
+            return false;
     }
-    return out;
+    return true;
 }
 
 // Forward decl: collect_bound_params is defined in the next anonymous
@@ -533,7 +547,15 @@ bool can_direct_modify(THD* thd) {
     // would mangle SET/WHERE tokens that share a table name. Row-pump
     // handles those via per-row callbacks.
     if (any_leaf_has_shadow_column(sel)) return false;
-    return true;
+
+    // Decline a bare word the rewriter cannot tell from the table
+    // (rewrite_table_names): MariaDB has chosen the path by the time
+    // try_direct_modify runs, so its refusal could not fall back.
+    std::vector<LeafName> leaves;
+    collect_leaf_names(sel, leaves);
+    std::string sql;
+    return rewrite_table_names(std::string(thd->query(), thd->query_length()),
+                               leaves, thd->db.str, sql);
 }
 
 int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
@@ -545,7 +567,8 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
 
     std::vector<LeafName> leaves;
     collect_leaf_names(sel, leaves);
-    std::string sql = rewrite_table_names(raw, leaves, thd->db.str);
+    std::string sql;
+    rewrite_table_names(raw, leaves, thd->db.str, sql);
 
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
         thd_get_ha_data(thd, stoolap_hton));
