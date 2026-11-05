@@ -42,6 +42,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <string>
+#include <vector>
 
 namespace stoolap_mariadb {
 
@@ -193,16 +195,67 @@ inline StoolapField record_field(TABLE* table, uint index, int32_t column) {
 // The store callback of a read into `table`, for a value
 // stoolap_cursor_next leaves to Field::store; the fields point into the
 // record the read writes. Keeps the error for the read's failure.
+//
+// Field_blob::store keeps its bytes in the field's own buffer, which the
+// next store into that field, MariaDB's included, overwrites: a row read
+// into record[1] would share it with the row MariaDB builds in record[0]
+// (UPDATE's old and new rows, REPLACE and ON DUPLICATE KEY UPDATE's
+// duplicate). With `blobs`, a read moves each BLOB's bytes into its own
+// buffer (one per field, valid until the next row), as InnoDB keeps them
+// in its own heap.
 struct RecordTarget {
     TABLE* table = nullptr;
     int err = 0;
+    std::vector<std::string>* blobs = nullptr;
 };
+
+// A TEXT / BLOB cell's bytes into `own`, the field pointing at them, with
+// no Field::store (which writes the field's shared buffer first). False
+// for a cell this does not take, which goes through Field::store.
+inline bool store_blob_owned(Field_blob* b, const uint8_t* cell, size_t len,
+                             std::string& own) {
+    // Its store compresses (create() refuses such columns)
+    if (b->compression_method()) return false;
+    if (len < 5) return false;
+    const uint8_t tag = cell[0];
+    if (tag != STOOLAP_TYPE_TEXT && tag != STOOLAP_TYPE_BLOB &&
+        tag != STOOLAP_TYPE_JSON)
+        return false;
+    const uint32_t n = pkt_le32(cell + 1);
+    if (5 + size_t(n) > len) return false;
+    const char* s = reinterpret_cast<const char*>(cell + 5);
+    if (tag == STOOLAP_TYPE_TEXT && field_enc(b) == Enc::HEX) {
+        // A binary or non-utf8 field's text is the hex of its bytes.
+        if (n % 2) return false;
+        own.resize(n / 2);
+        for (uint32_t i = 0; i < n / 2; ++i) {
+            const int hi = hex_nibble(s[2 * i]), lo = hex_nibble(s[2 * i + 1]);
+            if (hi < 0 || lo < 0) return false;
+            own[i] = static_cast<char>((hi << 4) | lo);
+        }
+    } else {
+        own.assign(s, n);
+    }
+    if (own.size() > b->max_data_length()) return false;
+    b->set_notnull();
+    b->set_ptr(static_cast<uint32>(own.size()),
+               reinterpret_cast<uchar*>(own.data()));
+    return true;
+}
 
 inline int32_t store_cell(void* ctx, int32_t field, const uint8_t* cell,
                           size_t len) {
     auto* t = static_cast<RecordTarget*>(ctx);
+    Field* f = t->table->field[field];
+    if (t->blobs && (f->flags & BLOB_FLAG)) {
+        if (t->blobs->size() <= static_cast<size_t>(field))
+            t->blobs->resize(t->table->s->fields);
+        if (store_blob_owned(static_cast<Field_blob*>(f), cell, len,
+                             (*t->blobs)[field]))
+            return 0;
+    }
     size_t pos = 0;
-    const int err = pkt_store_value(cell, len, &pos, t->table->field[field]);
+    const int err = pkt_store_value(cell, len, &pos, f);
     if (err) t->err = err;
     return err;
 }

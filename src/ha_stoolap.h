@@ -36,6 +36,7 @@ public:
 
     int open(const char* name, int mode, uint test_if_locked) override;
     int close() override;
+    int reset() override;
 
     int create(const char* name, TABLE* form,
                HA_CREATE_INFO* create_info) override;
@@ -141,6 +142,9 @@ private:
     bool reading_ = false;
     // Rows the read gave, added to Stoolap_buffered_rows when it ends
     uint64_t read_rows_ = 0;
+    // The bytes of the BLOB fields of the last row read, one buffer per
+    // field (see RecordTarget); reset() lets go of large ones.
+    std::vector<std::string> blob_bufs_;
     StoolapCursor* read_cursor();
     void end_read() {
         if (reading_) stoolap_cursor_end(cursor_.get());
