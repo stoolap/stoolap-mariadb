@@ -184,7 +184,7 @@ pub unsafe extern "C" fn stoolap_tx_query(
     sql: *const c_char,
     out_rows: *mut *mut StoolapRows,
 ) -> i32 {
-    stoolap_tx_query_params(tx, sql, std::ptr::null(), 0, out_rows)
+    tx_query_params(tx, sql, std::ptr::null(), 0, out_rows)
 }
 
 /// Query within a transaction (with parameters).
@@ -195,8 +195,7 @@ pub unsafe extern "C" fn stoolap_tx_query(
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL).
 /// - `out_rows` must be a valid pointer to a `*mut StoolapRows`.
-#[no_mangle]
-pub unsafe extern "C" fn stoolap_tx_query_params(
+unsafe fn tx_query_params(
     tx: *mut StoolapTx,
     sql: *const c_char,
     params: *const StoolapValue,

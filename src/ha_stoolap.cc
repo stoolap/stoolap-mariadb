@@ -1067,12 +1067,8 @@ std::string stoolap_table_name(const TABLE_SHARE* share) {
 
 ha_stoolap::ha_stoolap(handlerton* hton, TABLE_SHARE* table_arg)
     : handler(hton, table_arg) {
-    // Schema-only instances (mysql_create_frm_image) have a NULL share.
-    // `ref`: a flag byte, stoolap's row id, and the full record for a row
-    // a SQL read returned, which has no row id (see position()).
-    if (table_arg) {
-        ref_length = 1 + 8 + table_arg->reclength;
-    }
+    // `ref`: a flag byte and stoolap's row id (see position()).
+    ref_length = 1 + 8;
 }
 
 ulonglong ha_stoolap::table_flags() const {
@@ -1147,27 +1143,6 @@ void create_secondary_indexes(StoolapDB* db, const std::string& tbl,
 
 int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
     stoolap_table_ = stoolap_table_from_path(name);
-
-    // Detect BLOB/TEXT columns once per open. rnd_pos() needs this to refuse
-    // restore-from-ref when any field's in-record bytes are a (length, ptr)
-    // trio whose ptr lifetime is bound to the prior rnd_next's value-store
-    // (see has_blob_field_ comment in ha_stoolap.h).
-    has_blob_field_ = false;
-    if (table) {
-        for (uint i = 0; i < table->s->fields; ++i) {
-            switch (table->field[i]->real_type()) {
-                case MYSQL_TYPE_TINY_BLOB:
-                case MYSQL_TYPE_BLOB:
-                case MYSQL_TYPE_MEDIUM_BLOB:
-                case MYSQL_TYPE_LONG_BLOB:
-                    has_blob_field_ = true;
-                    break;
-                default:
-                    break;
-            }
-            if (has_blob_field_) break;
-        }
-    }
 
     // Reconcile: MariaDB may have a .frm while stoolap is missing the table
     // (fresh datadir, wipe, DSN switch). CREATE TABLE IF NOT EXISTS no-ops
@@ -2176,63 +2151,6 @@ using stoolap_mariadb::pkt_parse_header;
 using stoolap_mariadb::pkt_skip_value;
 using stoolap_mariadb::pkt_store_value;
 
-std::vector<uint32_t> ha_stoolap::projection_words() const {
-    std::vector<uint32_t> w;
-    if (!table->read_set || !table->write_set) return w;
-    const uint fields = table->s->fields;
-    w.assign((fields + 31) / 32, 0);
-    for (uint i = 0; i < fields; ++i) {
-        if (bitmap_is_set(table->read_set, i) ||
-            bitmap_is_set(table->write_set, i)) {
-            w[i / 32] |= uint32_t(1) << (i % 32);
-        }
-    }
-    return w;
-}
-
-std::string ha_stoolap::build_scan_columns() {
-    // Project read_set | write_set: write_set covers UPDATE's old/new
-    // compare; ORDER BY columns are already in read_set (filesort would
-    // read garbage otherwise). Only-read_set broke ORDER BY paths.
-    scan_proj_cols_ = projection_words();
-    scan_proj_.assign(table->s->fields, -1);
-    if (!table->read_set || !table->write_set) {
-        for (uint i = 0; i < table->s->fields; ++i)
-            scan_proj_[i] = i;
-        return "*";
-    }
-    // Plus the PRIMARY KEY, which MariaDB leaves out of read_set: a row a
-    // SQL read returns has no row id, so position(), update_row and
-    // delete_row take it from the key (see key_row_id).
-    TABLE_SHARE* share = table->s;
-    if (share->primary_key < share->keys) {
-        const KEY& pk = share->key_info[share->primary_key];
-        for (uint j = 0; j < pk.user_defined_key_parts; ++j) {
-            const uint i = pk.key_part[j].fieldnr - 1;
-            scan_proj_cols_[i / 32] |= uint32_t(1) << (i % 32);
-        }
-    }
-
-    std::string cols;
-    int proj_pos = 0;
-    for (uint i = 0; i < table->s->fields; ++i) {
-        const bool need = scan_proj_cols_[i / 32] & (uint32_t(1) << (i % 32));
-        if (!need) continue;
-        scan_proj_[i] = proj_pos++;
-        if (!cols.empty()) cols += ", ";
-        Field* f = table->field[i];
-        cols.append(quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length)));
-    }
-    if (cols.empty()) {
-        // No bits set -- COUNT(*)-shape needs one row per stoolap row.
-        for (uint i = 0; i < table->s->fields; ++i)
-            scan_proj_[i] = i;
-        return "*";
-    }
-    return cols;
-}
-
 int ha_stoolap::rnd_init(bool /*scan*/) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     reset_scan_state();
@@ -2240,8 +2158,9 @@ int ha_stoolap::rnd_init(bool /*scan*/) {
 }
 
 void ha_stoolap::refresh_projection() {
-    // build_scan_columns' projection without the SQL text: read_set |
-    // write_set, or every field when there are no bitmaps or no bits.
+    // read_set | write_set (write_set covers UPDATE's old / new compare),
+    // or every field when there are no bitmaps or no bits (a COUNT(*)
+    // still needs a row per row).
     const uint fields = table->s->fields;
     std::vector<uint32_t>& w = proj_words_scratch_;
     w.assign((fields + 31) / 32, 0);
@@ -2257,19 +2176,15 @@ void ha_stoolap::refresh_projection() {
     } else {
         w.clear();
     }
-    if (w == read_cols_words_ && w == scan_proj_cols_ && !read_cols_.empty())
-        return;
-    scan_proj_.assign(fields, -1);
+    if (w == read_cols_words_ && !read_cols_.empty()) return;
     read_cols_.clear();
     scan_buf_cell_to_field_.clear();
     for (uint i = 0; i < fields; ++i) {
         if (any && !(w[i / 32] & (uint32_t(1) << (i % 32)))) continue;
-        scan_proj_[i] = static_cast<int>(read_cols_.size());
         read_cols_.push_back(static_cast<int32_t>(i));
         scan_buf_cell_to_field_.push_back(static_cast<int>(i));
     }
     read_cols_words_ = w;
-    scan_proj_cols_ = w;
 }
 
 // Opens a direct read of the projected columns and loads its first chunk.
@@ -2399,106 +2314,18 @@ int ha_stoolap::rnd_next(uchar* buf) {
         return err;
     }
 
-    // Streaming SQL result: filtered range reads set up scan_.
-    cur_row_id_valid_ = false;
-    if (!scan_) return HA_ERR_END_OF_FILE;
-
-    int rc = stoolap_rows_next(scan_.get());
-    if (rc == STOOLAP_DONE) return HA_ERR_END_OF_FILE;
-    if (rc != STOOLAP_ROW) {
-        sql_print_error("stoolap: rows_next: %s",
-                        stoolap_rows_errmsg(scan_.get()));
-        return HA_ERR_GENERIC;
-    }
-    // Schema mismatch is caught at rnd_init / index_init when we open the
-    // result set; checking column_count() per row here was paying one FFI
-    // call per scanned row for a check that can't change mid-scan.
-
-    const my_ptrdiff_t row_diff =
-        static_cast<my_ptrdiff_t>(buf - table->record[0]);
-    move_fields(table, row_diff);
-
-    if (table->s->null_bytes) {
-        std::memset(buf, 0, table->s->null_bytes);
-    }
-
-    int err = 0;
-    // We tried bitmap-gated projection (read_set | write_set) but MariaDB's
-    // filesort / temp-table / GROUP BY paths sometimes consult columns
-    // outside the bitmap for sort keys, producing empty results on
-    // ORDER BY ... LIMIT N. Populating every projected column is the only
-    // correct choice without diving into the optimizer hooks.
-    for (uint i = 0; i < table->s->fields; ++i) {
-        const int col = (i < scan_proj_.size()) ? scan_proj_[i] : -1;
-        if (col < 0) continue;
-        Field* f = table->field[i];
-        // Skip column_is_null FFI for NOT NULL columns (schema guarantees);
-        // for nullable, set_notnull() clears stale 1s in the null bitmap.
-        if (f->maybe_null()) {
-            if (stoolap_rows_column_is_null(scan_.get(),
-                                            static_cast<int32_t>(col))) {
-                f->set_null();
-                continue;
-            }
-            f->set_notnull();
-        }
-        const int32_t c = static_cast<int32_t>(col);
-        switch (f->real_type()) {
-            case MYSQL_TYPE_TINY:
-            case MYSQL_TYPE_SHORT:
-            case MYSQL_TYPE_LONG:
-            case MYSQL_TYPE_LONGLONG:
-            case MYSQL_TYPE_INT24:
-            case MYSQL_TYPE_YEAR:
-            case MYSQL_TYPE_BIT:
-            case MYSQL_TYPE_DATE:
-            case MYSQL_TYPE_NEWDATE:
-            case MYSQL_TYPE_TIME:
-            case MYSQL_TYPE_TIME2:
-            case MYSQL_TYPE_DATETIME:
-            case MYSQL_TYPE_DATETIME2:
-            case MYSQL_TYPE_TIMESTAMP:
-            case MYSQL_TYPE_TIMESTAMP2:
-            case MYSQL_TYPE_ENUM:
-            case MYSQL_TYPE_SET:
-                // INTEGER columns; store_int decodes by the field's type.
-                stoolap_mariadb::store_int(
-                    f, stoolap_rows_column_int64(scan_.get(), c));
-                break;
-            case MYSQL_TYPE_FLOAT:
-            case MYSQL_TYPE_DOUBLE:
-                f->store(stoolap_rows_column_double(scan_.get(), c));
-                break;
-            case MYSQL_TYPE_VARCHAR:
-            case MYSQL_TYPE_VAR_STRING:
-            case MYSQL_TYPE_STRING:
-            case MYSQL_TYPE_NEWDECIMAL:
-            case MYSQL_TYPE_TINY_BLOB:
-            case MYSQL_TYPE_BLOB:
-            case MYSQL_TYPE_MEDIUM_BLOB:
-            case MYSQL_TYPE_LONG_BLOB: {
-                int64_t len = 0;
-                const char* s = stoolap_rows_column_text(scan_.get(), c, &len);
-                if (s) {
-                    stoolap_mariadb::store_text(f, s, static_cast<size_t>(len));
-                } else if (f->maybe_null()) {
-                    f->set_null();
-                }
-                break;
-            }
-            default:
-                err = HA_ERR_UNSUPPORTED;
-                goto done;
-        }
-    }
-
-done:
-    move_fields(table, -row_diff);
-    return err;
+    return HA_ERR_END_OF_FILE;
 }
 
 int ha_stoolap::rnd_pos(uchar* buf, uchar* pos) {
-    if (pos[0]) {
+    if (!pos[0]) {
+        // position() had no row id for it (see there).
+        my_printf_error(ER_GET_ERRMSG,
+                        "stoolap: re-read by position of a row with no row id",
+                        MYF(0));
+        return HA_ERR_UNSUPPORTED;
+    }
+    {
         // Re-read the row by its id.
         int64_t id;
         std::memcpy(&id, pos + 1, sizeof(id));
@@ -2523,20 +2350,6 @@ int ha_stoolap::rnd_pos(uchar* buf, uchar* pos) {
         const int rc = rnd_next(buf);
         return rc == HA_ERR_END_OF_FILE ? HA_ERR_RECORD_DELETED : rc;
     }
-    // BLOB hazard: a BLOB Field's in-record bytes are (length, ptr) where
-    // ptr is owned by the prior read's value-store and overwritten by the
-    // next one. Restoring ref bytes verbatim resurrects a freed pointer.
-    if (has_blob_field_) {
-        my_printf_error(ER_GET_ERRMSG,
-                        "stoolap: rnd_pos / re-read by position is not "
-                        "supported on tables with BLOB/TEXT columns "
-                        "(would resurrect freed payload pointer)",
-                        MYF(0));
-        return HA_ERR_UNSUPPORTED;
-    }
-    std::memcpy(buf, pos + 9, table->s->reclength);
-    cur_row_id_valid_ = false;
-    return 0;
 }
 
 // The row id of the row in `record` when the last read gave none: a
@@ -2560,19 +2373,13 @@ bool ha_stoolap::key_row_id(const uchar* record, int64_t* id) {
 }
 
 void ha_stoolap::position(const uchar* record) {
-    // A row is named by its row id, from the read or else from its key; a
-    // row with neither keeps its record. A row id alone names the row:
-    // the rest stays zero, so cmp_ref() finds two positions of one row
-    // equal.
+    // A row is named by its row id: the last read's, or else its key's.
+    // Every read gives one, so the else is a row MariaDB positions with no
+    // read before it, which rnd_pos() refuses (flag 0).
     int64_t id = cur_row_id_;
-    if (cur_row_id_valid_ || key_row_id(record, &id)) {
-        ref[0] = 1;
-        std::memcpy(ref + 1, &id, sizeof(id));
-        std::memset(ref + 9, 0, table->s->reclength);
-        return;
-    }
-    std::memset(ref, 0, 9);
-    std::memcpy(ref + 9, record, table->s->reclength);
+    const bool known = cur_row_id_valid_ || key_row_id(record, &id);
+    ref[0] = known ? 1 : 0;
+    std::memcpy(ref + 1, &id, sizeof(id));
 }
 
 // Whether an exact-lookup key part must be filtered by MariaDB rather

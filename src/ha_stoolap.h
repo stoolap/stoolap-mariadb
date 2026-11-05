@@ -136,13 +136,10 @@ private:
     // from racing the global executor / error buffer.
     StoolapDB* ddl_db();
 
-    // Streaming SQL result (read_range_first's filtered ranges).
-    stoolap_mariadb::RowsPtr scan_;
-
-    // Direct read (stoolap_read) for rnd_init and index_read_map: rnd_next
-    // parses the cursor's current packed chunk, which the cursor owns,
-    // and fetches the next when it runs out. Chunks start small when the
-    // statement has a LIMIT and grow.
+    // Every read is a direct read (stoolap_read): rnd_next parses the
+    // cursor's current packed chunk, which the cursor owns, and fetches the
+    // next when it runs out. Chunks start small when the statement has a
+    // LIMIT and grow.
     stoolap_mariadb::CursorPtr cursor_;
     uint32_t cursor_chunk_ = 0;
     int open_read(const StoolapCond* conds, int32_t nconds,
@@ -154,7 +151,7 @@ private:
     size_t pkt_len_ = 0;
     // stoolap's row id of the row the last read returned, which
     // update_row / delete_row / position name it by. Not valid after a
-    // streaming SQL read, which has none.
+    // write.
     int64_t cur_row_id_ = 0;
     bool cur_row_id_valid_ = false;
     // Direct writes; -1 for a table a foreign key names (write via SQL).
@@ -167,14 +164,12 @@ private:
     size_t scan_buf_pos_ = 0;
     uint32_t scan_buf_cols_ = 0;
     uint32_t scan_buf_rows_left_ = 0;
-    // Cell -> field map (inverse of scan_proj_); avoids per-row scan_proj_ lookup.
+    // Cell -> field map of the read's columns.
     std::vector<int> scan_buf_cell_to_field_;
 
-    // Centralized reset: rnd_next prefers the cursor over scan_, so a
-    // stale cursor left over from a prior read would silently shadow a
-    // fresh stream. Every scan entry point routes through here.
+    // Centralized reset: a stale cursor left over from a prior read would
+    // shadow a fresh one. Every scan entry point routes through here.
     void reset_scan_state() {
-        scan_.reset();
         cursor_.reset();
         pkt_ = nullptr;
         pkt_len_ = 0;
@@ -190,11 +185,6 @@ private:
     // get_dup_key() resets errkey then calls info(HA_STATUS_ERRKEY); we
     // stash the most recent dup key here. Reset to MAX_KEY on each write.
     uint last_dup_key_ = MAX_KEY;
-
-    // SELECT-list builder. Projects read_set | write_set; rnd_next maps
-    // back via scan_proj_. Empty bitmaps collapse to a literal sentinel
-    // (one row per stoolap row, minimum FFI).
-    std::string build_scan_columns();
 
     // Sticky from index_init: false lets index_read_map skip ORDER BY.
     bool index_sorted_ = false;
@@ -219,27 +209,17 @@ private:
     ha_rkey_function range_start_flag_ = HA_READ_KEY_EXACT;
     bool range_has_start_ = false;
 
-    // BLOB/TEXT present? rnd_pos refuses (BLOB in-record bytes are
-    // (len, ptr); ptr references prior-rnd_next's value-store).
-    bool has_blob_field_ = false;
-
     // pre_direct_*_rows ran the modify and stashed the count.
     bool direct_modify_in_pre_ = false;
     ha_rows direct_modify_affected_pre_ = 0;
 
-    // Field index -> stoolap result-cell position, or -1 if unprojected.
-    std::vector<int> scan_proj_;
-    // read_set | write_set words scan_proj_ was last built from (see
-    // projection_words); empty when built without bitmaps.
-    std::vector<uint32_t> scan_proj_cols_;
-    // The direct read's projection: scan_proj_ and the cells' columns,
-    // rebuilt only when read_set | write_set changes (a join probes the
-    // same columns once per outer row).
+    // The direct read's projection, the columns of its cells, rebuilt
+    // only when read_set | write_set changes (a join probes the same
+    // columns once per outer row).
     void refresh_projection();
     std::vector<uint32_t> proj_words_scratch_;
     std::vector<uint32_t> read_cols_words_;
     std::vector<int32_t> read_cols_;
-    std::vector<uint32_t> projection_words() const;
 
     // index_read_map's key conditions and ORDER BY columns, kept to reuse
     // their storage across the probes of a join; ir_text_ holds the text

@@ -229,18 +229,6 @@ int32_t stoolap_exec_params(
  */
 int32_t stoolap_query(StoolapDB* db, const char* sql, StoolapRows** out_rows);
 
-/**
- * Execute a query with positional parameters.
- * On success, *out_rows must be closed with stoolap_rows_close().
- */
-int32_t stoolap_query_params(
-    StoolapDB* db,
-    const char* sql,
-    const StoolapValue* params,
-    int32_t params_len,
-    StoolapRows** out_rows
-);
-
 /* =========================================================================
  * Prepared statements
  * ========================================================================= */
@@ -311,15 +299,6 @@ int32_t stoolap_tx_exec_params(
 
 /** Query within a transaction (no parameters). */
 int32_t stoolap_tx_query(StoolapTx* tx, const char* sql, StoolapRows** out_rows);
-
-/** Query within a transaction (with parameters). */
-int32_t stoolap_tx_query_params(
-    StoolapTx* tx,
-    const char* sql,
-    const StoolapValue* params,
-    int32_t params_len,
-    StoolapRows** out_rows
-);
 
 /**
  * Execute a prepared statement within a transaction (with parameters).
@@ -490,15 +469,12 @@ void stoolap_cursor_close(StoolapCursor* cursor);
  * Advance to the next row.
  * @return STOOLAP_ROW if a row is available.
  *         STOOLAP_DONE when exhausted.
- *         STOOLAP_ERROR on error (check stoolap_rows_errmsg).
+ *         STOOLAP_ERROR on error.
  */
 int32_t stoolap_rows_next(StoolapRows* rows);
 
 /** Get an integer value. Returns 0 if NULL or not convertible. */
 int64_t stoolap_rows_column_int64(const StoolapRows* rows, int32_t index);
-
-/** Get a float value. Returns 0.0 if NULL or not convertible. */
-double stoolap_rows_column_double(const StoolapRows* rows, int32_t index);
 
 /**
  * Get a text value from the current row.
@@ -520,9 +496,6 @@ int32_t stoolap_rows_column_is_null(const StoolapRows* rows, int32_t index);
  * Must be called even after STOOLAP_DONE.
  */
 void stoolap_rows_close(StoolapRows* rows);
-
-/** Get the last error message for a rows handle. */
-const char* stoolap_rows_errmsg(const StoolapRows* rows);
 
 /* =========================================================================
  * Bulk fetch
@@ -552,7 +525,7 @@ const char* stoolap_rows_errmsg(const StoolapRows* rows);
  * byte length.  Caller MUST free with stoolap_buffer_free().
  * The rows handle's data is consumed; call stoolap_rows_close() afterward.
  * A runtime error that ends the result early returns STOOLAP_ERROR and no
- * buffer; read it with stoolap_rows_errmsg().
+ * buffer.
  */
 int32_t stoolap_rows_fetch_all(
     StoolapRows* rows,
