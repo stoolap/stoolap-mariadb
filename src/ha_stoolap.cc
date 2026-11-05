@@ -2274,7 +2274,8 @@ void ha_stoolap::refresh_projection() {
 
 // Opens a direct read of the projected columns and loads its first chunk.
 int ha_stoolap::open_read(const StoolapCond* conds, int32_t nconds,
-                          const int32_t* order, int32_t norder, bool desc) {
+                          const int32_t* order, int32_t norder, bool desc,
+                          uint32_t first_chunk) {
     refresh_projection();
     const uint fields = table->s->fields;
 
@@ -2291,7 +2292,9 @@ int ha_stoolap::open_read(const StoolapCond* conds, int32_t nconds,
         return report_stoolap_error(verr);
     }
     cursor_.reset(cur);
-    cursor_chunk_ = stoolap_thd_has_explicit_limit(ha_thd()) ? 64 : 1024;
+    cursor_chunk_ = first_chunk                                ? first_chunk
+                    : stoolap_thd_has_explicit_limit(ha_thd()) ? 64
+                                                               : 1024;
     stoolap_mariadb::g_stats.buffered_scans.fetch_add(
         1, std::memory_order_relaxed);
     return next_chunk();
@@ -2809,63 +2812,33 @@ int ha_stoolap::index_next(uchar* buf) {
 int ha_stoolap::index_first(uchar* buf) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     if (active_index >= table->s->keys) return HA_ERR_INTERNAL_ERROR;
-    reset_scan_state();
-
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
-    sql += " ORDER BY ";
-    KEY& ki = table->key_info[active_index];
-    for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
-        if (i) sql += ", ";
-        Field* f = ki.key_part[i].field;
-        sql += quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length));
-    }
-    // No LIMIT 1: besides MIN probes, MariaDB runs ordered full index
-    // scans (UPDATE/DELETE ... ORDER BY pk LIMIT n) as index_first then
-    // index_next, which reads on from this stream. (index_last stays a
-    // one-row probe: without HA_READ_PREV nothing scans backwards.)
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: index_first SELECT failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    scan_.reset(rows);
-    int next_rc = rnd_next(buf);
-    return (next_rc == HA_ERR_END_OF_FILE) ? HA_ERR_KEY_NOT_FOUND : next_rc;
+    return index_end_read(buf, false);
 }
 
 int ha_stoolap::index_last(uchar* buf) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     if (active_index >= table->s->keys) return HA_ERR_INTERNAL_ERROR;
-    reset_scan_state();
+    return index_end_read(buf, true);
+}
 
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
-    sql += " ORDER BY ";
+// The whole table in the active index's order, from its first row (or
+// its last, `desc`). Besides MIN / MAX probes, which read one row and so
+// start with a one-row chunk, MariaDB runs ordered full index scans
+// (UPDATE / DELETE ... ORDER BY pk LIMIT n) as index_first then
+// index_next, which reads on. (Nothing scans backwards: no HA_READ_PREV.)
+int ha_stoolap::index_end_read(uchar* buf, bool desc) {
+    reset_scan_state();
     KEY& ki = table->key_info[active_index];
-    for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
-        if (i) sql += ", ";
-        Field* f = ki.key_part[i].field;
-        sql += quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length));
-        sql += " DESC";
-    }
-    sql += " LIMIT 1";
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    int rc = query_via(ctx, db_raw(), sql.c_str(), &rows);
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: index_last SELECT failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    scan_.reset(rows);
-    int next_rc = rnd_next(buf);
-    return (next_rc == HA_ERR_END_OF_FILE) ? HA_ERR_KEY_NOT_FOUND : next_rc;
+    ir_order_.clear();
+    for (uint i = 0; i < ki.user_defined_key_parts; ++i)
+        ir_order_.push_back(
+            static_cast<int32_t>(ki.key_part[i].field->field_index));
+    if (int err = open_read(nullptr, 0, ir_order_.data(),
+                            static_cast<int32_t>(ir_order_.size()), desc,
+                            /*first_chunk=*/1))
+        return err;
+    const int rc = rnd_next(buf);
+    return rc == HA_ERR_END_OF_FILE ? HA_ERR_KEY_NOT_FOUND : rc;
 }
 
 int ha_stoolap::read_range_first(const key_range* start_key,

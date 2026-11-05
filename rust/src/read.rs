@@ -13,12 +13,15 @@
 //! with MariaDB's fields in field order and never alters one in place.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use stoolap::core::{Error, Operator, Result, Row, Value};
 use stoolap::storage::expression::{
     AndExpr, ComparisonExpr, ConstBoolExpr, Expression, NullCheckExpr, OrExpr,
 };
 use stoolap::storage::traits::{ScanAccess, Scanner, Table};
+
+use crate::session::Session;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CondOp {
@@ -61,6 +64,86 @@ pub struct ReadSpec<'a> {
 enum Source {
     Scan(Box<dyn Scanner>),
     Sorted(std::vec::IntoIter<(i64, Row)>),
+    Paged(Pager),
+}
+
+/// A read of a whole table in the order of one indexed column, taken from
+/// the index a page at a time: a MIN / MAX probe reads one short page
+struct Pager {
+    session: Arc<Session>,
+    table: String,
+    column: usize,
+    desc: bool,
+    /// Rows taken so far, where the next page starts
+    offset: usize,
+    page: usize,
+    rows: std::vec::IntoIter<(i64, Row)>,
+    done: bool,
+}
+
+impl Pager {
+    /// Loads the next page; false at the end
+    fn fill(&mut self) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        let (column, asc, page, offset) = (self.column, !self.desc, self.page, self.offset);
+        let got = self.session.with_table(&self.table, |t| {
+            let name = t.schema().columns[column].name.clone();
+            // MariaDB's order: NULL first ascending, last descending
+            t.collect_rows_ordered_by_index(&name, asc, asc, page, offset)
+        })?;
+        let rows: Vec<(i64, Row)> = match got {
+            Some(rows) => {
+                let rows: Vec<(i64, Row)> = rows.into_iter().collect();
+                self.done = rows.len() < page;
+                rows
+            }
+            None => {
+                // The index cannot answer now (the transaction wrote the
+                // table): the rest from a sorted scan
+                self.done = true;
+                let desc = self.desc;
+                let all = self.session.with_table(&self.table, |t| {
+                    sorted_rows(t.scan(&[], None)?, &[column], desc)
+                })?;
+                all.into_iter().skip(offset).collect()
+            }
+        };
+        self.offset += rows.len();
+        self.page = (page * 4).min(1 << 16);
+        let more = !rows.is_empty();
+        self.rows = rows.into_iter();
+        Ok(more)
+    }
+}
+
+/// Every row `scanner` gives, sorted by `order` (NULL first, all reversed
+/// when `desc`)
+fn sorted_rows(
+    mut scanner: Box<dyn Scanner>,
+    order: &[usize],
+    desc: bool,
+) -> Result<Vec<(i64, Row)>> {
+    let mut rows = Vec::new();
+    while scanner.next() {
+        // take_row_with_id() gives 0 for the id on MVCC scanners
+        let id = scanner.current_row_id();
+        rows.push((id, scanner.take_row()));
+    }
+    if let Some(e) = scanner.err() {
+        return Err(e.clone());
+    }
+    // Stable, and linear on rows the index already gave in order
+    rows.sort_by(|a, b| {
+        let o = compare_by(&a.1, &b.1, order);
+        if desc {
+            o.reverse()
+        } else {
+            o
+        }
+    });
+    Ok(rows)
 }
 
 /// The rows of a read, handed out in chunks
@@ -186,27 +269,7 @@ impl Cursor {
         let source = if spec.order.is_empty() {
             Source::Scan(scanner)
         } else {
-            let mut scanner = scanner;
-            let mut rows = Vec::new();
-            while scanner.next() {
-                // take_row_with_id() gives 0 for the id on MVCC scanners
-                let id = scanner.current_row_id();
-                rows.push((id, scanner.take_row()));
-            }
-            if let Some(e) = scanner.err() {
-                return Err(e.clone());
-            }
-            // Stable, and linear on rows the index already gave in order
-            let (order, desc) = (spec.order, spec.desc);
-            rows.sort_by(|a, b| {
-                let o = compare_by(&a.1, &b.1, order);
-                if desc {
-                    o.reverse()
-                } else {
-                    o
-                }
-            });
-            Source::Sorted(rows.into_iter())
+            Source::Sorted(sorted_rows(scanner, spec.order, spec.desc)?.into_iter())
         };
         Ok(Cursor {
             source,
@@ -216,6 +279,39 @@ impl Cursor {
 
     pub fn column_count(&self) -> usize {
         self.columns.len()
+    }
+
+    /// A read of `table` with no condition, ordered by one column: from the
+    /// column's index a page at a time when it has one, else as `open`
+    pub fn ordered(session: &Arc<Session>, table: &str, spec: ReadSpec<'_>) -> Result<Cursor> {
+        if !spec.conds.is_empty() || spec.order.len() != 1 {
+            return session.with_table(table, |t| Cursor::open(t, spec));
+        }
+        let column = spec.order[0];
+        let indexed = session.with_table(table, |t| {
+            check_columns(t, spec.table_columns)?;
+            if spec.columns.iter().any(|&c| c >= spec.table_columns) {
+                return Err(Error::internal("column out of range"));
+            }
+            let name = &t.schema().columns[column].name;
+            Ok(t.schema().pk_column_index() == Some(column) || t.has_index_on_column(name))
+        })?;
+        if !indexed {
+            return session.with_table(table, |t| Cursor::open(t, spec));
+        }
+        Ok(Cursor {
+            source: Source::Paged(Pager {
+                session: Arc::clone(session),
+                table: table.to_string(),
+                column,
+                desc: spec.desc,
+                offset: 0,
+                page: 16,
+                rows: Vec::new().into_iter(),
+                done: false,
+            }),
+            columns: spec.columns.to_vec(),
+        })
     }
 
     /// Calls `emit` with each of up to `max` rows, its row id and the
@@ -241,6 +337,18 @@ impl Cursor {
             Source::Sorted(rows) => {
                 while n < max {
                     let Some((id, row)) = rows.next() else { break };
+                    emit(id, &row, &self.columns)?;
+                    n += 1;
+                }
+            }
+            Source::Paged(pager) => {
+                while n < max {
+                    let Some((id, row)) = pager.rows.next() else {
+                        if pager.fill()? {
+                            continue;
+                        }
+                        break;
+                    };
                     emit(id, &row, &self.columns)?;
                     n += 1;
                 }

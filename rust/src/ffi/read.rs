@@ -170,7 +170,7 @@ pub unsafe extern "C" fn stoolap_read(
             order: &order,
             desc: desc != 0,
         };
-        handle.session.with_table(name, |t| Cursor::open(t, spec))
+        Cursor::ordered(&handle.session, name, spec)
     }));
     finish_open(handle, result, out, "stoolap_read")
 }
