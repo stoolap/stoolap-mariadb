@@ -6,16 +6,18 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-//! A row written straight into a MariaDB record buffer. The plugin
-//! describes each field it reads once (where it sits in the record, its
-//! NULL bit, how it is stored); the common kinds are written here and the
-//! rest are handed back, one value at a time, to the plugin's own store.
+//! Rows straight between stoolap and a MariaDB record buffer. The plugin
+//! describes each field once (where it sits in the record, its NULL bit,
+//! how it is stored); the common kinds are read and written here, the rest
+//! handed back, one value at a time, to the plugin's own store and encode.
 
 use std::os::raw::c_void;
 
 use stoolap::core::{Error, Result, Row, Value};
 
 use crate::ffi::rows::{reset_packed, write_value};
+use crate::ffi::types::StoolapValue;
+use crate::ffi::value::ffi_value_to_rust;
 
 /// Handed to the plugin's store callback
 pub const STOOLAP_FIELD_STORE: i32 = 0;
@@ -45,14 +47,32 @@ pub struct StoolapField {
     pub length: u32,
     pub max_chars: u32,
     pub is_unsigned: u32,
-    /// The field's index, for the store callback
+    /// The field's index, for the store and encode callbacks
     pub field: i32,
+    /// The bytes it takes in the record
+    pub pack_length: u32,
 }
 
 /// Stores the cell `cell` (the packed format, one value) in
 /// field `field`; 0 on success
 pub type StoreFn =
     unsafe extern "C" fn(ctx: *mut c_void, field: i32, cell: *const u8, len: usize) -> i32;
+
+/// Encodes field `field` of `record` into `out`; 0 on success, else the
+/// write fails
+pub type EncodeFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    field: i32,
+    record: *const u8,
+    out: *mut StoolapValue,
+) -> i32;
+
+/// The record a write reads, and the callback for the kinds read elsewhere
+pub struct RecordIn {
+    pub record: *const u8,
+    pub encode: Option<EncodeFn>,
+    pub ctx: *mut c_void,
+}
 
 /// Where a read writes its rows
 pub struct Sink {
@@ -174,6 +194,100 @@ pub unsafe fn write_record(
         }
     }
     Ok(())
+}
+
+/// Whether `f` is NULL in `record`
+///
+/// # Safety
+///
+/// `record` must be a record buffer of the layout `f` describes.
+unsafe fn is_null(f: &StoolapField, record: *const u8) -> bool {
+    f.null_mask != 0 && *record.add(f.null_offset as usize) & f.null_mask as u8 != 0
+}
+
+/// `f`'s value in `src`'s record
+///
+/// # Safety
+///
+/// `src.record` must be a record buffer of the layout `f` describes.
+pub unsafe fn read_value(f: &StoolapField, src: &RecordIn) -> Result<Value> {
+    if is_null(f, src.record) {
+        return Ok(Value::null_unknown());
+    }
+    let at = src.record.add(f.offset as usize);
+    let direct = match f.kind {
+        STOOLAP_FIELD_INT => {
+            let n = f.length as usize;
+            let mut b = [0u8; 8];
+            std::ptr::copy_nonoverlapping(at, b.as_mut_ptr(), n);
+            let negative = f.is_unsigned == 0 && n < 8 && b[n - 1] & 0x80 != 0;
+            if negative {
+                b[n..].fill(0xff);
+            }
+            let v = i64::from_le_bytes(b);
+            // BIGINT UNSIGNED past INT64_MAX has no stoolap value: the
+            // plugin refuses it
+            (f.is_unsigned == 0 || n < 8 || v >= 0).then_some(Value::Integer(v))
+        }
+        STOOLAP_FIELD_DOUBLE => {
+            let mut b = [0u8; 8];
+            std::ptr::copy_nonoverlapping(at, b.as_mut_ptr(), 8);
+            Some(Value::Float(f64::from_le_bytes(b)))
+        }
+        STOOLAP_FIELD_FLOAT => {
+            let mut b = [0u8; 4];
+            std::ptr::copy_nonoverlapping(at, b.as_mut_ptr(), 4);
+            Some(Value::Float(f32::from_le_bytes(b) as f64))
+        }
+        STOOLAP_FIELD_VARCHAR => {
+            let prefix = f.length as usize;
+            let mut b = [0u8; 2];
+            std::ptr::copy_nonoverlapping(at, b.as_mut_ptr(), prefix);
+            let n = u16::from_le_bytes(b) as usize;
+            let bytes = std::slice::from_raw_parts(at.add(prefix), n);
+            std::str::from_utf8(bytes).ok().map(Value::text)
+        }
+        _ => None,
+    };
+    if let Some(v) = direct {
+        return Ok(v);
+    }
+    let encode = src
+        .encode
+        .ok_or_else(|| Error::internal("a field needs an encode callback"))?;
+    let mut out: StoolapValue = std::mem::zeroed();
+    let rc = encode(src.ctx, f.field, src.record, &mut out);
+    if rc != 0 {
+        return Err(Error::internal(format!(
+            "encoding field {} failed ({})",
+            f.field, rc
+        )));
+    }
+    // Copies the value out of the plugin's buffers
+    ffi_value_to_rust(&out)
+}
+
+/// The values of `fields` in `src`'s record
+///
+/// # Safety
+///
+/// As `read_value`.
+pub unsafe fn read_values(fields: &[StoolapField], src: &RecordIn) -> Result<Vec<Value>> {
+    fields.iter().map(|f| read_value(f, src)).collect()
+}
+
+/// Whether `f` holds the same bytes in both records
+///
+/// # Safety
+///
+/// Both must be record buffers of the layout `f` describes.
+pub unsafe fn same_in(f: &StoolapField, a: *const u8, b: *const u8) -> bool {
+    if is_null(f, a) != is_null(f, b) {
+        return false;
+    }
+    let n = f.pack_length as usize;
+    std::slice::from_raw_parts(a.add(f.offset as usize), n)
+        == std::slice::from_raw_parts(b.add(f.offset as usize), n)
 }
 
 #[cfg(test)]

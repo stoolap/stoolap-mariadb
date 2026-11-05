@@ -94,7 +94,6 @@ struct StoolapErrorView {
 
 StoolapErrorView fetch_db_error(StoolapDB* db);
 StoolapErrorView fetch_tx_error(StoolapTx* tx);
-StoolapErrorView fetch_stmt_error(StoolapStmt* stmt);
 int report_stoolap_error(const StoolapErrorView& v);
 int raise_commit_error(const char* msg);
 
@@ -266,17 +265,6 @@ static StoolapDB* warm_db(stoolap_mariadb::ThdContext* ctx,
     return fallback;
 }
 
-int exec_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
-             const char* sql, const StoolapValue* params, int32_t nparams,
-             int64_t* affected) {
-    if (ctx && ctx->has_tx()) {
-        return stoolap_tx_exec_params(ctx->tx(), sql, params, nparams,
-                                      affected);
-    }
-    return stoolap_exec_params(warm_db(ctx, fallback), sql, params, nparams,
-                               affected);
-}
-
 int query_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
               const char* sql, StoolapRows** out_rows) {
     if (ctx && ctx->has_tx()) {
@@ -302,18 +290,6 @@ StoolapErrorView fetch_db_error(StoolapDB* db) {
 
 StoolapErrorView fetch_tx_error(StoolapTx* tx) {
     return make_view(tx ? stoolap_tx_errmsg(tx) : nullptr);
-}
-
-StoolapErrorView fetch_stmt_error(StoolapStmt* stmt) {
-    return make_view(stmt ? stoolap_stmt_errmsg(stmt) : nullptr);
-}
-
-// Pick the handle that owns the live error: tx if open, else warm db.
-StoolapErrorView fetch_error_via(stoolap_mariadb::ThdContext* ctx,
-                                 StoolapDB* fallback) {
-    if (ctx && ctx->has_tx()) return fetch_tx_error(ctx->tx());
-    StoolapDB* d = (ctx && ctx->db()) ? ctx->db() : fallback;
-    return fetch_db_error(d);
 }
 
 // MariaDB key behind stoolap's n-th table-level unique constraint, or
@@ -1184,8 +1160,6 @@ int ha_stoolap::close() {
     // Release scan state now -- a large fetch_all buffer would otherwise
     // live until the handler is destroyed.
     reset_scan_state();
-    bulk_insert_stmt_.reset();
-    insert_sql_.clear();
     db_.reset();
     stoolap_table_.clear();
     return 0;
@@ -1367,68 +1341,31 @@ bool extract_field(Field* f, StoolapValue& v, std::string& text_holder) {
     }
 }
 
-/**
- * Build a WHERE clause that uniquely identifies a row in `table->record[0]`
- * (after move_fields has been applied): `WHERE pk1 = $N [AND pk2 = $M ...]`
- * over every PRIMARY KEY part, so stoolap can use its PK (or composite PK)
- * index instead of a full scan. Refuses tables without a PRIMARY KEY.
- *
- * Returns true on success; false if a column type is unsupported or the
- * table has no usable PRIMARY KEY (an error is raised for the latter).
- */
-bool append_where_for_row(std::string& sql, TABLE* table,
-                          std::vector<StoolapValue>& params,
-                          std::vector<std::string>& text_holders,
-                          int& next_param) {
-    // Use only the table->field[] view so the field pointers definitely
-    // match the already-applied move_fields offset (the KEY_PART_INFO::field
-    // alias can point to a separate copy in some MariaDB internal paths).
-    TABLE_SHARE* share = table ? table->s : nullptr;
-    if (share && share->primary_key < share->keys && share->key_info) {
-        const KEY& pk = share->key_info[share->primary_key];
-        std::vector<Field*> parts;
-        for (uint i = 0; pk.key_part && i < pk.user_defined_key_parts; ++i) {
-            uint idx = pk.key_part[i].fieldnr;
-            if (idx > 0) --idx;  // fieldnr is 1-based
-            Field* f = idx < share->fields ? table->field[idx] : nullptr;
-            if (!f || f->is_null()) {
-                parts.clear();
-                break;
-            }
-            parts.push_back(f);
-        }
-        if (!parts.empty()) {
-            sql += " WHERE ";
-            for (size_t i = 0; i < parts.size(); ++i) {
-                Field* f = parts[i];
-                if (i) sql += " AND ";
-                sql += quote_ident(
-                    std::string_view(f->field_name.str, f->field_name.length));
-                sql += " = $";
-                sql += std::to_string(next_param++);
-                StoolapValue v{};
-                text_holders.emplace_back();
-                if (!extract_field(f, v, text_holders.back())) return false;
-                params.push_back(v);
-            }
-            return true;
-        }
+// The encode callback of a write, for a value the record path does not
+// read itself: extract_field, with the fields moved to the record it reads
+// and back to record[0] when the write is done. `holder` keeps the text
+// until the next call.
+struct RecordSource {
+    TABLE* table;
+    const uchar* at;
+    int err = 0;
+    std::string holder;
+    explicit RecordSource(TABLE* t) : table(t), at(t->record[0]) {}
+    ~RecordSource() {
+        move_fields(table, static_cast<my_ptrdiff_t>(table->record[0] - at));
     }
+};
 
-    // No PK + byte-identical duplicates + filesort+LIMIT path: each per-row
-    // UPDATE/DELETE callback would over-mutate every dup. Stoolap has no
-    // rowid for tiebreaking and its UPDATE/DELETE grammar has no LIMIT,
-    // so no byte-side fix exists. Direct DML (cond_push) still works.
-    my_printf_error(ER_GET_ERRMSG,
-                    "stoolap: row-pump UPDATE/DELETE on a table without a "
-                    "PRIMARY KEY is unsupported. Stoolap has no "
-                    "stable row-id, so MariaDB's filesort+LIMIT path could "
-                    "over-mutate byte-identical duplicates. Add a "
-                    "PRIMARY KEY, or rewrite the statement so the WHERE clause "
-                    "alone selects the rows (no ORDER BY/LIMIT) -- direct DML "
-                    "then handles it as one engine-side UPDATE/DELETE.",
-                    MYF(0));
-    return false;
+int32_t encode_cell(void* ctx, int32_t field, const uint8_t* record,
+                    StoolapValue* out) {
+    auto* src = static_cast<RecordSource*>(ctx);
+    if (record != src->at) {
+        move_fields(src->table, static_cast<my_ptrdiff_t>(record - src->at));
+        src->at = record;
+    }
+    if (!extract_field(src->table->field[field], *out, src->holder))
+        src->err = HA_ERR_UNSUPPORTED;
+    return src->err;
 }
 
 }  // namespace
@@ -1438,33 +1375,24 @@ bool append_where_for_row(std::string& sql, TABLE* table,
 // throughput. Stays well under int32_t row_count for the batch FFI.
 static constexpr size_t kBulkFlushRows = 50000;
 
-void ha_stoolap::start_bulk_insert(ha_rows rows, uint /*flags*/) {
+void ha_stoolap::start_bulk_insert(ha_rows /*rows*/, uint /*flags*/) {
     bulk_active_ = false;
     bulk_owns_tx_ = false;
-    bulk_params_.clear();
-    bulk_text_holders_.clear();
-
-    // Auto-commit path uses stoolap_stmt_exec_batch (one tx, one fsync).
-    // Inside an explicit user tx, we still skip per-row parse by preparing
-    // once and looping tx_stmt_exec at flush. end_bulk_insert dispatches.
+    bulk_rows_ = 0;
 
     // INSERT IGNORE / REPLACE / ODKU need per-row HA_ERR_FOUND_DUPP_KEY
-    // callbacks for recovery. stmt_exec_batch is all-or-nothing -- one dup
-    // would silently drop every non-conflicting row.
-    if (stoolap_thd_needs_per_row_dup_handling(ha_thd())) {
-        return;
-    }
+    // callbacks for recovery; a batch is all-or-nothing, and one duplicate
+    // would drop every row with it.
+    if (stoolap_thd_needs_per_row_dup_handling(ha_thd())) return;
 
+    // The rows wait in Rust until the flush.
+    if (!row_buffer_) row_buffer_.reset(stoolap_row_buffer_new());
+    if (!row_buffer_) return;
+    stoolap_row_buffer_clear(row_buffer_.get());
+    StoolapDB* db = get_thd_ctx(ha_thd())->db();
+    bulk_fk_ =
+        db && stoolap_writes_through_sql(db, stoolap_table_.c_str()) == 1;
     bulk_active_ = true;
-
-    // Cap the up-front reserve at the flush threshold so multi-million-row
-    // INSERT...VALUES doesn't allocate the whole batch before flushing.
-    // INSERT...SELECT often passes 0 (unknown source size); use the cap.
-    const ha_rows raw_hint =
-        (rows && rows != HA_POS_ERROR) ? rows : ha_rows{kBulkFlushRows};
-    const ha_rows hint =
-        raw_hint < ha_rows{kBulkFlushRows} ? raw_hint : ha_rows{kBulkFlushRows};
-    bulk_params_.reserve(hint * table->s->fields);
 }
 
 int ha_stoolap::end_bulk_insert() {
@@ -1478,117 +1406,32 @@ int ha_stoolap::end_bulk_insert() {
 }
 
 int ha_stoolap::flush_bulk_buffer(bool partial) {
-    if (bulk_params_.empty()) return 0;
-    if (insert_sql_.empty()) {
-        bulk_params_.clear();
-        bulk_text_holders_.clear();
-        return 0;
-    }
-
-    {
-        const int32_t cols = static_cast<int32_t>(table->s->fields);
-        int64_t affected = 0;
-        const int rc = insert_direct(
-            bulk_params_.data(),
-            static_cast<int32_t>(bulk_params_.size() / cols), &affected);
-        if (rc != -1) {
-            bulk_params_.clear();
-            bulk_text_holders_.clear();
-            if (rc) invalidate_records_cache();
-            return rc;
-        }
-    }
-    // A table a foreign key names: through SQL. In autocommit mode, wrap
-    // the chunked flushes in one outer tx so the whole bulk statement is
-    // atomic (stmt_exec_batch otherwise commits per-chunk).
-    if (partial) {
+    if (bulk_rows_ == 0) return 0;
+    bulk_rows_ = 0;
+    // A table a foreign key names goes through SQL, a flush's rows in one
+    // transaction. Flushed in chunks in autocommit mode, the chunks share
+    // one the statement-end commit ends, so the statement stays atomic.
+    if (partial && bulk_fk_) {
         auto* ctx = get_thd_ctx(ha_thd());
-        if (ctx && !ctx->has_tx()) {
+        if (!ctx->has_tx()) {
             if (ctx->begin() != STOOLAP_OK) {
                 sql_print_error("stoolap: bulk-insert tx open failed: %s",
                                 stoolap_errmsg(ctx->db()));
                 return HA_ERR_GENERIC;
             }
             bulk_owns_tx_ = true;
-            // Some bulk INSERT paths skip external_lock; register here
-            // so commit/rollback callbacks fire at statement end.
-            trans_register_ha(ha_thd(), /*all=*/false, stoolap_hton,
-                              /*flags=*/0);
         }
     }
-
-    // Bulk INSERT prepare cache lives on the THD context (per-connection)
-    // not on the handler -- the handler is created fresh per statement,
-    // so a handler-local cache would re-prepare per batch. The THD-level
-    // cache keyed by INSERT SQL keeps the same StoolapStmt across
-    // statements on the connection, matching the direct stoolap benchmark
-    // pattern of one prepare per hot template.
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapDB* db_for_prepare = (ctx && ctx->db()) ? ctx->db() : db_ensure();
-    StoolapStmt* stmt_raw = ctx ? ctx->bulk_stmt_get(insert_sql_) : nullptr;
-    if (!stmt_raw) {
-        StoolapStmt* fresh = nullptr;
-        if (stoolap_prepare(db_for_prepare, insert_sql_.c_str(), &fresh) !=
-            STOOLAP_OK) {
-            auto verr = fetch_db_error(db_for_prepare);
-            sql_print_error("stoolap: prepare bulk INSERT failed: %s",
-                            *verr.message ? verr.message : "(no detail)");
-            bulk_params_.clear();
-            bulk_text_holders_.clear();
-            return report_stoolap_error(verr);
-        }
-        stmt_raw = fresh;
-        if (ctx) {
-            ctx->bulk_stmt_put(insert_sql_, stoolap_mariadb::StmtPtr(fresh));
-        } else {
-            // No THD ctx (close-time bulk?) -- fall back to handler-local
-            // cache so we at least don't leak the prepared stmt.
-            bulk_insert_stmt_.reset(fresh);
-        }
-    }
-
-    const int32_t cols = static_cast<int32_t>(table->s->fields);
-    const int32_t row_count = static_cast<int32_t>(bulk_params_.size() / cols);
+    StoolapDB* db = direct_write_db();
+    if (!db) return HA_ERR_INTERNAL_ERROR;
     int64_t affected = 0;
-
-    int rc;
-    if (ctx && ctx->has_tx()) {
-        // Inside an explicit user transaction: stoolap_stmt_exec_batch
-        // would start a nested tx, so loop tx_stmt_exec on the prepared
-        // stmt. We still skip the per-row parse cost; what we can't skip
-        // is per-row stoolap-side row-write work, which is the same as
-        // direct write_row would do anyway.
-        for (int32_t r = 0; r < row_count; ++r) {
-            int64_t one = 0;
-            rc = stoolap_tx_stmt_exec(ctx->tx(), stmt_raw,
-                                      bulk_params_.data() + size_t(r) * cols,
-                                      cols, &one);
-            if (rc != STOOLAP_OK) break;
-            affected += one;
-        }
-    } else {
-        rc = stoolap_stmt_exec_batch(db_for_prepare, stmt_raw,
-                                     bulk_params_.data(), cols, row_count,
-                                     &affected);
-    }
-    bulk_params_.clear();
-    bulk_text_holders_.clear();
+    const int rc = stoolap_insert_buffer(db, stoolap_table_.c_str(),
+                                         static_cast<int32_t>(table->s->fields),
+                                         row_buffer_.get(), &affected);
+    cur_row_id_valid_ = false;
     if (rc != STOOLAP_OK) {
-        StoolapErrorView verr = (ctx && ctx->has_tx())
-                                    ? fetch_tx_error(ctx->tx())
-                                    : fetch_stmt_error(stmt_raw);
-        if (!*verr.message) {
-            verr = fetch_db_error(db_for_prepare);
-        }
-        sql_print_error("stoolap: batch INSERT failed: %s",
-                        *verr.message ? verr.message : "(no detail)");
         invalidate_records_cache();
-        int err = report_stoolap_error(verr);
-        if (err == HA_ERR_FOUND_DUPP_KEY) {
-            last_dup_key_ = errkey_from_view(verr, table->s);
-            errkey = last_dup_key_;
-        }
-        return err;
+        return write_error(db, "INSERT");
     }
     apply_count_delta(affected);
     return 0;
@@ -1623,126 +1466,84 @@ int ha_stoolap::write_row(const uchar* buf) {
         }
     }
 
-    // Stoolap's semantic-cache reuses parsed plans by SQL string hash;
-    // no plugin-side StoolapStmt cache needed.
-    if (insert_sql_.empty()) {
-        insert_sql_ = "INSERT INTO ";
-        insert_sql_ += quote_ident(stoolap_table_);
-        insert_sql_ += " VALUES (";
-        for (uint i = 0; i < table->s->fields; ++i) {
-            if (i) insert_sql_.push_back(',');
-            insert_sql_.push_back('$');
-            insert_sql_ += std::to_string(i + 1);
-        }
-        insert_sql_.push_back(')');
-    }
-
-    const my_ptrdiff_t row_diff =
-        static_cast<my_ptrdiff_t>(buf - table->record[0]);
-    move_fields(table, row_diff);
-
-    int err = 0;
-
-    // Buffer for end_bulk_insert / kBulkFlushRows-triggered flush.
+    const auto& fields = insert_fields();
+    RecordSource src(table);
     if (bulk_active_) {
-        const size_t holders_base = bulk_text_holders_.size();
-        const size_t params_base = bulk_params_.size();
-        for (uint i = 0; i < table->s->fields; ++i) {
-            bulk_text_holders_.emplace_back();
-            Field* f = table->field[i];
-            StoolapValue v{};
-            if (!extract_field(f, v, bulk_text_holders_.back())) {
-                err = HA_ERR_UNSUPPORTED;
-                // Roll back this row's partial entries: leaving cols
-                // 0..k-1 in bulk_params_ would misalign every following
-                // row's column indices in the batch.
-                while (bulk_text_holders_.size() > holders_base) {
-                    bulk_text_holders_.pop_back();
-                }
-                if (bulk_params_.size() > params_base) {
-                    bulk_params_.resize(params_base);
-                }
-                goto done;
-            }
-            bulk_params_.push_back(v);
+        const int64_t n = stoolap_row_buffer_add(
+            row_buffer_.get(), fields.data(),
+            static_cast<int32_t>(fields.size()), buf, &encode_cell, &src);
+        if (n < 0) {
+            if (src.err) return src.err;
+            sql_print_error("stoolap: INSERT failed: %s",
+                            stoolap_row_buffer_errmsg(row_buffer_.get()));
+            return HA_ERR_GENERIC;
         }
-        // Eager flush when over threshold.
-        if (bulk_params_.size() >= kBulkFlushRows * table->s->fields) {
+        bulk_rows_ = n;
+        if (static_cast<size_t>(n) < kBulkFlushRows) return 0;
+        const int err = flush_bulk_buffer(/*partial=*/true);
+        if (err && bulk_owns_tx_) {
             auto* ctx = get_thd_ctx(ha_thd());
-            int frc = flush_bulk_buffer(/*partial=*/true);
-            if (frc) {
-                if (bulk_owns_tx_ && ctx && ctx->has_tx()) {
-                    ctx->rollback();
-                    bulk_owns_tx_ = false;
-                }
-                err = frc;
-                goto done;
-            }
+            if (ctx->has_tx()) ctx->rollback();
+            bulk_owns_tx_ = false;
         }
-        goto done;
+        return err;
     }
 
-    {
-        std::vector<StoolapValue> params;
-        std::vector<std::string> text_holders;
-        params.reserve(table->s->fields);
-        text_holders.reserve(table->s->fields);
-
-        for (uint i = 0; i < table->s->fields; ++i) {
-            Field* f = table->field[i];
-            StoolapValue v{};
-            text_holders.emplace_back();
-            if (!extract_field(f, v, text_holders.back())) {
-                err = HA_ERR_UNSUPPORTED;
-                goto done;
-            }
-            params.push_back(v);
-        }
-
-        if (int rc = insert_direct(params.data(), 1, nullptr); rc != -1) {
-            err = rc;
-            goto done;
-        }
-        {
-            auto* ctx = get_thd_ctx(ha_thd());
-            int64_t affected = 0;
-            int rc = exec_via(ctx, db_raw(), insert_sql_.c_str(), params.data(),
-                              static_cast<int32_t>(params.size()), &affected);
-            if (rc != STOOLAP_OK) {
-                auto verr = fetch_error_via(ctx, db_raw());
-                sql_print_error("stoolap: INSERT failed: %s", verr.message);
-                err = report_stoolap_error(verr);
-                if (err == HA_ERR_FOUND_DUPP_KEY) {
-                    last_dup_key_ = errkey_from_view(verr, table_share);
-                    errkey = last_dup_key_;
-                }
-            } else {
-                apply_count_delta(affected);
-            }
-        }
-    }
-
-done:
-    move_fields(table, -row_diff);
-    return err;
-}
-
-// Inserts `nrows` rows of values directly; -1 for a table a foreign key
-// names, which the caller writes through SQL.
-int ha_stoolap::insert_direct(const StoolapValue* values, int32_t nrows,
-                              int64_t* affected_out) {
     StoolapDB* db = direct_write_db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
     int64_t affected = 0;
-    const int rc = stoolap_insert(db, stoolap_table_.c_str(),
-                                  static_cast<int32_t>(table->s->fields),
-                                  values, nrows, &affected);
-    if (rc == STOOLAP_FALLBACK) return -1;
+    const int rc = stoolap_insert_record(
+        db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
+        fields.data(), static_cast<int32_t>(fields.size()), buf, &encode_cell,
+        &src, &affected);
     cur_row_id_valid_ = false;
-    if (rc != STOOLAP_OK) return write_error(db, "INSERT");
+    if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "INSERT");
     apply_count_delta(affected);
-    if (affected_out) *affected_out = affected;
     return 0;
+}
+
+// Every field, as a direct insert reads the record.
+const std::vector<StoolapField>& ha_stoolap::insert_fields() {
+    if (write_fields_.empty())
+        for (uint i = 0; i < table->s->fields; ++i)
+            write_fields_.push_back(stoolap_mariadb::record_field(
+                table, i, static_cast<int32_t>(i)));
+    return write_fields_;
+}
+
+// The fields write_set names, as a direct update reads the records.
+const std::vector<StoolapField>& ha_stoolap::refresh_update_fields() {
+    const uint fields = table->s->fields;
+    std::vector<uint32_t>& w = proj_words_scratch_;
+    w.assign((fields + 31) / 32, 0);
+    for (uint i = 0; i < fields; ++i)
+        if (bitmap_is_set(table->write_set, i))
+            w[i / 32] |= uint32_t(1) << (i % 32);
+    if (w == update_words_ && !update_fields_.empty()) return update_fields_;
+    update_fields_.clear();
+    for (uint i = 0; i < fields; ++i)
+        if (w[i / 32] & (uint32_t(1) << (i % 32)))
+            update_fields_.push_back(stoolap_mariadb::record_field(
+                table, i, static_cast<int32_t>(i)));
+    update_words_ = w;
+    return update_fields_;
+}
+
+// The PRIMARY KEY parts, which name a row a write has no row id for.
+const std::vector<StoolapField>& ha_stoolap::key_fields() {
+    if (!key_fields_built_) {
+        TABLE_SHARE* share = table->s;
+        if (share->primary_key < share->keys) {
+            const KEY& pk = share->key_info[share->primary_key];
+            for (uint i = 0; i < pk.user_defined_key_parts; ++i) {
+                const uint f = pk.key_part[i].fieldnr - 1;
+                key_fields_.push_back(stoolap_mariadb::record_field(
+                    table, f, static_cast<int32_t>(f)));
+            }
+        }
+        key_fields_built_ = true;
+    }
+    return key_fields_;
 }
 
 // The session handle direct writes go through. A write outside an open
@@ -1768,222 +1569,46 @@ int ha_stoolap::write_error(StoolapDB* db, const char* what) {
     return err;
 }
 
-// Updates the row the last read returned, by its row id, setting the
-// written columns whose value changed; -1 for a table a foreign key names.
-int ha_stoolap::update_row_direct(const uchar* old_data,
-                                  const uchar* new_data) {
-    const uint fields = table->s->fields;
-    std::vector<int32_t> cols;
-    std::vector<StoolapValue> vals;
-    std::vector<std::string> holders;
-    holders.reserve(fields);  // the values point into these
-    const my_ptrdiff_t d =
-        static_cast<my_ptrdiff_t>(new_data - table->record[0]);
-    move_fields(table, d);
-    for (uint i = 0; i < fields; ++i) {
-        if (!bitmap_is_set(table->write_set, i)) continue;
-        Field* f = table->field[i];
-        const size_t off = f->ptr - table->record[0];
-        const bool null_match =
-            f->null_ptr
-                ? ((new_data[f->null_ptr - table->record[0]] & f->null_bit) ==
-                   (old_data[f->null_ptr - table->record[0]] & f->null_bit))
-                : true;
-        if (null_match &&
-            std::memcmp(new_data + off, old_data + off, f->pack_length()) == 0)
-            continue;
-        StoolapValue v{};
-        holders.emplace_back();
-        if (!extract_field(f, v, holders.back())) {
-            move_fields(table, -d);
-            return HA_ERR_UNSUPPORTED;
-        }
-        cols.push_back(static_cast<int32_t>(i));
-        vals.push_back(v);
-    }
-    move_fields(table, -d);
-    if (cols.empty()) return 0;
-
-    StoolapDB* db = direct_write_db();
-    if (!db) return HA_ERR_INTERNAL_ERROR;
-    int64_t affected = 0;
-    const int rc = stoolap_update_row(
-        db, stoolap_table_.c_str(), static_cast<int32_t>(fields), cur_row_id_,
-        cols.data(), vals.data(), static_cast<int32_t>(cols.size()), &affected);
-    if (rc == STOOLAP_FALLBACK) return -1;
-    if (rc != STOOLAP_OK) return write_error(db, "UPDATE");
-    return affected == 0 ? HA_ERR_RECORD_DELETED : 0;
-}
-
+// Sets the written columns whose value changed, in the row the last read
+// returned (by its row id), or else the row its PRIMARY KEY names.
 int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     if (!cur_row_id_valid_)
         cur_row_id_valid_ = key_row_id(old_data, &cur_row_id_);
-    if (cur_row_id_valid_) {
-        const int rc = update_row_direct(old_data, new_data);
-        if (rc != -1) return rc;
-    }
-
-    // SET from new_data, WHERE from old_data: UPDATE t SET ... WHERE ... LIMIT 1.
-    std::string sql = "UPDATE ";
-    sql += quote_ident(stoolap_table_);
-    sql += " SET ";
-
-    std::vector<StoolapValue> params;
-    std::vector<std::string> text_holders;
-    params.reserve(table->s->fields * 2);
-    text_holders.reserve(table->s->fields * 2);
-
-    int err = 0;
-    int next_param = 1;
-
-    // SET filters: write_set hint AND bytewise old-vs-new compare. The
-    // compare matters for ODKU/REPLACE which re-supply every column of
-    // the existing row including the PK; stoolap rejects re-assigning a
-    // PK column even with the same value.
-    {
-        const my_ptrdiff_t d =
-            static_cast<my_ptrdiff_t>(new_data - table->record[0]);
-        move_fields(table, d);
-        bool first = true;
-        for (uint i = 0; i < table->s->fields; ++i) {
-            if (!bitmap_is_set(table->write_set, i)) continue;
-            Field* f = table->field[i];
-
-            // Skip columns whose value is unchanged: take pointer arithmetic
-            // relative to record[0] so we can compare old vs new bytes.
-            const uchar* new_p = new_data + (f->ptr - table->record[0]);
-            const uchar* old_p = old_data + (f->ptr - table->record[0]);
-            const uint pack_len = f->pack_length();
-            const bool null_match =
-                f->null_ptr
-                    ? ((new_data[f->null_ptr - table->record[0]] &
-                        f->null_bit) ==
-                       (old_data[f->null_ptr - table->record[0]] & f->null_bit))
-                    : true;
-            if (null_match && std::memcmp(new_p, old_p, pack_len) == 0) {
-                continue;
-            }
-
-            if (!first) sql.push_back(',');
-            first = false;
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-            sql += " = $";
-            sql += std::to_string(next_param++);
-
-            StoolapValue v{};
-            text_holders.emplace_back();
-            if (!extract_field(f, v, text_holders.back())) {
-                err = HA_ERR_UNSUPPORTED;
-                move_fields(table, -d);
-                goto done;
-            }
-            params.push_back(v);
-        }
-        move_fields(table, -d);
-        if (first) {
-            // Nothing changed — UPDATE with empty SET would be invalid SQL,
-            // and there's nothing to write. Treat as success.
-            err = 0;
-            goto done;
-        }
-    }
-
-    // WHERE clause from old_data.
-    {
-        const my_ptrdiff_t d =
-            static_cast<my_ptrdiff_t>(old_data - table->record[0]);
-        move_fields(table, d);
-        bool ok =
-            append_where_for_row(sql, table, params, text_holders, next_param);
-        move_fields(table, -d);
-        if (!ok) {
-            err = HA_ERR_UNSUPPORTED;
-            goto done;
-        }
-    }
-
-    {
-        auto* ctx = get_thd_ctx(ha_thd());
-        int64_t affected = 0;
-        int rc = exec_via(ctx, db_raw(), sql.c_str(), params.data(),
-                          static_cast<int32_t>(params.size()), &affected);
-        if (rc != STOOLAP_OK) {
-            auto verr = fetch_error_via(ctx, db_raw());
-            sql_print_error("stoolap: UPDATE failed: %s", verr.message);
-            err = report_stoolap_error(verr);
-            if (err == HA_ERR_FOUND_DUPP_KEY) {
-                last_dup_key_ = errkey_from_view(verr, table->s);
-                errkey = last_dup_key_;
-            }
-        } else if (affected == 0) {
-            err =
-                HA_ERR_RECORD_DELETED;  // row vanished between scan and update
-        }
-    }
-
-done:
-    return err;
+    const auto& fields = refresh_update_fields();
+    if (fields.empty()) return 0;
+    const auto& keys = key_fields();
+    StoolapDB* db = direct_write_db();
+    if (!db) return HA_ERR_INTERNAL_ERROR;
+    RecordSource src(table);
+    int64_t affected = 0;
+    const int rc = stoolap_update_record(
+        db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
+        cur_row_id_, cur_row_id_valid_, fields.data(),
+        static_cast<int32_t>(fields.size()), keys.data(),
+        static_cast<int32_t>(keys.size()), old_data, new_data, &encode_cell,
+        &src, &affected);
+    if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "UPDATE");
+    return affected == 0 ? HA_ERR_RECORD_DELETED : 0;
 }
 
+// Deletes the row the last read returned (by its row id), or else the row
+// its PRIMARY KEY names.
 int ha_stoolap::delete_row(const uchar* buf) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
-
-    // The row the last read returned, by its row id.
     if (!cur_row_id_valid_) cur_row_id_valid_ = key_row_id(buf, &cur_row_id_);
-    if (cur_row_id_valid_) {
-        StoolapDB* db = direct_write_db();
-        if (!db) return HA_ERR_INTERNAL_ERROR;
-        int64_t affected = 0;
-        const int rc = stoolap_delete_row(db, stoolap_table_.c_str(),
-                                          cur_row_id_, &affected);
-        if (rc == STOOLAP_OK) {
-            if (affected == 0) return HA_ERR_RECORD_DELETED;
-            apply_count_delta(-affected);
-            return 0;
-        }
-        if (rc != STOOLAP_FALLBACK) return write_error(db, "DELETE");
-    }
-
-    const my_ptrdiff_t row_diff =
-        static_cast<my_ptrdiff_t>(buf - table->record[0]);
-    move_fields(table, row_diff);
-
-    std::string sql = "DELETE FROM ";
-    sql += quote_ident(stoolap_table_);
-
-    std::vector<StoolapValue> params;
-    std::vector<std::string> text_holders;
-    params.reserve(table->s->fields);
-    text_holders.reserve(table->s->fields);
-
-    int err = 0;
-    int next_param = 1;
-    if (!append_where_for_row(sql, table, params, text_holders, next_param)) {
-        err = HA_ERR_UNSUPPORTED;
-        goto done;
-    }
-
-    {
-        auto* ctx = get_thd_ctx(ha_thd());
-        int64_t affected = 0;
-        int rc = exec_via(ctx, db_raw(), sql.c_str(), params.data(),
-                          static_cast<int32_t>(params.size()), &affected);
-        if (rc != STOOLAP_OK) {
-            auto verr = fetch_error_via(ctx, db_raw());
-            sql_print_error("stoolap: DELETE failed: %s", verr.message);
-            err = report_stoolap_error(verr);
-        } else if (affected == 0) {
-            err = HA_ERR_RECORD_DELETED;
-        } else {
-            apply_count_delta(-affected);
-        }
-    }
-
-done:
-    move_fields(table, -row_diff);
-    return err;
+    const auto& keys = key_fields();
+    StoolapDB* db = direct_write_db();
+    if (!db) return HA_ERR_INTERNAL_ERROR;
+    RecordSource src(table);
+    int64_t affected = 0;
+    const int rc = stoolap_delete_record(
+        db, stoolap_table_.c_str(), cur_row_id_, cur_row_id_valid_, keys.data(),
+        static_cast<int32_t>(keys.size()), buf, &encode_cell, &src, &affected);
+    if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "DELETE");
+    if (affected == 0) return HA_ERR_RECORD_DELETED;
+    apply_count_delta(-affected);
+    return 0;
 }
 
 int ha_stoolap::analyze(THD* /*thd*/, HA_CHECK_OPT* /*opt*/) {

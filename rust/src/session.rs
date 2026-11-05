@@ -204,6 +204,22 @@ impl Session {
         })
     }
 
+    /// Whether a foreign key names `table` (as child or parent): its
+    /// writes go through SQL, where the executor checks the keys
+    pub fn writes_through_sql(&self, table: &str) -> Result<bool> {
+        use stoolap::storage::traits::Engine;
+        let engine = self.exec.engine();
+        let schema = engine.get_table_schema(table)?;
+        Ok(!schema.foreign_keys.is_empty() || !engine.find_referencing_fks(table).is_empty())
+    }
+
+    /// `table`'s column names, in order
+    pub fn column_names(&self, table: &str) -> Result<Vec<String>> {
+        use stoolap::storage::traits::Engine;
+        let schema = self.exec.engine().get_table_schema(table)?;
+        Ok(schema.columns.iter().map(|c| c.name.to_string()).collect())
+    }
+
     fn with_handle<R>(
         &self,
         cache: &Mutex<FxHashMap<String, Box<dyn Table>>>,

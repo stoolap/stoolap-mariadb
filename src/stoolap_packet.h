@@ -181,6 +181,7 @@ inline StoolapField record_field(TABLE* table, uint index, int32_t column) {
     d.column = column;
     d.field = static_cast<int32_t>(index);
     d.offset = static_cast<uint32_t>(f->ptr - rec);
+    d.pack_length = f->pack_length();
     if (f->null_ptr) {
         d.null_offset = static_cast<uint32_t>(f->null_ptr - rec);
         d.null_mask = f->null_bit;

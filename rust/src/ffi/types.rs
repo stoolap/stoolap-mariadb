@@ -19,8 +19,6 @@ use std::os::raw::c_char;
 
 use std::sync::Arc;
 
-use stoolap::executor::CachedPlanRef;
-
 use crate::session::{Rows, Session};
 
 /// FFI-safe tagged union for passing parameter values across the C boundary.
@@ -67,14 +65,6 @@ pub struct StoolapDB {
     pub(crate) packed: Vec<u8>,
 }
 
-/// Opaque handle wrapping a [`Statement`].
-pub struct StoolapStmt {
-    pub(crate) plan: CachedPlanRef,
-    pub(crate) last_error: Option<CString>,
-    /// Keeps the session it was prepared on, and with it the engine, open
-    pub(crate) _session: Arc<Session>,
-}
-
 /// Opaque handle wrapping a [`Transaction`].
 /// The transaction open in `session`, until commit or rollback consumes
 /// the handle
@@ -103,15 +93,6 @@ impl StoolapDB {
         self.last_error = CString::new(sanitized).ok();
     }
 
-    pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
-    }
-}
-
-impl StoolapStmt {
     pub(crate) fn error_ptr(&self) -> *const c_char {
         match &self.last_error {
             Some(cs) => cs.as_ptr(),

@@ -59,12 +59,6 @@ public:
     void records_adjust(const std::string& table, int64_t delta);
     void invalidate_dirty_records();
 
-    // Connection-scoped prepared-stmt cache for bulk INSERT SQL
-    // templates. The handler is created fresh per-statement so a per-
-    // handler cache would die between batches.
-    StoolapStmt* bulk_stmt_get(const std::string& sql);
-    void bulk_stmt_put(std::string sql, StmtPtr stmt);
-
     // MariaDB doesn't pass the user's SAVEPOINT name to engines; we
     // generate "sp<id>" from a per-connection counter. Stoolap-side
     // savepoints are tx-scoped so id reuse across transactions is safe.
@@ -75,7 +69,6 @@ private:
     DbPtr db_;
     TxPtr tx_;
 
-    std::unordered_map<std::string, StmtPtr> bulk_stmt_cache_;
     std::unordered_set<std::string> dirty_record_tables_;
     std::unordered_map<std::string, uint64_t> record_counts_;
     uint64_t next_savepoint_id_ = 0;
