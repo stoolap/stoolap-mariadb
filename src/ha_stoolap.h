@@ -137,32 +137,32 @@ private:
     StoolapDB* ddl_db();
 
     // Every read is a direct read (stoolap_read) into cursor_, which the
-    // handler keeps for all its reads: rnd_next parses the cursor's current
-    // packed chunk, which the cursor owns, and fetches the next when it
-    // runs out and the read has more (reading_). Chunks start small when
-    // the statement has a LIMIT and grow.
+    // handler keeps for all its reads: rnd_next has the cursor write its
+    // next row into the record (read_fields_ say where each field goes)
+    // while the read has more (reading_).
     stoolap_mariadb::CursorPtr cursor_;
     bool reading_ = false;
-    uint32_t cursor_chunk_ = 0;
+    // Rows the read gave, added to Stoolap_buffered_rows when it ends
+    uint64_t read_rows_ = 0;
+    // The error of the store callback, for the read's failure
+    int store_err_ = 0;
+    static int32_t store_cell(void* ctx, int32_t field, const uint8_t* cell,
+                              size_t len);
     StoolapCursor* read_cursor();
-    int load_chunk(int rc, const uint8_t* buf, int64_t len);
     void end_read() {
         if (reading_) stoolap_cursor_end(cursor_.get());
         reading_ = false;
+        if (read_rows_) {
+            stoolap_mariadb::g_stats.buffered_rows.fetch_add(
+                read_rows_, std::memory_order_relaxed);
+            read_rows_ = 0;
+        }
     }
-    // At the end of a scan: also lets go of a buffer a large chunk grew,
-    // which a handler cached with its TABLE would keep otherwise.
-    void release_read() {
-        reset_scan_state();
-        if (cursor_) stoolap_cursor_end(cursor_.get());
-    }
+    // At the end of a scan.
+    void release_read() { reset_scan_state(); }
     int open_read(const StoolapCond* conds, int32_t nconds,
-                  const int32_t* order, int32_t norder, bool desc,
-                  uint32_t first_chunk = 0);
+                  const int32_t* order, int32_t norder, bool desc);
     int index_end_read(uchar* buf, bool desc);
-    int next_chunk();
-    const uint8_t* pkt_ = nullptr;
-    size_t pkt_len_ = 0;
     // stoolap's row id of the row the last read returned, which
     // update_row / delete_row / position name it by. Not valid after a
     // write.
@@ -175,21 +175,11 @@ private:
     int write_error(StoolapDB* db, const char* what);
     StoolapDB* direct_write_db();
     bool key_row_id(const uchar* record, int64_t* id);
-    size_t scan_buf_pos_ = 0;
-    uint32_t scan_buf_cols_ = 0;
-    uint32_t scan_buf_rows_left_ = 0;
-    // Cell -> field map of the read's columns.
-    std::vector<int> scan_buf_cell_to_field_;
 
     // Centralized reset: a stale cursor left over from a prior read would
     // shadow a fresh one. Every scan entry point routes through here.
     void reset_scan_state() {
         end_read();
-        pkt_ = nullptr;
-        pkt_len_ = 0;
-        scan_buf_pos_ = 0;
-        scan_buf_cols_ = 0;
-        scan_buf_rows_left_ = 0;
         key_filter_active_ = false;
         range_filter_active_ = false;
     }
@@ -227,13 +217,13 @@ private:
     bool direct_modify_in_pre_ = false;
     ha_rows direct_modify_affected_pre_ = 0;
 
-    // The direct read's projection, the columns of its cells, rebuilt
-    // only when read_set | write_set changes (a join probes the same
-    // columns once per outer row).
+    // The direct read's projection, the fields it fills, rebuilt only when
+    // read_set | write_set changes (a join probes the same columns once
+    // per outer row).
     void refresh_projection();
     std::vector<uint32_t> proj_words_scratch_;
     std::vector<uint32_t> read_cols_words_;
-    std::vector<int32_t> read_cols_;
+    std::vector<StoolapField> read_fields_;
 
     // index_read_map's key conditions and ORDER BY columns, kept to reuse
     // their storage across the probes of a join; ir_text_ holds the text

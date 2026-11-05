@@ -16,13 +16,6 @@
 #include "sql_class.h"
 #include "sql_lex.h"
 
-extern "C" int stoolap_thd_has_explicit_limit(THD* thd) {
-    if (!thd || !thd->lex) return 0;
-    SELECT_LEX* sel = thd->lex->first_select_lex();
-    if (!sel) return 0;
-    return sel->limit_params.explicit_limit ? 1 : 0;
-}
-
 extern "C" int stoolap_thd_is_update_or_delete(THD* thd) {
     if (!thd || !thd->lex) return 0;
     const int cmd = thd->lex->sql_command;

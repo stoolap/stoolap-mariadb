@@ -167,6 +167,45 @@ inline bool encode_field(Field* f, StoolapValue& v, std::string& holder) {
     return false;  // PLAIN types are written by the caller
 }
 
+// Reader side: how stoolap_cursor_next writes `f` into the record. The
+// kinds it writes itself are the ones whose record bytes the value gives
+// as they are; the rest (dates, ENUM, DECIMAL, BLOB, ...) go through
+// Field::store, from the store callback.
+inline void describe_field(Field* f, StoolapField* d) {
+    d->kind = STOOLAP_FIELD_STORE;
+    switch (f->real_type()) {
+        case MYSQL_TYPE_TINY:
+        case MYSQL_TYPE_SHORT:
+        case MYSQL_TYPE_INT24:
+        case MYSQL_TYPE_LONG:
+        case MYSQL_TYPE_LONGLONG:
+            d->kind = STOOLAP_FIELD_INT;
+            d->length = f->pack_length();
+            d->is_unsigned = f->is_unsigned();
+            return;
+        case MYSQL_TYPE_DOUBLE:
+        case MYSQL_TYPE_FLOAT:
+            // Fixed decimals round and UNSIGNED clamps, in Field::store.
+            if (f->decimals() >= NOT_FIXED_DEC && !f->is_unsigned())
+                d->kind = f->real_type() == MYSQL_TYPE_DOUBLE
+                              ? STOOLAP_FIELD_DOUBLE
+                              : STOOLAP_FIELD_FLOAT;
+            return;
+        case MYSQL_TYPE_VARCHAR:
+            // A COMPRESSED one reports VARCHAR too but stores its own
+            // header.
+            if (!f->compression_method() &&
+                f->charset()->cset == my_charset_utf8mb4_bin.cset) {
+                d->kind = STOOLAP_FIELD_VARCHAR;
+                d->length = static_cast<Field_varstring*>(f)->length_bytes;
+                d->max_chars = f->char_length();
+            }
+            return;
+        default:
+            return;
+    }
+}
+
 // Reader side: an INTEGER cell into `f`.
 inline void store_int(Field* f, int64_t v) {
     switch (field_enc(f)) {

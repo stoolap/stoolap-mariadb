@@ -14,7 +14,6 @@ class THD;
 
 // sql_class.h-dependent helpers: live in stoolap_thd_inspect.cc to keep
 // the heavy sql_class/wsrep include chain out of most TUs.
-extern "C" int stoolap_thd_has_explicit_limit(THD* thd);
 extern "C" int stoolap_thd_is_update_or_delete(THD* thd);
 extern "C" int stoolap_thd_needs_per_row_dup_handling(THD* thd);
 

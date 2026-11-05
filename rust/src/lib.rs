@@ -13,5 +13,6 @@
 
 pub mod ffi;
 pub mod read;
+pub mod record;
 pub mod session;
 pub mod write;

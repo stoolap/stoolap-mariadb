@@ -368,12 +368,51 @@ typedef struct StoolapCond {
 
 /**
  * Where a read's rows come out. Keep one and read into it again and
- * again: a key lookup is then one call, with no allocation once its
- * buffer has grown. Errors of its reads go to stoolap_cursor_errmsg().
+ * again. Errors of its reads go to stoolap_cursor_errmsg().
  */
 typedef struct StoolapCursor StoolapCursor;
 
 StoolapCursor* stoolap_cursor_new(void);
+
+/** StoolapField kinds: handed to the store callback */
+#define STOOLAP_FIELD_STORE     0
+/** A little-endian integer of `length` bytes (1, 2, 3, 4 or 8) */
+#define STOOLAP_FIELD_INT       1
+/** An 8-byte DOUBLE with no fixed decimals */
+#define STOOLAP_FIELD_DOUBLE    2
+/** A 4-byte FLOAT with no fixed decimals */
+#define STOOLAP_FIELD_FLOAT     3
+/**
+ * A utf8mb4 VARCHAR, not COMPRESSED: a `length`-byte (1 or 2) length
+ * prefix, then the bytes; a value of at most `max_chars` bytes always fits
+ */
+#define STOOLAP_FIELD_VARCHAR   4
+
+/**
+ * One field a read fills: the stoolap column it reads and where it sits
+ * in the record. A value its kind does not take as it is (and NULL in a
+ * NOT NULL field) goes to the store callback instead.
+ */
+typedef struct StoolapField {
+    int32_t column;
+    int32_t kind;
+    uint32_t offset;
+    /** The NULL bit's byte and mask; mask 0 when NOT NULL */
+    uint32_t null_offset;
+    uint32_t null_mask;
+    uint32_t length;
+    uint32_t max_chars;
+    uint32_t is_unsigned;
+    /** The field's index, passed to the store callback */
+    int32_t field;
+} StoolapField;
+
+/**
+ * Stores one value, `cell` (one cell of the stoolap_rows_fetch_all()
+ * format), in field `field`; returns 0, else the read fails.
+ */
+typedef int32_t (*StoolapStoreFn)(void* ctx, int32_t field,
+                                  const uint8_t* cell, size_t len);
 
 /** stoolap_read() flags: order descending */
 #define STOOLAP_READ_DESC       1
@@ -386,60 +425,51 @@ StoolapCursor* stoolap_cursor_new(void);
 
 /**
  * Open a read of `table` into `cursor`, ending the one it had: the rows
- * meeting every condition, each carrying `columns`, ordered by `order`
+ * meeting every condition, each filling `fields`, ordered by `order`
  * (NULL first, all descending with STOOLAP_READ_DESC in `flags`), or in
  * no set order when `norder` is 0. `table_columns` is the column count
- * MariaDB knows; a table that differs is refused. Packs the first
- * `first_rows` rows and returns as stoolap_cursor_fetch().
+ * MariaDB knows; a table that differs is refused.
  */
 int32_t stoolap_read(
     StoolapDB* db,
     const char* table,
     int32_t table_columns,
-    const int32_t* columns, int32_t ncolumns,
+    const StoolapField* fields, int32_t nfields,
     const StoolapCond* conds, int32_t nconds,
     const int32_t* order, int32_t norder,
     int32_t flags,
-    StoolapCursor* cursor,
-    int32_t first_rows,
-    const uint8_t** out_buf,
-    int64_t* out_len
+    StoolapCursor* cursor
 );
-
-/**
- * Pack the read's next rows, at most `max_rows`, in the
- * stoolap_rows_fetch_all() format with empty column names, each row's id
- * as one more INTEGER cell after its columns. The buffer is the
- * cursor's, valid until its next read, fetch or close. Returns
- * STOOLAP_ROW with at least one row, STOOLAP_DONE at the end,
- * STOOLAP_ERROR. A short chunk is the last and ends the read.
- */
-int32_t stoolap_cursor_fetch(
-    StoolapCursor* cursor,
-    int32_t max_rows,
-    const uint8_t** out_buf,
-    int64_t* out_len
-);
-
-const char* stoolap_cursor_errmsg(const StoolapCursor* cursor);
-
-/**
- * End the cursor's read, if one is open; the cursor stays. Its last chunk
- * is gone, and the buffer with it when a large chunk grew it.
- */
-void stoolap_cursor_end(StoolapCursor* cursor);
 
 /** As stoolap_read(), for the one row `row_id` (no row if not visible). */
 int32_t stoolap_read_row(
     StoolapDB* db,
     const char* table,
     int32_t table_columns,
-    const int32_t* columns, int32_t ncolumns,
+    const StoolapField* fields, int32_t nfields,
     int64_t row_id,
-    StoolapCursor* cursor,
-    const uint8_t** out_buf,
-    int64_t* out_len
+    StoolapCursor* cursor
 );
+
+/**
+ * Write the read's next row into `record`, its id into `row_id`, and 1
+ * into `last` when no row follows it (the read has ended then). Returns
+ * STOOLAP_ROW, STOOLAP_DONE at the end, or STOOLAP_ERROR; both end the
+ * read. A value goes to `store(ctx, ...)` as StoolapField says.
+ */
+int32_t stoolap_cursor_next(
+    StoolapCursor* cursor,
+    uint8_t* record,
+    StoolapStoreFn store,
+    void* ctx,
+    int64_t* row_id,
+    int32_t* last
+);
+
+const char* stoolap_cursor_errmsg(const StoolapCursor* cursor);
+
+/** End the cursor's read, if one is open; the cursor stays. */
+void stoolap_cursor_end(StoolapCursor* cursor);
 
 /**
  * End the statement's direct access, and the transaction it opened
