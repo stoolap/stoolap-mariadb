@@ -956,6 +956,9 @@ INSERT INTO reck VALUES (1);
     h.assert_pushed("record_reads expressions",
                     "SELECT id, t + 1, i - 1, -m, f * 2, d / 2, CONCAT(v, 'x'), "
                     "CHAR_LENGTH(v) FROM recr ORDER BY id")
+    h.assert_pushed("bool_values select list",
+                    "SELECT id, (t + 1 > 1) + 1, (i > 0) * 10, i > 0, (i > 0) = (m > 0) "
+                    "FROM recr ORDER BY id")
     h.assert_pushed_derived("record_reads derived table",
                             "SELECT STRAIGHT_JOIN k.id, x.t, x.d, x.v FROM reck k JOIN "
                             "(SELECT id, t, d, v FROM recr WHERE id > 0) x "
