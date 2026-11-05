@@ -2197,11 +2197,17 @@ int ha_stoolap::open_read(const StoolapCond* conds, int32_t nconds,
     auto* ctx = get_thd_ctx(ha_thd());
     StoolapDB* db = ctx->db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
+    // A statement that sets the primary key moves rows to new ids
+    int32_t flags = desc ? STOOLAP_READ_DESC : 0;
+    const uint pk = table->s->primary_key;
+    if (pk != MAX_KEY &&
+        bitmap_is_set(table->write_set,
+                      table->key_info[pk].key_part[0].fieldnr - 1))
+        flags |= STOOLAP_READ_FIXED;
     StoolapCursor* cur = nullptr;
     if (stoolap_read(db, stoolap_table_.c_str(), static_cast<int32_t>(fields),
                      read_cols_.data(), static_cast<int32_t>(read_cols_.size()),
-                     conds, nconds, order, norder, desc ? 1 : 0,
-                     &cur) != STOOLAP_OK) {
+                     conds, nconds, order, norder, flags, &cur) != STOOLAP_OK) {
         auto verr = fetch_db_error(db);
         sql_print_error("stoolap: read failed: %s", verr.message);
         return report_stoolap_error(verr);

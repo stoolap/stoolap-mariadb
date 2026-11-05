@@ -59,6 +59,9 @@ pub struct ReadSpec<'a> {
     /// Columns to order by, ascending with NULL first unless `desc`
     pub order: &'a [usize],
     pub desc: bool,
+    /// The statement may move rows to new ids: take the rows at open, not
+    /// a page at a time, where a moved row would come back
+    pub fixed: bool,
 }
 
 enum Source {
@@ -324,7 +327,7 @@ impl Cursor {
     /// A read of `table` with no condition, ordered by one column: from the
     /// column's index a page at a time when it has one, else as `open`
     pub fn ordered(session: &Arc<Session>, table: &str, spec: ReadSpec<'_>) -> Result<Cursor> {
-        if !spec.conds.is_empty() || spec.order.len() != 1 {
+        if spec.fixed || !spec.conds.is_empty() || spec.order.len() != 1 {
             return session.with_table(table, |t| Cursor::open(t, spec));
         }
         let column = spec.order[0];

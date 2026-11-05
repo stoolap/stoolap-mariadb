@@ -52,3 +52,16 @@ UPDATE t5 FORCE INDEX (kk) SET v = v + 1 ORDER BY k LIMIT 18;
 SELECT COUNT(*), SUM(v), MAX(v) FROM t5;
 DELETE FROM t5 ORDER BY id DESC LIMIT 17;
 SELECT MIN(id), MAX(id), COUNT(*) FROM t5;
+
+-- A row moved to a new PRIMARY KEY is not read again: the secondary index
+-- MariaDB scans does not hold the key, so it does not buffer the rows.
+CREATE TABLE t6 (id BIGINT NOT NULL PRIMARY KEY, a BIGINT UNSIGNED NOT NULL,
+                 KEY ka (a)) ENGINE={E};
+INSERT INTO t6 WITH RECURSIVE s (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 200)
+  SELECT n, 1 FROM s;
+UPDATE t6 FORCE INDEX (ka) SET id = id + 100000 WHERE a < 9223372036854775808 LIMIT 1000;
+SELECT MIN(id), MAX(id), COUNT(*) FROM t6;
+UPDATE t6 FORCE INDEX (ka) SET id = id + 100000 WHERE a = 1 LIMIT 1000;
+SELECT MIN(id), MAX(id), COUNT(*) FROM t6;
+UPDATE t6 SET id = id + 100000 ORDER BY id DESC LIMIT 150;
+SELECT MIN(id), MAX(id), COUNT(*) FROM t6;

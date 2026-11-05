@@ -20,6 +20,8 @@ use super::types::{StoolapDB, StoolapValue};
 use super::{value, STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
 use crate::read::{Cond, CondOp, Cursor, Node, ReadSpec};
 
+pub const STOOLAP_READ_DESC: i32 = 1;
+pub const STOOLAP_READ_FIXED: i32 = 2;
 pub const STOOLAP_OP_EQ: i32 = 0;
 pub const STOOLAP_OP_GT: i32 = 1;
 pub const STOOLAP_OP_GE: i32 = 2;
@@ -101,8 +103,8 @@ unsafe fn finish_open(
 /// Opens a read of `table`, in the open transaction or else in a read
 /// transaction of the statement's own, which `stoolap_end_statement` ends:
 /// the rows meeting every
-/// condition, each carrying `columns`, ordered by `order` (descending when
-/// `desc`) or in no set order when `norder` is 0.
+/// condition, each carrying `columns`, ordered by `order` (descending with
+/// `STOOLAP_READ_DESC` in `flags`) or in no set order when `norder` is 0.
 ///
 /// # Safety
 ///
@@ -119,7 +121,7 @@ pub unsafe extern "C" fn stoolap_read(
     nconds: i32,
     order: *const i32,
     norder: i32,
-    desc: i32,
+    flags: i32,
     out: *mut *mut StoolapCursor,
 ) -> i32 {
     if out.is_null() {
@@ -168,7 +170,8 @@ pub unsafe extern "C" fn stoolap_read(
             columns: &columns,
             conds: cond_list,
             order: &order,
-            desc: desc != 0,
+            desc: flags & STOOLAP_READ_DESC != 0,
+            fixed: flags & STOOLAP_READ_FIXED != 0,
         };
         Cursor::ordered(&handle.session, name, spec)
     }));

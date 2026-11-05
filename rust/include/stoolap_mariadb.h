@@ -368,12 +368,21 @@ typedef struct StoolapCond {
 
 typedef struct StoolapCursor StoolapCursor;
 
+/** stoolap_read() flags: order descending */
+#define STOOLAP_READ_DESC       1
+/**
+ * stoolap_read() flags: the statement may move rows to new row ids (it
+ * sets the primary key), so the read takes its rows when it opens instead
+ * of a page at a time, where a moved row would come back
+ */
+#define STOOLAP_READ_FIXED      2
+
 /**
  * Open a read of `table`: the rows meeting every condition, each carrying
- * `columns`, ordered by `order` (NULL first, all descending when `desc`),
- * or in no set order when `norder` is 0. `table_columns` is the column
- * count MariaDB knows; a table that differs is refused. Errors go to
- * stoolap_errmsg(db).
+ * `columns`, ordered by `order` (NULL first, all descending with
+ * STOOLAP_READ_DESC in `flags`), or in no set order when `norder` is 0.
+ * `table_columns` is the column count MariaDB knows; a table that differs
+ * is refused. Errors go to stoolap_errmsg(db).
  */
 int32_t stoolap_read(
     StoolapDB* db,
@@ -382,7 +391,7 @@ int32_t stoolap_read(
     const int32_t* columns, int32_t ncolumns,
     const StoolapCond* conds, int32_t nconds,
     const int32_t* order, int32_t norder,
-    int32_t desc,
+    int32_t flags,
     StoolapCursor** out_cursor
 );
 
