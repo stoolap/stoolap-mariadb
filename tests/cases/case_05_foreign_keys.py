@@ -247,6 +247,19 @@ CREATE TABLE vc (code VARCHAR(30) COLLATE utf8mb4_bin,
     h.assert_err("a missing parent named 'still referenced by table'",
                  "INSERT INTO vc VALUES ('still referenced by table')",
                  r"add or update a child row")
+    # A NUL in the key keeps the error's own class: the message the plugin
+    # reads escapes it, and a column naming the detail's separator does
+    # not mislead the wording fallback
+    h.exec_script(f"""
+CREATE TABLE np2 (id INT NOT NULL PRIMARY KEY,
+  code VARCHAR(30) COLLATE utf8mb4_bin UNIQUE) ENGINE={h.engine};
+CREATE TABLE nc2 (`x)' \u2014 y` VARCHAR(30) COLLATE utf8mb4_bin,
+  FOREIGN KEY (`x)' \u2014 y`) REFERENCES np2 (code)) ENGINE={h.engine};
+INSERT INTO np2 VALUES (1, CHAR(0));
+INSERT INTO nc2 VALUES (CHAR(0));
+""")
+    h.assert_err("deleting a parent row with a NUL key is 1451",
+                 "DELETE FROM np2 WHERE id = 1", r"\b1451\b")
     # DROP DATABASE takes its own children with it, though their stoolap
     # names are shortened past its prefix
     longdb = "$" * 36 + "_" * 28

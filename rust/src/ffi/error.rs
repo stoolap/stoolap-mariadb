@@ -28,7 +28,7 @@ thread_local! {
 
 pub(crate) fn set_global_error(msg: &str) {
     THREAD_ERROR.with(|cell| {
-        *cell.borrow_mut() = CString::new(msg.replace('\0', "\\0")).ok();
+        *cell.borrow_mut() = CString::new(error_text(msg)).ok();
     });
 }
 
@@ -95,6 +95,12 @@ fn parent_side(detail: &str) -> bool {
     .any(|p| detail.starts_with(p))
 }
 
+/// An error's message as a handle records it: C text, a NUL as `\0`.
+/// `note_error` keys the class by the same text the plugin reads back.
+pub(crate) fn error_text(msg: &str) -> String {
+    msg.replace('\0', "\\0")
+}
+
 /// Notes `e`, which a handle has just recorded as its message
 pub(crate) fn note_error(e: &Error) {
     let class = match e {
@@ -119,7 +125,7 @@ pub(crate) fn note_error(e: &Error) {
             return;
         }
     };
-    LAST.with(|c| *c.borrow_mut() = Some((e.to_string(), class)));
+    LAST.with(|c| *c.borrow_mut() = Some((error_text(&e.to_string()), class)));
 }
 
 /// The n of stoolap's "unique_<table>_<n>" index

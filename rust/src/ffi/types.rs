@@ -89,8 +89,7 @@ pub struct StoolapRows {
 
 impl StoolapDB {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error = CString::new(super::error::error_text(msg)).ok();
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
@@ -103,8 +102,7 @@ impl StoolapDB {
 
 impl StoolapTx {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error = CString::new(super::error::error_text(msg)).ok();
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
