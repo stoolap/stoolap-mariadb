@@ -63,6 +63,7 @@ unsafe fn write_through(
         }
         Ok(Err(e)) => {
             handle.set_error(&e.to_string());
+            super::error::note_error(&e);
             STOOLAP_ERROR
         }
         Err(_) => {
@@ -141,6 +142,7 @@ pub unsafe extern "C" fn stoolap_writes_through_sql(
         Ok(Ok(fk)) => fk as i32,
         Ok(Err(e)) => {
             handle.set_error(&e.to_string());
+            super::error::note_error(&e);
             STOOLAP_ERROR
         }
         Err(_) => {
@@ -248,7 +250,10 @@ pub unsafe extern "C" fn stoolap_row_buffer_add(
             buf.rows.push(row);
             return buf.rows.len() as i64;
         }
-        Ok(Err(e)) => e.to_string(),
+        Ok(Err(e)) => {
+            super::error::note_error(&e);
+            e.to_string()
+        }
         Err(_) => "panic during stoolap_row_buffer_add".to_string(),
     };
     buf.last_error = CString::new(msg.replace('\0', "\\0")).ok();

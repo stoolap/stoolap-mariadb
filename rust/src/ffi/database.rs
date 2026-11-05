@@ -80,6 +80,7 @@ pub unsafe extern "C" fn stoolap_open(dsn: *const c_char, out_db: *mut *mut Stoo
             }
             Err(e) => {
                 error::set_global_error(&e.to_string());
+                super::error::note_error(&e);
                 STOOLAP_ERROR
             }
         }
@@ -227,6 +228,7 @@ pub unsafe extern "C" fn stoolap_exec(
             }
             Err(e) => {
                 handle.set_error(&e.to_string());
+                super::error::note_error(&e);
                 STOOLAP_ERROR
             }
         }
@@ -286,6 +288,7 @@ pub unsafe extern "C" fn stoolap_exec_params(
             }
             Err(e) => {
                 handle.set_error(&e.to_string());
+                super::error::note_error(&e);
                 STOOLAP_ERROR
             }
         }
@@ -363,6 +366,7 @@ unsafe fn query_params(
             }
             Err(e) => {
                 handle.set_error(&e.to_string());
+                super::error::note_error(&e);
                 STOOLAP_ERROR
             }
         }
@@ -443,6 +447,7 @@ pub unsafe extern "C" fn stoolap_query_params_all(
             }
             Err(e) => {
                 handle.set_error(&e.to_string());
+                super::error::note_error(&e);
                 STOOLAP_ERROR
             }
         }

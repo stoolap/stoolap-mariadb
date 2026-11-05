@@ -592,6 +592,36 @@ void stoolap_rows_close(StoolapRows* rows);
  * Bulk fetch
  * ========================================================================= */
 
+/* =========================================================================
+ * Error classes
+ * ========================================================================= */
+
+/** A wording no class covers (stoolap drift). */
+#define STOOLAP_ERR_UNKNOWN             0
+/** Known, with no MariaDB counterpart: report the text. */
+#define STOOLAP_ERR_GENERIC             1
+#define STOOLAP_ERR_DUP_KEY             2
+#define STOOLAP_ERR_NO_REFERENCED_ROW   3
+#define STOOLAP_ERR_ROW_IS_REFERENCED   4
+/** Retry the statement: a write conflict, a lock, a schema change. */
+#define STOOLAP_ERR_DEADLOCK            5
+#define STOOLAP_ERR_TABLE_EXISTS        6
+#define STOOLAP_ERR_NO_SUCH_TABLE       7
+#define STOOLAP_ERR_UNSUPPORTED         8
+
+/** The key a duplicate names: none, or the PRIMARY KEY. */
+#define STOOLAP_KEY_NONE               -1
+#define STOOLAP_KEY_PRIMARY            -2
+
+/**
+ * The STOOLAP_ERR_* class of the error message `msg`, as any handle's
+ * errmsg gives it; for a duplicate, `key` gets the key it names: a
+ * STOOLAP_KEY_* or the ordinal of the table-level unique constraint in
+ * CREATE TABLE order. An error recorded with its stoolap value is
+ * classed by the value, anything else by its wording. `key` may be NULL.
+ */
+int32_t stoolap_error_class(const char* msg, int32_t* key);
+
 /**
  * The packed format of stoolap_query_params_all() and of the cells a
  * StoolapStoreFn takes (one tag and payload).

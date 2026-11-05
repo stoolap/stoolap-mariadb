@@ -1,5 +1,5 @@
 """Error-mapping smoke test: every known stoolap error class must
-round-trip through map_stoolap_error to the right MariaDB errno.
+round-trip through stoolap_error_class to the right MariaDB errno.
 
 Doubles as a drift detector: SHOW STATUS LIKE 'Stoolap_unmapped_errors'
 must stay at 0 across the whole run. A stoolap upgrade that rewords any
@@ -7,8 +7,9 @@ of these messages will either flip the errno to 1296 (caught by the
 specific assert_errno) or bump the unmapped counter (caught by the
 final assertion).
 
-The pattern table is in src/ha_stoolap.cc::map_stoolap_error; the
-canonical stoolap formats are in ../stoolap/src/core/error.rs.
+The classes are in rust/src/ffi/error.rs (by the error's value where it
+has one, else by its wording); the canonical stoolap formats are in
+../stoolap/src/core/error.rs.
 """
 
 import mysql.connector
@@ -155,6 +156,6 @@ INSERT INTO uq_upd VALUES (1, 10), (2, 20);
         h._pass(f"Stoolap_unmapped_errors unchanged (still {final_unmapped})")
     else:
         h._fail(f"Stoolap_unmapped_errors bumped by {delta}",
-                "stoolap reworded an error class that map_stoolap_error",
+                "stoolap reworded an error class that stoolap_error_class",
                 "no longer recognises -- check stoolap/src/core/error.rs",
-                "vs the pattern table in src/ha_stoolap.cc::map_stoolap_error.")
+                "vs the rules in rust/src/ffi/error.rs.")

@@ -79,6 +79,7 @@ pub unsafe extern "C" fn stoolap_begin_with_isolation(
             }
             Err(e) => {
                 handle.set_error(&e.to_string());
+                super::error::note_error(&e);
                 STOOLAP_ERROR
             }
         }
@@ -110,6 +111,7 @@ unsafe fn on_tx(tx: *mut StoolapTx, what: &str, f: impl FnOnce(&Session) -> Resu
         Ok(Ok(())) => STOOLAP_OK,
         Ok(Err(e)) => {
             handle.set_error(&e.to_string());
+            super::error::note_error(&e);
             STOOLAP_ERROR
         }
         Err(_) => {
@@ -226,6 +228,7 @@ unsafe fn end_tx(tx: *mut StoolapTx, end: impl FnOnce(&Session) -> Result<()>) -
         Ok(Ok(())) => STOOLAP_OK,
         Ok(Err(e)) => {
             super::error::set_global_error(&e.to_string());
+            super::error::note_error(&e);
             STOOLAP_ERROR
         }
         Err(_) => STOOLAP_ERROR,

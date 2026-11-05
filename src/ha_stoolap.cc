@@ -310,135 +310,40 @@ uint unique_key_by_ordinal(TABLE_SHARE* share, uint n) {
     return MAX_KEY;
 }
 
-// The key's columns as stoolap lists them in a UNIQUE error: "a, b".
-std::string key_column_list(const KEY& k) {
-    std::string out;
-    for (uint i = 0; i < k.user_defined_key_parts; ++i) {
-        const Field* f = k.key_part[i].field;
-        if (!f) return std::string();
-        if (i) out += ", ";
-        out.append(f->field_name.str, f->field_name.length);
-    }
-    return out;
-}
-
-// PK dup -> primary key; UNIQUE dup -> the key stoolap reports in
-// "unique constraint failed for index unique_<table>_<n> on column C
-// with value V" (C is "a, b" for a composite key; a composite PRIMARY KEY
-// reports this way too). n pins the key exactly (unique_key_by_ordinal);
-// C must also be that key's whole column list. Table and column names are
-// unquoted and may contain the separators, so every " on column " is
-// tried until one satisfies both.
+// The MariaDB key a duplicate names: the PRIMARY KEY, or the key behind
+// the unique constraint stoolap numbers; else the PRIMARY KEY, or key 0.
 uint errkey_from_view(const StoolapErrorView& v, TABLE_SHARE* share) {
     if (!share) return 0;
-    std::string_view m(v.message);
-    constexpr std::string_view kPrefix =
-        "unique constraint failed for index unique_";
-    constexpr std::string_view kCol = " on column ";
-    constexpr std::string_view kVal = " with value ";
-    if (m.compare(0, kPrefix.size(), kPrefix) == 0) {
-        for (size_t at = m.find(kCol, kPrefix.size());
-             at != std::string_view::npos; at = m.find(kCol, at + 1)) {
-            size_t d = at;
-            while (d > kPrefix.size() &&
-                   std::isdigit(static_cast<unsigned char>(m[d - 1]))) {
-                --d;
-            }
-            if (d == at || at - d > 6 || m[d - 1] != '_') continue;
-            uint n = 0;
-            for (size_t i = d; i < at; ++i)
-                n = n * 10 + (m[i] - '0');
-            const uint key = unique_key_by_ordinal(share, n);
-            if (key == MAX_KEY) continue;
-            const std::string cols = key_column_list(share->key_info[key]);
-            if (cols.empty()) continue;
-            const std::string_view rest = m.substr(at + kCol.size());
-            if (rest.size() >= cols.size() + kVal.size() &&
-                rest.compare(0, cols.size(), cols) == 0 &&
-                rest.compare(cols.size(), kVal.size(), kVal) == 0) {
-                return key;
-            }
-        }
+    int32_t key = STOOLAP_KEY_NONE;
+    stoolap_error_class(v.message, &key);
+    if (key >= 0) {
+        const uint k = unique_key_by_ordinal(share, static_cast<uint>(key));
+        if (k != MAX_KEY) return k;
     }
     if (share->primary_key < share->keys) return share->primary_key;
     return 0;
 }
 
-// `known` is false when no pattern matched: a stoolap wording this table
-// doesn't cover. report_stoolap_error counts those in unmapped_errors.
-struct ErrcodeMap {
-    int ha_err;
-    bool known;
-};
-
-// Source of truth for the strings: ../stoolap/src/core/error.rs.
-ErrcodeMap map_stoolap_error(const char* msg) {
-    std::string_view m(msg ? msg : "");
-
-    // PREFIX anchors at pos 0; CONTAINS finds the needle anywhere
-    // (used for tail markers like the truncate-blocked variant of
-    // "uncommitted changes" that appears as the second clause).
-    enum Anchor : uint8_t { PREFIX, CONTAINS };
-    struct Pattern {
-        std::string_view needle;
-        int ha_err;
-        Anchor anchor;
-    };
-    auto matches = [&](const Pattern& p) {
-        if (p.anchor == PREFIX) {
-            return m.size() >= p.needle.size() &&
-                   m.compare(0, p.needle.size(), p.needle) == 0;
-        }
-        return m.find(p.needle) != std::string_view::npos;
-    };
-
-    // Order: most-specific first. PK/UNIQUE/FK use anchored prefixes
-    // since the FK message contains "does not exist" which would
-    // otherwise route to NO_SUCH_TABLE. HA_ERR_GENERIC rows are known
-    // classes with no MariaDB counterpart (surface as 1296 + text).
-    static constexpr Pattern kTable[] = {
-        {"primary key constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
-        {"unique constraint failed", HA_ERR_FOUND_DUPP_KEY, PREFIX},
-        // Parent side (DELETE / UPDATE of a referenced row): "...
-        // still referenced by table 'C'". The child side ("referenced row
-        // ... does not exist") falls through to NO_REFERENCED_ROW.
-        {"still referenced by table", HA_ERR_ROW_IS_REFERENCED, CONTAINS},
-        {"foreign key constraint violation", HA_ERR_NO_REFERENCED_ROW, PREFIX},
-        // Anchored so future similar wordings don't match by accident.
-        {"not null constraint failed", HA_ERR_GENERIC, PREFIX},
-        {"CHECK constraint failed", HA_ERR_GENERIC, PREFIX},
-        // "table 'T' schema changed; retry the statement" and "a truncate
-        // or drop overtook the statement's view; retry the statement".
-        {"; retry the statement", HA_ERR_LOCK_DEADLOCK, CONTAINS},
-        {"' already exists", HA_ERR_TABLE_EXIST, CONTAINS},
-        // Column / index lookups also end in "' not found"; claim them
-        // before the table/view rule below.
-        {"column '", HA_ERR_GENERIC, PREFIX},
-        {"index '", HA_ERR_GENERIC, PREFIX},
-        {"' not found", HA_ERR_NO_SUCH_TABLE, CONTAINS},
-        // Truncate blocked by an open tx ("... have uncommitted changes").
-        {"uncommitted changes", HA_ERR_LOCK_DEADLOCK, CONTAINS},
-        {"write conflict", HA_ERR_LOCK_DEADLOCK, CONTAINS},
-        {"failed to acquire lock", HA_ERR_LOCK_DEADLOCK, PREFIX},
-        {"transaction aborted", HA_ERR_LOCK_DEADLOCK, PREFIX},
-        {"database is locked", HA_ERR_LOCK_DEADLOCK, PREFIX},
-        {"not supported", HA_ERR_UNSUPPORTED, CONTAINS},
-        {"unsupported", HA_ERR_UNSUPPORTED, CONTAINS},
-        {"parse error", HA_ERR_GENERIC, PREFIX},
-        {"division by zero", HA_ERR_GENERIC, PREFIX},
-        {"type conversion error", HA_ERR_GENERIC, PREFIX},
-        {"type error", HA_ERR_GENERIC, PREFIX},
-        {"invalid argument", HA_ERR_GENERIC, PREFIX},
-        {"value for column ", HA_ERR_GENERIC, PREFIX},
-        {"IO error", HA_ERR_GENERIC, PREFIX},
-        {"query cancelled", HA_ERR_GENERIC, PREFIX},
-        {"transaction already", HA_ERR_GENERIC, PREFIX},
-        {"transaction not started", HA_ERR_GENERIC, PREFIX},
-    };
-    for (const Pattern& p : kTable) {
-        if (matches(p)) return {p.ha_err, true};
+// The handler error of a stoolap error class.
+int ha_error_of(int32_t cls) {
+    switch (cls) {
+        case STOOLAP_ERR_DUP_KEY:
+            return HA_ERR_FOUND_DUPP_KEY;
+        case STOOLAP_ERR_NO_REFERENCED_ROW:
+            return HA_ERR_NO_REFERENCED_ROW;
+        case STOOLAP_ERR_ROW_IS_REFERENCED:
+            return HA_ERR_ROW_IS_REFERENCED;
+        case STOOLAP_ERR_DEADLOCK:
+            return HA_ERR_LOCK_DEADLOCK;
+        case STOOLAP_ERR_TABLE_EXISTS:
+            return HA_ERR_TABLE_EXIST;
+        case STOOLAP_ERR_NO_SUCH_TABLE:
+            return HA_ERR_NO_SUCH_TABLE;
+        case STOOLAP_ERR_UNSUPPORTED:
+            return HA_ERR_UNSUPPORTED;
+        default:
+            return HA_ERR_GENERIC;
     }
-    return {HA_ERR_GENERIC, false};
 }
 
 // Brewed mariadbd exports my_error / my_printf_error directly, but the
@@ -454,9 +359,9 @@ int report_stoolap_error(const StoolapErrorView& v) {
     const char* msg = v.message;
     const bool have_text = *msg;
 
-    const ErrcodeMap m = map_stoolap_error(msg);
-    const int rc = m.ha_err;
-    if (!m.known && have_text) {
+    const int32_t cls = stoolap_error_class(msg, nullptr);
+    const int rc = ha_error_of(cls);
+    if (cls == STOOLAP_ERR_UNKNOWN && have_text) {
         // Wording no pattern covers: stoolap drift, see case_18.
         stoolap_mariadb::g_stats.unmapped_errors.fetch_add(
             1, std::memory_order_relaxed);

@@ -104,6 +104,7 @@ unsafe fn read_into(
         Ok(Ok(false)) => STOOLAP_DONE,
         Ok(Err(e)) => {
             handle.set_error(&e.to_string());
+            super::error::note_error(&e);
             STOOLAP_ERROR
         }
         Err(_) => {
@@ -208,6 +209,7 @@ pub unsafe extern "C" fn stoolap_end_statement(db: *mut StoolapDB, commit: i32) 
         Ok(Ok(())) => STOOLAP_OK,
         Ok(Err(e)) => {
             handle.set_error(&e.to_string());
+            super::error::note_error(&e);
             STOOLAP_ERROR
         }
         Err(_) => {
@@ -256,6 +258,7 @@ pub unsafe extern "C" fn stoolap_rows_into_cursor(
         Ok(Ok(())) => STOOLAP_OK,
         Ok(Err(e)) => {
             handle.set_error(&e.to_string());
+            super::error::note_error(&e);
             STOOLAP_ERROR
         }
         Err(_) => {
@@ -299,6 +302,7 @@ pub unsafe extern "C" fn stoolap_cursor_set_fields(
         Err(e) => {
             handle.cursor = None;
             handle.set_error(&e.to_string());
+            super::error::note_error(&e);
             STOOLAP_ERROR
         }
     }
@@ -390,6 +394,7 @@ pub unsafe extern "C" fn stoolap_cursor_next(
         Ok(Err(e)) => {
             handle.cursor = None;
             handle.set_error(&e.to_string());
+            super::error::note_error(&e);
             STOOLAP_ERROR
         }
         Err(_) => {

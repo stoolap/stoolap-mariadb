@@ -104,8 +104,9 @@ file stem, e.g. `case_06_pushdown` -> `stoolap_test_06_pushdown`). The
 
 The runner snapshots `SHOW STATUS LIKE 'Stoolap_%'` before and after each case.
 Normal activity counters are allowlisted centrally. `Stoolap_unmapped_errors`
-is a strict drift counter -- non-zero means `map_stoolap_error` gave up on
-a real error wording, so the pattern table needs the new stoolap text.
+is a strict drift counter -- non-zero means `stoolap_error_class`
+(`rust/src/ffi/error.rs`) gave up on a real error wording, so its rules need
+the new stoolap text.
 If a case intentionally moves
 some other non-activity counter, declare
 `STOOLAP_COUNTERS_ALLOW_DELTA = {"CounterName"}` next to its `run(harness)`

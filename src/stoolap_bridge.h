@@ -125,7 +125,7 @@ struct PushdownStats {
     // cached_records() miss that ran a live COUNT(*).
     // High values = the handler/tx/global caches aren't being reused.
     std::atomic<uint64_t> records_live_counts{0};
-    // Non-empty stoolap message no map_stoolap_error pattern covers.
+    // Non-empty stoolap message no stoolap_error_class rule covers.
     // case_18 pins this at 0.
     std::atomic<uint64_t> unmapped_errors{0};
 
