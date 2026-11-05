@@ -315,6 +315,12 @@ typedef struct StoolapKeyBound {
     int32_t op;
     /** Parts left out for the caller's own comparison (bit i) */
     uint32_t skip;
+    /**
+     * Skipped equality parts in a PAD SPACE binary collation (bit i):
+     * looked up as rtrim(v) followed by each count of spaces the column
+     * fits, which the caller's comparison still filters
+     */
+    uint32_t pad;
     int32_t mode;
 } StoolapKeyBound;
 
@@ -644,6 +650,17 @@ int32_t stoolap_create_table(
     const uint8_t* create_sql, int64_t create_sql_len,
     int32_t if_not_exists
 );
+
+/** The most bytes a stoolap table name takes (it names a file). */
+#define STOOLAP_MAX_TABLE_NAME 255
+
+/**
+ * Write `name` (`len` bytes), the plugin's escaped (db, table) name, as
+ * stoolap can hold it to `out` (STOOLAP_MAX_TABLE_NAME bytes): past the
+ * limit, its first characters, `_2` and a hash of the whole. Returns the
+ * length written, 0 when `name` fits as it is.
+ */
+size_t stoolap_fit_table_name(const char* name, size_t len, char* out);
 
 /** Drop `table` if it is there. */
 int32_t stoolap_drop_table(StoolapDB* db, const char* table);

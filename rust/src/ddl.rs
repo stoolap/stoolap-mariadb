@@ -43,8 +43,46 @@ pub fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// The most bytes a table name takes in stoolap, which names a file after
+/// it
+const MAX_TABLE_NAME: usize = 255;
+
+/// The bytes `c` takes in stoolap, which may keep it lowercased
+fn stored_len(c: char) -> usize {
+    c.len_utf8().max(c.to_lowercase().map(char::len_utf8).sum())
+}
+
+/// `name`, or when stoolap cannot hold it, its first characters, `_2` and
+/// a hash of the whole lowercased (FNV-1a, 64 bits): stoolap matches table
+/// names lowercased, so names in other letter case shorten to one it
+/// matches too. The escaping never writes `_2`, so no name that fits meets
+/// a shortened one; the hash must not change, a file-backed table keeps
+/// its name.
+pub fn fit_name(name: String) -> String {
+    const TAIL: usize = 2 + 16;
+    if name.chars().map(stored_len).sum::<usize>() <= MAX_TABLE_NAME {
+        return name;
+    }
+    let mut out = String::with_capacity(MAX_TABLE_NAME);
+    let mut len = 0;
+    for c in name.chars() {
+        len += stored_len(c);
+        if len + TAIL > MAX_TABLE_NAME {
+            break;
+        }
+        out.push(c);
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.to_lowercase().bytes() {
+        hash = (hash ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    out.push_str(&format!("_2{hash:016x}"));
+    out
+}
+
 /// Stoolap's table name for MariaDB's (db, table): `_` as `_0` and `/` as
-/// `_1` in each, joined by `_1`, so distinct pairs never meet
+/// `_1` in each, joined by `_1`, so distinct pairs never meet; fit_name
+/// shortens a long one
 pub fn flat_name(db: &str, table: &str) -> String {
     let escape = |s: &str, out: &mut String| {
         for c in s.chars() {
@@ -61,7 +99,7 @@ pub fn flat_name(db: &str, table: &str) -> String {
         out.push_str("_1");
     }
     escape(table, &mut out);
-    out
+    fit_name(out)
 }
 
 /// Creates `table` (stoolap's name; `db` the MariaDB database it is in)
@@ -509,6 +547,17 @@ mod tests {
     #[test]
     fn foreign_key_clauses() {
         assert_eq!(flat_name("a_b", "c/d"), "a_0b_1c_1d");
+        let long = flat_name(&"_".repeat(64), &"_".repeat(64));
+        assert_eq!(long.len(), 255);
+        assert!(long.starts_with("_0_0") && long.contains("_2"));
+        assert_ne!(long, flat_name(&"_".repeat(64), &"_".repeat(63)));
+        let fits = "a".repeat(255);
+        assert_eq!(fit_name(fits.clone()), fits);
+        assert_eq!(fit_name("a".repeat(256)).len(), 255);
+        assert_eq!(
+            fit_name("a".repeat(256)).to_lowercase(),
+            fit_name("A".repeat(256)).to_lowercase()
+        );
         assert_eq!(
             fks(
                 "CREATE TABLE c (id INT, pid INT, CONSTRAINT f FOREIGN KEY fk (pid) REFERENCES `p` (id) ON DELETE CASCADE ON UPDATE SET NULL)",

@@ -162,6 +162,33 @@ pub unsafe extern "C" fn stoolap_create_table(
     rc
 }
 
+/// Writes `name` (`len` bytes) as a stoolap table name, shortened as
+/// `ddl::fit_name` does, to `out` (STOOLAP_MAX_TABLE_NAME bytes); returns
+/// its length, 0 when `name` fits as it is or is not UTF-8.
+///
+/// # Safety
+///
+/// `name` must hold `len` bytes and `out` STOOLAP_MAX_TABLE_NAME.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_fit_table_name(
+    name: *const u8,
+    len: usize,
+    out: *mut u8,
+) -> usize {
+    if name.is_null() || out.is_null() {
+        return 0;
+    }
+    let Ok(s) = std::str::from_utf8(std::slice::from_raw_parts(name, len)) else {
+        return 0;
+    };
+    let fit = ddl::fit_name(s.to_string());
+    if fit.len() == len {
+        return 0;
+    }
+    std::ptr::copy_nonoverlapping(fit.as_ptr(), out, fit.len());
+    fit.len()
+}
+
 /// Drops `table` if it is there.
 ///
 /// # Safety
