@@ -373,8 +373,14 @@ const char* stoolap_tx_errmsg(const StoolapTx* tx);
 #define STOOLAP_OP_LE           4
 #define STOOLAP_OP_IS_NULL      5  /**< value unused */
 #define STOOLAP_OP_IS_NOT_NULL  6  /**< value unused */
+/** Joins the `column` (a count) conditions before it; postfix order. */
+#define STOOLAP_OP_AND          7
+#define STOOLAP_OP_OR           8
 
-/** `column op value`. */
+/**
+ * `column op value`, or an AND / OR of the conditions before it. The list
+ * is in postfix order; the conditions left at its end are ANDed.
+ */
 typedef struct StoolapCond {
     int32_t column;
     int32_t op;

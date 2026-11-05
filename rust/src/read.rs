@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 
 use stoolap::core::{Error, Operator, Result, Row, Value};
 use stoolap::storage::expression::{
-    AndExpr, ComparisonExpr, ConstBoolExpr, Expression, NullCheckExpr,
+    AndExpr, ComparisonExpr, ConstBoolExpr, Expression, NullCheckExpr, OrExpr,
 };
 use stoolap::storage::traits::{ScanAccess, Scanner, Table};
 
@@ -38,13 +38,21 @@ pub struct Cond {
     pub value: Value,
 }
 
+/// A read's condition in postfix order: `And(n)` / `Or(n)` join the `n`
+/// nodes before them; what is left at the end is ANDed
+pub enum Node {
+    Cond(Cond),
+    And(usize),
+    Or(usize),
+}
+
 /// What a read returns and in which order
 pub struct ReadSpec<'a> {
     /// The table's column count as the caller knows it
     pub table_columns: usize,
     /// The columns each row carries, in order
     pub columns: &'a [usize],
-    pub conds: Vec<Cond>,
+    pub conds: Vec<Node>,
     /// Columns to order by, ascending with NULL first unless `desc`
     pub order: &'a [usize],
     pub desc: bool,
@@ -117,7 +125,21 @@ impl Cursor {
         }
 
         let mut exprs: Vec<Box<dyn Expression>> = Vec::with_capacity(spec.conds.len());
-        for cond in spec.conds {
+        for node in spec.conds {
+            let cond = match node {
+                Node::Cond(cond) => cond,
+                Node::And(n) | Node::Or(n) => {
+                    if n == 0 || n > exprs.len() {
+                        return Err(Error::internal("condition joins missing operands"));
+                    }
+                    let operands = exprs.split_off(exprs.len() - n);
+                    exprs.push(match node {
+                        Node::And(_) => Box::new(AndExpr::new(operands)),
+                        _ => Box::new(OrExpr::new(operands)),
+                    });
+                    continue;
+                }
+            };
             column_ok(cond.column)?;
             let col = &schema.columns[cond.column];
             let op = match cond.op {

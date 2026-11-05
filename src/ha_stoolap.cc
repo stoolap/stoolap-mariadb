@@ -285,17 +285,6 @@ int query_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
     return stoolap_query(warm_db(ctx, fallback), sql, out_rows);
 }
 
-int query_params_via(stoolap_mariadb::ThdContext* ctx, StoolapDB* fallback,
-                     const char* sql, const StoolapValue* params,
-                     int32_t nparams, StoolapRows** out_rows) {
-    if (ctx && ctx->has_tx()) {
-        return stoolap_tx_query_params(ctx->tx(), sql, params, nparams,
-                                       out_rows);
-    }
-    return stoolap_query_params(warm_db(ctx, fallback), sql, params, nparams,
-                                out_rows);
-}
-
 }  // namespace (helpers below have external linkage so
 // ha_stoolap_select.cc can call them.)
 
@@ -2927,25 +2916,7 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         return read_range_filtered(start_key, end_key, sorted);
     }
 
-    // Lexicographic-tuple semantics: (a,b) >= (1,5) is NOT a >= 1 AND b >= 5
-    // (which would be empty when paired with the upper bound). Expand to
-    //   (a > 1) OR (a = 1 AND b >= 5)   -- lower bound
-    //   (a < 2) OR (a = 2 AND b <= 3)   -- upper bound
-    // evaluated correctly by stoolap's expression VM.
-    auto count_bound_parts = [&](const key_range* range) -> uint {
-        if (!range) return 0;
-        uint n = 0;
-        for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
-            if (!(range->keypart_map & (key_part_map(1) << i))) break;
-            n = i + 1;
-        }
-        return n;
-    };
-    const uint start_parts = count_bound_parts(start_key);
-    const uint end_parts = count_bound_parts(end_key);
-    const bool composite_range = (start_parts > 1 || end_parts > 1);
-
-    // SQL op for the last bound part; earlier parts are always equality.
+    // The comparison for the last bound part; earlier parts are equality.
     auto op_for_start = [](ha_rkey_function f) -> const char* {
         switch (f) {
             case HA_READ_KEY_EXACT:
@@ -2987,38 +2958,32 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         }
     };
 
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
-
-    std::vector<StoolapValue> params;
-    // deque, not vector: append_bound runs twice and stashes
-    // text_holders.back().data() into StoolapValue.text.ptr; a vector
-    // realloc between phases would invalidate pointers from phase one.
+    ir_conds_.clear();
+    ir_order_.clear();
+    // deque: the conditions' text values point into these.
     std::deque<std::string> text_holders;
-    int next_param = 1;
-    bool any_pred = false;
-
-    // For nparts > 1 with non-eq last_op emits the OR-chain:
-    //   (p0 <strict> v0) OR (p0 = v0 AND p1 <last_op> v1)
-    auto append_lex_bound = [&](const char* col, const char* op, int param_no,
-                                bool is_first_pred) {
-        sql += is_first_pred ? " WHERE " : " AND ";
-        sql += col;
-        sql += ' ';
-        sql += op;
-        sql += " $";
-        sql += std::to_string(param_no);
+    auto push_cond = [&](Field* f, int32_t op, const StoolapValue& v) {
+        StoolapCond c{};
+        c.column = static_cast<int32_t>(f->field_index);
+        c.op = op;
+        c.value = v;
+        ir_conds_.push_back(c);
     };
-    (void)composite_range;
+    auto push_join = [&](int32_t op, int32_t n) {
+        StoolapCond c{};
+        c.column = n;
+        c.op = op;
+        ir_conds_.push_back(c);
+    };
+
     auto append_bound = [&](const key_range* range,
-                            const char* (*op_fn)(ha_rkey_function),
-                            bool is_end) -> int {
+                            const char* (*op_fn)(ha_rkey_function)) -> int {
         if (!range) return 0;
         const char* last_op = op_fn(range->flag);
         if (!last_op) return HA_ERR_UNSUPPORTED;
         const bool is_eq_op = (last_op[0] == '=' && last_op[1] == '\0');
-        // Strict variant for OR-chain prefix legs: ">=" / ">" -> ">".
-        const char strict = (last_op[0] == '>') ? '>' : '<';
+        // Strict variant for the chain's prefix legs: ">=" / ">" -> ">".
+        const char* strict = (last_op[0] == '>') ? ">" : "<";
 
         uint nparts = 0, klen = 0;
         count_parts(key_info, range->keypart_map, nparts, klen);
@@ -3031,81 +2996,56 @@ int ha_stoolap::read_range_first(const key_range* start_key,
             static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
         move_fields(table, d);
 
-        // OR-chain for composite non-eq bounds.
+        // A composite non-equality bound is lexicographic: (a,b) >= (1,5)
+        // is (a > 1) OR (a = 1 AND b >= 5), not a >= 1 AND b >= 5.
         if (nparts > 1 && !is_eq_op) {
-            // Bind every key-part value once; each is referenced per leg.
-            std::vector<int> param_nos;
-            param_nos.reserve(nparts);
+            std::vector<StoolapValue> vals(nparts);
             for (uint i = 0; i < nparts; ++i) {
                 Field* f = key_info.key_part[i].field;
                 if (f->is_null()) {
                     move_fields(table, -d);
                     return HA_ERR_KEY_NOT_FOUND;  // NULL in lex bound: no rows.
                 }
-                StoolapValue v{};
                 text_holders.emplace_back();
-                if (!extract_field(f, v, text_holders.back())) {
+                if (!extract_field(f, vals[i], text_holders.back())) {
                     move_fields(table, -d);
                     return HA_ERR_UNSUPPORTED;
                 }
-                params.push_back(v);
-                param_nos.push_back(next_param++);
             }
-            sql += any_pred ? " AND (" : " WHERE (";
-            any_pred = true;
-            for (uint chain_i = 0; chain_i < nparts; ++chain_i) {
-                if (chain_i) sql += " OR ";
-                sql += "(";
-                for (uint i = 0; i <= chain_i; ++i) {
-                    if (i) sql += " AND ";
-                    Field* f = key_info.key_part[i].field;
-                    sql += quote_ident(std::string_view(f->field_name.str,
-                                                        f->field_name.length));
-                    char this_op[3] = {0};
-                    if (i < chain_i) {
-                        this_op[0] = '=';
-                    } else if (chain_i < nparts - 1) {
-                        this_op[0] = strict;
-                    } else {
-                        this_op[0] = last_op[0];
-                        this_op[1] = last_op[1];
-                    }
-                    sql.push_back(' ');
-                    sql += this_op;
-                    sql += " $";
-                    sql += std::to_string(param_nos[i]);
+            // The bound it implies on the leading part, which an index
+            // can read (an OR alone is not).
+            push_cond(key_info.key_part[0].field,
+                      strict[0] == '>' ? STOOLAP_OP_GE : STOOLAP_OP_LE,
+                      vals[0]);
+            for (uint leg = 0; leg < nparts; ++leg) {
+                for (uint i = 0; i <= leg; ++i) {
+                    const char* op = i < leg            ? "="
+                                     : leg < nparts - 1 ? strict
+                                                        : last_op;
+                    push_cond(key_info.key_part[i].field, cond_op(op), vals[i]);
                 }
-                sql += ")";
+                if (leg)
+                    push_join(STOOLAP_OP_AND, static_cast<int32_t>(leg + 1));
             }
-            sql += ")";
+            push_join(STOOLAP_OP_OR, static_cast<int32_t>(nparts));
             move_fields(table, -d);
-            (void)is_end;
-            (void)append_lex_bound;
             return 0;
         }
 
         for (uint i = 0; i < nparts; ++i) {
             Field* f = key_info.key_part[i].field;
-            const bool is_last = (i == nparts - 1);
-            const char* op = is_last ? last_op : "=";
-            Beyond beyond = Beyond::NONE;
-            const bool special = f->is_null() || unsigned_beyond_i64(f);
-            if (special) {
-                beyond = bound_beyond(op, f->is_null());
+            const char* op = (i == nparts - 1) ? last_op : "=";
+            if (f->is_null() || unsigned_beyond_i64(f)) {
+                const Beyond beyond = bound_beyond(op, f->is_null());
                 if (beyond == Beyond::NONE) {
                     move_fields(table, -d);
                     return HA_ERR_KEY_NOT_FOUND;
                 }
                 if (beyond == Beyond::ALL) continue;
-            }
-
-            sql += any_pred ? " AND " : " WHERE ";
-            any_pred = true;
-
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-            if (special) {
-                sql += beyond == Beyond::IS_NULL ? " IS NULL" : " IS NOT NULL";
+                push_cond(f,
+                          beyond == Beyond::IS_NULL ? STOOLAP_OP_IS_NULL
+                                                    : STOOLAP_OP_IS_NOT_NULL,
+                          StoolapValue{});
                 continue;
             }
             StoolapValue v{};
@@ -3114,23 +3054,17 @@ int ha_stoolap::read_range_first(const key_range* start_key,
                 move_fields(table, -d);
                 return HA_ERR_UNSUPPORTED;
             }
-            sql.push_back(' ');
-            sql += op;
-            sql += " $";
-            sql += std::to_string(next_param++);
-            params.push_back(v);
+            push_cond(f, cond_op(op), v);
         }
         move_fields(table, -d);
-        (void)is_end;
         return 0;
     };
 
-    if (int rc = append_bound(start_key, op_for_start, /*is_end=*/false))
-        return rc;
-    if (int rc = append_bound(end_key, op_for_end, /*is_end=*/true)) return rc;
+    if (int rc = append_bound(start_key, op_for_start)) return rc;
+    if (int rc = append_bound(end_key, op_for_end)) return rc;
 
-    // Skip ORDER BY when an exact unique-index lookup (one row) or when
-    // MariaDB's `sorted` flag says the range plan doesn't need order.
+    // Skip the order when an exact unique-index lookup (one row) or when
+    // MariaDB's `sorted` flag says the range plan doesn't need it.
     bool exact_unique = false;
     if (start_key && start_key->flag == HA_READ_KEY_EXACT &&
         (key_info.flags & HA_NOSAME)) {
@@ -3139,27 +3073,16 @@ int ha_stoolap::read_range_first(const key_range* start_key,
         exact_unique = (sk_parts == key_info.user_defined_key_parts);
     }
     if (!exact_unique && sorted) {
-        sql += " ORDER BY ";
-        for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
-            if (i) sql += ", ";
-            Field* f = key_info.key_part[i].field;
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-        }
+        for (uint i = 0; i < key_info.user_defined_key_parts; ++i)
+            ir_order_.push_back(
+                static_cast<int32_t>(key_info.key_part[i].field->field_index));
     }
 
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    int rc = query_params_via(ctx, db_raw(), sql.c_str(), params.data(),
-                              static_cast<int32_t>(params.size()), &rows);
-    if (rc != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: read_range query failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    scan_.reset(rows);
-    int next_rc = rnd_next(table->record[0]);
-    return (next_rc == HA_ERR_END_OF_FILE) ? HA_ERR_END_OF_FILE : next_rc;
+    if (int err = open_read(
+            ir_conds_.data(), static_cast<int32_t>(ir_conds_.size()),
+            ir_order_.data(), static_cast<int32_t>(ir_order_.size()), false))
+        return err;
+    return rnd_next(table->record[0]);
 }
 
 int ha_stoolap::read_range_next() {
@@ -3233,17 +3156,14 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
         }
     }
 
-    std::string sql = "SELECT " + build_scan_columns() + " FROM ";
-    sql += quote_ident(stoolap_table_);
-    std::vector<StoolapValue> params;
+    ir_conds_.clear();
+    ir_order_.clear();
     std::deque<std::string> holders;
     if (part_safe(0)) {
         // Every row of the range has its first part between the bounds'
         // first parts (inclusive, whatever the flags); NULLs sort first,
         // so an upper bound keeps them.
         Field* f = ki.key_part[0].field;
-        const std::string col = quote_ident(
-            std::string_view(f->field_name.str, f->field_name.length));
         for (const key_range* r : {start_key, end_key}) {
             if (!r || !(r->keypart_map & 1)) continue;
             std::memset(table->record[1], 0, table->s->reclength);
@@ -3252,20 +3172,25 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
             const my_ptrdiff_t d =
                 static_cast<my_ptrdiff_t>(table->record[1] - table->record[0]);
             move_fields(table, d);
-            StoolapValue v{};
+            StoolapCond c{};
+            c.column = static_cast<int32_t>(f->field_index);
+            c.op = r == start_key ? STOOLAP_OP_GE : STOOLAP_OP_LE;
             holders.emplace_back();
             const bool bind = !f->is_null() && !unsigned_beyond_i64(f) &&
-                              extract_field(f, v, holders.back());
+                              extract_field(f, c.value, holders.back());
             move_fields(table, -d);
             if (!bind) continue;
-            sql += params.empty() ? " WHERE (" : " AND (";
-            sql += col;
-            sql += r == start_key ? " >= $" : " <= $";
-            params.push_back(v);
-            sql += std::to_string(params.size());
-            if (r == end_key && f->real_maybe_null())
-                sql += " OR " + col + " IS NULL";
-            sql.push_back(')');
+            ir_conds_.push_back(c);
+            if (r == end_key && f->real_maybe_null()) {
+                StoolapCond n{};
+                n.column = c.column;
+                n.op = STOOLAP_OP_IS_NULL;
+                ir_conds_.push_back(n);
+                StoolapCond either{};
+                either.column = 2;
+                either.op = STOOLAP_OP_OR;
+                ir_conds_.push_back(either);
+            }
         }
     }
     if (sorted) {
@@ -3275,7 +3200,6 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
         // ORDER BY check skips the same way).
         const key_part_map where_const =
             table->const_key_parts ? table->const_key_parts[active_index] : 0;
-        bool first = true;
         for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
             // A constant part is one value to MariaDB: sorting stoolap's
             // bytes there could split values its collation calls equal
@@ -3285,25 +3209,15 @@ int ha_stoolap::read_range_filtered(const key_range* start_key,
             if (!ki.key_part[i].field ||
                 !(index_flags(active_index, i, false) & HA_READ_ORDER))
                 break;
-            Field* f = ki.key_part[i].field;
-            sql += first ? " ORDER BY " : ", ";
-            first = false;
-            sql += quote_ident(
-                std::string_view(f->field_name.str, f->field_name.length));
-            sql += " NULLS FIRST";
+            ir_order_.push_back(
+                static_cast<int32_t>(ki.key_part[i].field->field_index));
         }
     }
 
-    auto* ctx = get_thd_ctx(ha_thd());
-    StoolapRows* rows = nullptr;
-    if (query_params_via(ctx, db_raw(), sql.c_str(), params.data(),
-                         static_cast<int32_t>(params.size()),
-                         &rows) != STOOLAP_OK) {
-        auto verr = fetch_error_via(ctx, db_raw());
-        sql_print_error("stoolap: read_range query failed: %s", verr.message);
-        return report_stoolap_error(verr);
-    }
-    scan_.reset(rows);
+    if (int err = open_read(
+            ir_conds_.data(), static_cast<int32_t>(ir_conds_.size()),
+            ir_order_.data(), static_cast<int32_t>(ir_order_.size()), false))
+        return err;
 
     range_has_start_ = start_key != nullptr;
     if (start_key) {
