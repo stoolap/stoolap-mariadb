@@ -8,6 +8,8 @@ DELETE FROM e ORDER BY id DESC LIMIT 1;
 UPDATE e FORCE INDEX (kn) SET n = 1 ORDER BY n LIMIT 1;
 SELECT MIN(id), MAX(n) FROM e;
 -- A decimal literal past a double's precision is not pushed: stoolap
--- reads it as a double. Within it, it pushes and comes back exact.
+-- reads it as a double. Within it, it pushes and comes back exact
+-- (case_06_pushdown checks which of the two push).
 INSERT INTO e VALUES (1, 2);
-SELECT 12345678901234567890.5, 123456789012345.5, 0.000000000000000123456789, n + 0.25 FROM e;
+SELECT 12345678901234567890.5 FROM e;
+SELECT 12345678901234.5, 0.000000000000000123456789, -98765.4321 FROM e;

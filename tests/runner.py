@@ -169,6 +169,10 @@ class ServerCtx:
                     filecmp.cmp(dst, self.plugin, shallow=False)):
                 pass  # destination is up-to-date; CI flow
             else:
+                # A new file, not new bytes in the old one: macOS kills a
+                # process mapping a signed binary changed in place.
+                if os.path.exists(dst):
+                    os.unlink(dst)
                 shutil.copyfile(self.plugin, dst)
         except (PermissionError, OSError) as e:
             print(f"runner: cannot install plugin to {self.plugin_dir}: {e}",
