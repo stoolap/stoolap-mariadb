@@ -403,26 +403,7 @@ int raise_commit_error(const char* msg) {
 
 namespace {
 
-// MariaDB hands us "./db/tbl"; both db and tbl can contain '_' and '/'.
-// Inject `_0` for `_` and `_1` for `/` so distinct (db, tbl) pairs never
-// collide (naive `/` -> `__` collides on db=`p`,tbl=`q__r` vs db=`p__q`,tbl=`r`).
-// One past stoolap's name limit is shortened (fit_table_name).
-std::string stoolap_table_from_path(const char* mariadb_path) {
-    if (!mariadb_path) return std::string();
-    std::string_view s(mariadb_path);
-    if (s.size() >= 2 && s[0] == '.' && s[1] == '/') s.remove_prefix(2);
-    std::string out;
-    out.reserve(s.size() + 4);
-    for (char c : s) {
-        if (c == '_')
-            out.append("_0");
-        else if (c == '/')
-            out.append("_1");
-        else
-            out.push_back(c);
-    }
-    return stoolap_mariadb::fit_table_name(std::move(out));
-}
+using stoolap_mariadb::stoolap_table_from_path;
 
 std::string quote_ident(std::string_view s) {
     std::string out;
