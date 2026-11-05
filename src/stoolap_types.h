@@ -202,6 +202,19 @@ inline int hex_nibble(char c) {
 inline void store_text(Field* f, const char* s, size_t n) {
     const CHARSET_INFO* cs = f->charset();
     if (text_is_utf8(cs)) {  // the usual case, one flag test
+        // A utf8mb4 VARCHAR takes valid UTF-8 as it is: no more bytes
+        // than the field has characters always fits, so the bytes go in
+        // without the copy that checks and counts each character.
+        if (f->real_type() == MYSQL_TYPE_VARCHAR &&
+            cs->cset == my_charset_utf8mb4_bin.cset && n <= f->char_length()) {
+            auto* v = static_cast<Field_varstring*>(f);
+            if (v->length_bytes == 1)
+                *f->ptr = static_cast<uchar>(n);
+            else
+                int2store(f->ptr, static_cast<uint16>(n));
+            std::memcpy(f->ptr + v->length_bytes, s, n);
+            return;
+        }
         f->store(s, n, cs);
         return;
     }
