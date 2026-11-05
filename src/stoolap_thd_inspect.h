@@ -10,7 +10,27 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
 class THD;
+
+// A single-column FOREIGN KEY as MariaDB's parser read it; the parent by
+// its file path, "db/table" as tablename_to_filename encodes them.
+struct StoolapThdForeignKey {
+    std::string column;
+    std::string parent_path;
+    std::string parent_column;  // empty: the parent's primary key
+    int on_delete;              // enum_fk_option
+    int on_update;
+};
+
+// The FOREIGN KEYs of the statement's CREATE / ALTER TABLE: MariaDB keeps
+// none for an engine that does not claim them. A parent naming no
+// database is in `child_db`, the child's (encoded) database directory.
+// False for a composite one, which stoolap does not enforce.
+bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
+                              std::vector<StoolapThdForeignKey>* out);
 
 // sql_class.h-dependent helpers: live in stoolap_thd_inspect.cc to keep
 // the heavy sql_class/wsrep include chain out of most TUs.

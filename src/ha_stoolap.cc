@@ -34,10 +34,6 @@
 #include <string_view>
 #include <vector>
 
-// Declared locally to avoid pulling in sql_class.h (transitively requires
-// wsrep headers brew doesn't ship).
-extern "C" LEX_STRING* thd_query_string(MYSQL_THD thd);
-
 handlerton* stoolap_hton = nullptr;
 stoolap_mariadb::Engine g_engine;
 
@@ -583,10 +579,10 @@ bool refuse_unsupported_columns(TABLE* form) {
 }
 
 // Creates the stoolap table for `form` with its secondary indexes, and,
-// when `with_fks`, the FOREIGN KEY clauses of the statement's text
-// (MariaDB strips them from `form` for an engine that does not claim
-// them); 0 or a handler error. A secondary index that fails is a warning:
-// queries on its key full-scan.
+// when `with_fks`, the FOREIGN KEYs the statement's parser read (MariaDB
+// keeps none in `form` for an engine that does not claim them); 0 or a
+// handler error. A secondary index that fails is a warning: queries on
+// its key full-scan.
 int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
                          bool if_not_exists, bool with_fks, const char* what) {
     std::vector<StoolapColumnDef> columns;
@@ -616,18 +612,40 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
         keys.push_back({k.name.str, parts[i].data(),
                         static_cast<int32_t>(parts[i].size()), kind});
     }
-    const std::string db_name(form->s->db.str, form->s->db.length);
-    // The statement's bytes, by their length: a literal may hold a NUL,
-    // and the text is in the client's character set.
-    LEX_STRING* qs =
-        with_fks && current_thd ? thd_query_string(current_thd) : nullptr;
-    const bool has_sql = qs && qs->str;
+    std::vector<StoolapThdForeignKey> fks;
+    std::vector<std::string> parents;
+    std::vector<StoolapForeignKeyDef> fk_defs;
+    if (with_fks) {
+        // The child's database directory: the path is "./db/table".
+        const std::string_view path(form->s->normalized_path.str,
+                                    form->s->normalized_path.length);
+        const size_t slash = path.rfind('/');
+        const size_t start =
+            slash == std::string_view::npos ? 0 : path.rfind('/', slash - 1);
+        const std::string child_db(
+            slash == std::string_view::npos || start == std::string_view::npos
+                ? std::string_view()
+                : path.substr(start + 1, slash - start - 1));
+        if (!stoolap_thd_foreign_keys(current_thd, child_db.c_str(), &fks)) {
+            my_printf_error(ER_GET_ERRMSG,
+                            "stoolap: composite FOREIGN KEY: stoolap "
+                            "enforces single-column foreign keys only.",
+                            MYF(0));
+            return HA_ERR_UNSUPPORTED;
+        }
+        for (const auto& fk : fks)
+            parents.push_back(stoolap_table_from_path(fk.parent_path.c_str()));
+        for (size_t i = 0; i < fks.size(); ++i)
+            fk_defs.push_back({fks[i].column.c_str(), parents[i].c_str(),
+                               fks[i].parent_column.empty()
+                                   ? nullptr
+                                   : fks[i].parent_column.c_str(),
+                               fks[i].on_delete, fks[i].on_update});
+    }
     const int rc = stoolap_create_table(
-        db, tbl.c_str(), db_name.c_str(), columns.data(),
-        static_cast<int32_t>(columns.size()), keys.data(),
-        static_cast<int32_t>(keys.size()),
-        has_sql ? reinterpret_cast<const uint8_t*>(qs->str) : nullptr,
-        has_sql ? static_cast<int64_t>(qs->length) : 0, if_not_exists);
+        db, tbl.c_str(), columns.data(), static_cast<int32_t>(columns.size()),
+        keys.data(), static_cast<int32_t>(keys.size()), fk_defs.data(),
+        static_cast<int32_t>(fk_defs.size()), if_not_exists);
     if (rc == STOOLAP_INDEX_FAILED) {
         sql_print_warning(
             "stoolap: failed to create indexes of '%s': %s -- queries on "

@@ -8,10 +8,9 @@
 
 //! Tables from MariaDB's definitions. The plugin describes a table's
 //! columns (with the stoolap type it stores each in) and keys; this builds
-//! the stoolap CREATE TABLE and its indexes. MariaDB strips FOREIGN KEY
-//! clauses from what it hands an engine that does not claim them, so they
-//! are read back from the statement's own text, their parent tables
-//! renamed to stoolap's names.
+//! the stoolap CREATE TABLE and its indexes. MariaDB keeps no FOREIGN KEY
+//! for an engine that does not claim them, so the plugin hands over the
+//! ones its parser read, their parent tables under stoolap's names.
 
 use stoolap::api::ParamVec;
 use stoolap::core::{Error, Result};
@@ -80,39 +79,15 @@ pub fn fit_name(name: String) -> String {
     out
 }
 
-/// Stoolap's table name for MariaDB's (db, table): `_` as `_0` and `/` as
-/// `_1` in each, joined by `_1`, so distinct pairs never meet; fit_name
-/// shortens a long one
-pub fn flat_name(db: &str, table: &str) -> String {
-    let escape = |s: &str, out: &mut String| {
-        for c in s.chars() {
-            match c {
-                '_' => out.push_str("_0"),
-                '/' => out.push_str("_1"),
-                c => out.push(c),
-            }
-        }
-    };
-    let mut out = String::with_capacity(db.len() + table.len() + 4);
-    if !db.is_empty() {
-        escape(db, &mut out);
-        out.push_str("_1");
-    }
-    escape(table, &mut out);
-    fit_name(out)
-}
-
-/// Creates `table` (stoolap's name; `db` the MariaDB database it is in)
-/// and its secondary indexes; `create_sql` is the statement's text, read
-/// for FOREIGN KEY clauses. Returns the indexes that failed, by name with
-/// the error, which leave their queries on a full scan.
+/// Creates `table` (stoolap's name) with its `foreign_keys` and secondary
+/// indexes. Returns the indexes that failed, by name with the error, which
+/// leave their queries on a full scan.
 pub fn create_table(
     session: &Session,
     table: &str,
-    db: &str,
     columns: &[Column],
     keys: &[Key],
-    create_sql: Option<&[u8]>,
+    foreign_keys: &[ForeignKey],
     if_not_exists: bool,
 ) -> Result<Vec<String>> {
     let column_name = |i: usize| -> Result<&str> {
@@ -173,8 +148,8 @@ pub fn create_table(
         sql.push_str(", UNIQUE ");
         sql.push_str(&key_columns(k)?);
     }
-    if let Some(text) = create_sql {
-        foreign_keys(text, db, table, &mut sql)?;
+    for fk in foreign_keys {
+        foreign_key(fk, table, &mut sql)?;
     }
     sql.push(')');
     session.run(&sql, ParamVec::new())?;
@@ -218,319 +193,59 @@ pub fn rename_table(session: &Session, from: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
-// -------------------------------------------------------------------------
-// FOREIGN KEY clauses from MariaDB's CREATE TABLE text
-// -------------------------------------------------------------------------
-
-fn is_word(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
+/// A FOREIGN KEY, as MariaDB's parser read it
+pub struct ForeignKey {
+    pub column: String,
+    /// The parent table, by stoolap's name
+    pub parent: String,
+    /// None: the parent's primary key
+    pub parent_column: Option<String>,
+    /// `STOOLAP_FK_*`
+    pub on_delete: i32,
+    pub on_update: i32,
 }
 
-/// The comment at `p` and its end, as MariaDB's lexer skips them between
-/// tokens: /* ... */ (not /*! ... */ or /*M! ... */, whose text it runs),
-/// # and -- to the end of the line
-fn comment_end(s: &[u8], p: usize) -> Option<usize> {
-    let rest = &s[p..];
-    if rest.starts_with(b"/*") && !rest.starts_with(b"/*!") && !rest.starts_with(b"/*M!") {
-        return Some(
-            s[p + 2..]
-                .windows(2)
-                .position(|w| w == b"*/")
-                .map_or(s.len(), |at| p + 2 + at + 2),
-        );
-    }
-    if rest.starts_with(b"#")
-        || (rest.starts_with(b"--") && rest.get(2).is_none_or(|c| c.is_ascii_whitespace()))
-    {
-        return Some(
-            s[p..]
-                .iter()
-                .position(|&c| c == b'\n')
-                .map_or(s.len(), |at| p + at + 1),
-        );
-    }
-    None
-}
+/// MariaDB's ON DELETE / ON UPDATE actions (enum_fk_option)
+pub const STOOLAP_FK_UNDEF: i32 = 0;
+pub const STOOLAP_FK_RESTRICT: i32 = 1;
+pub const STOOLAP_FK_NO_ACTION: i32 = 2;
+pub const STOOLAP_FK_CASCADE: i32 = 3;
+pub const STOOLAP_FK_SET_NULL: i32 = 4;
+pub const STOOLAP_FK_SET_DEFAULT: i32 = 5;
 
-/// Past the white space and comments at `p`
-fn skip_ws(s: &[u8], mut p: usize) -> usize {
-    while p < s.len() {
-        if s[p].is_ascii_whitespace() {
-            p += 1;
-        } else if let Some(end) = comment_end(s, p) {
-            p = end;
-        } else {
-            break;
-        }
-    }
-    p
-}
-
-/// `word` at `p`, any case, a word of its own: not part of an identifier
-/// (x$FOREIGN) nor a qualified name's part (d.foreign). The position
-/// after it
-fn keyword(s: &[u8], p: usize, word: &str) -> Option<usize> {
-    let end = p + word.len();
-    if end > s.len() || !s[p..end].eq_ignore_ascii_case(word.as_bytes()) {
-        return None;
-    }
-    if p > 0 && (is_ident_byte(s[p - 1]) || s[p - 1] == b'.') {
-        return None;
-    }
-    if end < s.len() && is_ident_byte(s[end]) {
-        return None;
-    }
-    Some(end)
-}
-
-/// A byte of a bare identifier: MariaDB's [0-9a-zA-Z$_] and the bytes of
-/// a character past ASCII
-fn is_ident_byte(c: u8) -> bool {
-    is_word(c) || c == b'$' || c >= 0x80
-}
-
-/// An identifier at `p`, as its bytes: `quoted` or "quoted" (ANSI_QUOTES,
-/// where the plain sql_mode would not have parsed the statement), a
-/// doubled quote standing for one, or bare
-fn ident(s: &[u8], mut p: usize) -> Option<(Vec<u8>, usize)> {
-    if p >= s.len() {
-        return None;
-    }
-    let q = s[p];
-    if q == b'`' || q == b'"' {
-        let mut out = Vec::new();
-        p += 1;
-        while p < s.len() {
-            if s[p] == q {
-                if p + 1 < s.len() && s[p + 1] == q {
-                    out.push(q);
-                    p += 2;
-                    continue;
-                }
-                return Some((out, p + 1));
-            }
-            out.push(s[p]);
-            p += 1;
-        }
-        return None;
-    }
-    let start = p;
-    while p < s.len() && is_ident_byte(s[p]) {
-        p += 1;
-    }
-    (p > start).then(|| (s[start..p].to_vec(), p))
-}
-
-/// Whether the word before `at` is DROP: ALTER TABLE ... DROP FOREIGN KEY
-fn after_drop(s: &[u8], at: usize) -> bool {
-    let mut end = at;
-    while end > 0 && s[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    end >= 4 && s[end - 4..end].eq_ignore_ascii_case(b"DROP") && (end == 4 || !is_word(s[end - 5]))
-}
-
-/// The bytes inside the parentheses at `p`, and the position after them
-fn paren_list(s: &[u8], p: usize) -> Option<(&[u8], usize)> {
-    if p >= s.len() || s[p] != b'(' {
-        return None;
-    }
-    let mut depth = 0;
-    for (i, &c) in s.iter().enumerate().skip(p) {
-        match c {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((&s[p + 1..i], i + 1));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The FOREIGN KEY clause at `at`, rewritten into `out`: its end, or None
-/// when it does not parse (the scan goes on past it)
-fn foreign_key(
-    s: &[u8],
-    at: usize,
-    db: &str,
-    table: &str,
-    out: &mut String,
-) -> Result<Option<usize>> {
-    type Clause<'a> = (&'a [u8], Vec<u8>, Vec<u8>, &'a [u8], Vec<u8>, usize);
-    let parse = || -> Option<Clause<'_>> {
-        let mut p = keyword(s, at, "FOREIGN")?;
-        p = keyword(s, skip_ws(s, p), "KEY")?;
-        // An index name before the column list
-        p = skip_ws(s, p);
-        if p < s.len() && s[p] != b'(' {
-            p = skip_ws(s, ident(s, p)?.1);
-        }
-        let (child, np) = paren_list(s, p)?;
-        p = keyword(s, skip_ws(s, np), "REFERENCES")?;
-        p = skip_ws(s, p);
-        let (mut parent_table, np) = ident(s, p)?;
-        p = np;
-        let mut parent_db = Vec::new();
-        if p < s.len() && s[p] == b'.' {
-            parent_db = parent_table;
-            let (t, np) = ident(s, p + 1)?;
-            parent_table = t;
-            p = np;
-        }
-        p = skip_ws(s, p);
-        let mut parent_columns: &[u8] = &[];
-        if p < s.len() && s[p] == b'(' {
-            let (cols, np) = paren_list(s, p)?;
-            parent_columns = cols;
-            p = skip_ws(s, np);
-        }
-        // ON DELETE / ON UPDATE actions, verbatim
-        let mut actions = Vec::new();
-        for _ in 0..2 {
-            let Some(after_on) = keyword(s, p, "ON") else {
-                break;
-            };
-            let kw = skip_ws(s, after_on);
-            let Some(after_event) = keyword(s, kw, "DELETE").or_else(|| keyword(s, kw, "UPDATE"))
-            else {
-                break;
-            };
-            let action = skip_ws(s, after_event);
-            let mut end = action;
-            while end < s.len() && (s[end].is_ascii_alphabetic() || s[end] == b' ') {
-                end += 1;
-            }
-            while end > action && s[end - 1].is_ascii_whitespace() {
-                end -= 1;
-            }
-            // Rebuilt from its words: a comment between them stays out of
-            // stoolap's SQL
-            if !actions.is_empty() {
-                actions.push(b' ');
-            }
-            actions.extend_from_slice(b"ON ");
-            actions.extend_from_slice(&s[kw..after_event]);
-            actions.push(b' ');
-            actions.extend_from_slice(&s[action..end]);
-            p = skip_ws(s, end);
-        }
-        Some((child, parent_db, parent_table, parent_columns, actions, p))
-    };
-    let Some((child, parent_db, parent_table, parent_columns, actions, end)) = parse() else {
-        // FOREIGN not followed by KEY is no clause; DROP FOREIGN KEY names
-        // a key to drop; anything else is a clause that would be lost, and
-        // with it the key
-        let is_clause = keyword(s, at, "FOREIGN")
-            .and_then(|p| keyword(s, skip_ws(s, p), "KEY"))
-            .is_some();
-        if !is_clause || after_drop(s, at) {
-            return Ok(None);
-        }
-        return Err(Error::NotSupported(
-            "a FOREIGN KEY clause the plugin cannot read: write it as FOREIGN KEY \
-             [name] (column) REFERENCES table (column)"
-                .into(),
-        ));
-    };
-    // The names as written, in the client's character set: as UTF-8 only,
-    // since a lossy one could name another column ('\u{FFFD}' is one)
-    let utf8 = |b: &[u8]| -> Result<String> {
-        String::from_utf8(b.to_vec()).map_err(|_| {
-            Error::NotSupported(
-                "FOREIGN KEY names that are not UTF-8: create the table from a utf8mb4 \
-                 connection"
-                    .into(),
-            )
-        })
-    };
-    let (child, parent_db, parent_table, parent_columns, actions) = (
-        utf8(child)?,
-        utf8(&parent_db)?,
-        utf8(&parent_table)?,
-        utf8(parent_columns)?,
-        utf8(&actions)?,
-    );
-
-    // Stoolap's foreign keys are single-column: dropping a composite one
-    // would let the CREATE succeed and accept violating rows unseen
-    if child.contains(',') || parent_columns.contains(',') {
-        return Err(Error::NotSupported(format!(
-            "composite FOREIGN KEY ({}): stoolap enforces single-column \
-             foreign keys only.",
-            child
-        )));
-    }
-    // Stoolap's name for the parent comes from MariaDB's file name for it,
-    // which encodes every character past [0-9A-Za-z_] (p$1 is p@00241)
-    let plain = |n: &str| n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
-    let parent_db = if parent_db.is_empty() {
-        db.to_string()
-    } else {
-        parent_db
-    };
-    if !plain(&parent_table) || !plain(&parent_db) {
-        return Err(Error::NotSupported(format!(
-            "FOREIGN KEY parent '{}': the plugin names a parent table only \
-             when its database and table names are letters, digits and _",
-            parent_table
-        )));
-    }
-    let parent = flat_name(&parent_db, &parent_table);
+/// Appends `fk`, a key of `table`, as a clause of its CREATE TABLE
+fn foreign_key(fk: &ForeignKey, table: &str, out: &mut String) -> Result<()> {
     // Stoolap looks the parent up at CREATE, before this table exists
-    if parent == table {
+    if fk.parent == table {
         return Err(Error::NotSupported(format!(
             "self-referencing FOREIGN KEY on '{}': stoolap resolves the \
              parent at CREATE-time, before the table is registered.",
-            table
+            fk.column
         )));
     }
     out.push_str(", FOREIGN KEY (");
-    out.push_str(&child);
+    out.push_str(&quote(&fk.column));
     out.push_str(") REFERENCES ");
-    out.push_str(&quote(&parent));
-    if !parent_columns.is_empty() {
+    out.push_str(&quote(&fk.parent));
+    if let Some(c) = &fk.parent_column {
         out.push_str(" (");
-        out.push_str(&parent_columns);
+        out.push_str(&quote(c));
         out.push(')');
     }
-    if !actions.is_empty() {
+    for (event, action) in [("DELETE", fk.on_delete), ("UPDATE", fk.on_update)] {
+        let words = match action {
+            STOOLAP_FK_UNDEF => continue,
+            STOOLAP_FK_RESTRICT => "RESTRICT",
+            STOOLAP_FK_NO_ACTION => "NO ACTION",
+            STOOLAP_FK_CASCADE => "CASCADE",
+            STOOLAP_FK_SET_NULL => "SET NULL",
+            STOOLAP_FK_SET_DEFAULT => "SET DEFAULT",
+            _ => return Err(Error::internal("unknown FOREIGN KEY action")),
+        };
+        out.push_str(" ON ");
+        out.push_str(event);
         out.push(' ');
-        out.push_str(&actions);
-    }
-    Ok(Some(end))
-}
-
-/// Appends every FOREIGN KEY clause of `sql` (outside quotes) to `out`,
-/// each led by ", ". `sql` is the statement's bytes as the client sent
-/// them: any character set, a NUL inside a literal
-fn foreign_keys(s: &[u8], db: &str, table: &str, out: &mut String) -> Result<()> {
-    let mut i = 0;
-    while i < s.len() {
-        if let Some(end) = comment_end(s, i) {
-            i = end;
-            continue;
-        }
-        match s[i] {
-            q @ (b'\'' | b'"' | b'`') => {
-                i += 1;
-                while i < s.len() && s[i] != q {
-                    i += if s[i] == b'\\' && i + 1 < s.len() {
-                        2
-                    } else {
-                        1
-                    };
-                }
-                i += 1;
-            }
-            _ if keyword(s, i, "FOREIGN").is_some() => {
-                i = foreign_key(s, i, db, table, out)?.unwrap_or(i + 1);
-            }
-            _ => i += 1,
-        }
+        out.push_str(words);
     }
     Ok(())
 }
@@ -539,18 +254,40 @@ fn foreign_keys(s: &[u8], db: &str, table: &str, out: &mut String) -> Result<()>
 mod tests {
     use super::*;
 
-    fn fks(sql: &str, table: &str) -> Result<String> {
-        let mut out = String::new();
-        foreign_keys(sql.as_bytes(), "d", table, &mut out).map(|_| out)
+    #[test]
+    fn foreign_key_clauses() {
+        let fk = |parent: &str, parent_column: Option<&str>, on_delete, on_update| ForeignKey {
+            column: "p\"id".into(),
+            parent: parent.into(),
+            parent_column: parent_column.map(Into::into),
+            on_delete,
+            on_update,
+        };
+        let sql = |k: ForeignKey| {
+            let mut out = String::new();
+            foreign_key(&k, "d_1c", &mut out).map(|_| out)
+        };
+        assert_eq!(
+            sql(fk("d_1p", Some("id"), STOOLAP_FK_CASCADE, STOOLAP_FK_SET_NULL)).unwrap(),
+            ", FOREIGN KEY (\"p\"\"id\") REFERENCES \"d_1p\" (\"id\") ON DELETE CASCADE ON UPDATE SET NULL"
+        );
+        assert_eq!(
+            sql(fk("o_1p", None, STOOLAP_FK_UNDEF, STOOLAP_FK_NO_ACTION)).unwrap(),
+            ", FOREIGN KEY (\"p\"\"id\") REFERENCES \"o_1p\" ON UPDATE NO ACTION"
+        );
+        assert!(sql(fk("d_1c", Some("id"), STOOLAP_FK_UNDEF, STOOLAP_FK_UNDEF)).is_err());
+        assert!(sql(fk("d_1p", Some("id"), 9, STOOLAP_FK_UNDEF)).is_err());
     }
 
     #[test]
-    fn foreign_key_clauses() {
-        assert_eq!(flat_name("a_b", "c/d"), "a_0b_1c_1d");
-        let long = flat_name(&"_".repeat(64), &"_".repeat(64));
+    fn long_names() {
+        let long = fit_name(format!("{}_1{}", "_0".repeat(64), "_0".repeat(64)));
         assert_eq!(long.len(), 255);
         assert!(long.starts_with("_0_0") && long.contains("_2"));
-        assert_ne!(long, flat_name(&"_".repeat(64), &"_".repeat(63)));
+        assert_ne!(
+            long,
+            fit_name(format!("{}_1{}", "_0".repeat(64), "_0".repeat(63)))
+        );
         let fits = "a".repeat(255);
         assert_eq!(fit_name(fits.clone()), fits);
         assert_eq!(fit_name("a".repeat(256)).len(), 255);
@@ -558,133 +295,5 @@ mod tests {
             fit_name("a".repeat(256)).to_lowercase(),
             fit_name("A".repeat(256)).to_lowercase()
         );
-        assert_eq!(
-            fks(
-                "CREATE TABLE c (id INT, pid INT, CONSTRAINT f FOREIGN KEY fk (pid) REFERENCES `p` (id) ON DELETE CASCADE ON UPDATE SET NULL)",
-                "d_1c"
-            )
-            .unwrap(),
-            ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id) ON DELETE CASCADE ON UPDATE SET NULL"
-        );
-        assert_eq!(
-            fks(
-                "CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES o.p(id))",
-                "d_1c"
-            )
-            .unwrap(),
-            ", FOREIGN KEY (pid) REFERENCES \"o_1p\" (id)"
-        );
-        assert_eq!(
-            fks(
-                "CREATE TABLE c (v VARCHAR(9) DEFAULT 'FOREIGN KEY (x) REFERENCES y')",
-                "d_1c"
-            )
-            .unwrap(),
-            ""
-        );
-        assert!(fks(
-            "CREATE TABLE c (a INT, b INT, FOREIGN KEY (a, b) REFERENCES p (x, y))",
-            "d_1c"
-        )
-        .is_err());
-        assert!(fks(
-            "CREATE TABLE c (a INT, FOREIGN KEY (a) REFERENCES c (id))",
-            "d_1c"
-        )
-        .is_err());
-        // A NUL inside a literal, and bytes that are not UTF-8 (a latin1
-        // comment), do not stop the scan
-        let mut out = String::new();
-        foreign_keys(
-            b"CREATE TABLE c (b VARBINARY(4) DEFAULT 'a\0b', pid INT, FOREIGN KEY (pid) REFERENCES p (id)) COMMENT='caf\xe9'",
-            "d",
-            "d_1c",
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(out, ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id)");
-        // ANSI_QUOTES
-        assert_eq!(
-            fks(
-                "CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES \"p\" (id))",
-                "d_1c"
-            )
-            .unwrap(),
-            ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id)"
-        );
-        // A parent whose MariaDB file name is encoded (p$1 is p@00241) is
-        // refused rather than named wrong
-        for parent in ["p$1", "`a``b`", "p\u{e9}"] {
-            let sql =
-                format!("CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES {parent} (id))");
-            assert!(fks(&sql, "d_1c").is_err(), "{parent}");
-        }
-        // FOREIGN in a name is no clause
-        for sql in [
-            "CREATE TABLE c (x$FOREIGN INT, y\u{e9}foreign INT)",
-            "CREATE TABLE d.foreign (id INT)",
-            "CREATE TABLE c (foreign_id INT)",
-        ] {
-            assert_eq!(fks(sql, "d_1c").unwrap(), "", "{sql}");
-        }
-        // Comments between the tokens of a clause, as MariaDB's lexer skips them
-        assert_eq!(
-            fks(
-                "CREATE TABLE c (pid INT, FOREIGN /* a */ KEY # b\n (pid) -- c\n REFERENCES /*d*/ p (id) ON /* e */ DELETE CASCADE)",
-                "d_1c"
-            )
-            .unwrap(),
-            ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id) ON DELETE CASCADE"
-        );
-        // So is the current database's
-        let mut out = String::new();
-        assert!(foreign_keys(
-            b"CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES p (id))",
-            "my-db",
-            "my@002ddb_1c",
-            &mut out,
-        )
-        .is_err());
-        // DROP FOREIGN KEY names a key, comments are skipped, /*! */ runs
-        assert_eq!(
-            fks(
-                "ALTER TABLE c DROP FOREIGN KEY fk_1, ADD COLUMN x INT",
-                "d_1c"
-            )
-            .unwrap(),
-            ""
-        );
-        assert_eq!(
-            fks(
-                "CREATE TABLE c (pid INT /* FOREIGN KEY later */, x INT) -- FOREIGN KEY\n",
-                "d_1c"
-            )
-            .unwrap(),
-            ""
-        );
-        assert_eq!(
-            fks(
-                "CREATE TABLE c (pid INT /*! , FOREIGN KEY (pid) REFERENCES p (id) */)",
-                "d_1c"
-            )
-            .unwrap(),
-            ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id)"
-        );
-        // A clause that does not read is refused, not dropped with its key
-        assert!(fks(
-            "CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES (id))",
-            "d_1c"
-        )
-        .is_err());
-        // A name in another character set is refused, not read lossily
-        // (which could name another column)
-        let mut out = String::new();
-        assert!(foreign_keys(
-            b"CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES p (`\xe9`))",
-            "d",
-            "d_1c",
-            &mut out,
-        )
-        .is_err());
     }
 }

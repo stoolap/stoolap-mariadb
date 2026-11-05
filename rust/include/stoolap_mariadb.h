@@ -629,25 +629,38 @@ typedef struct StoolapKeyDef {
 /** The table was created, but some indexes were not (stoolap_errmsg). */
 #define STOOLAP_INDEX_FAILED 3
 
+/** A FOREIGN KEY's ON DELETE / ON UPDATE action: MariaDB's enum_fk_option. */
+#define STOOLAP_FK_UNDEF        0
+#define STOOLAP_FK_RESTRICT     1
+#define STOOLAP_FK_NO_ACTION    2
+#define STOOLAP_FK_CASCADE      3
+#define STOOLAP_FK_SET_NULL     4
+#define STOOLAP_FK_SET_DEFAULT  5
+
+/** A single-column FOREIGN KEY, as MariaDB's parser read it. */
+typedef struct StoolapForeignKeyDef {
+    const char* column;
+    /** The parent table, by stoolap's name */
+    const char* parent;
+    /** NULL: the parent's primary key */
+    const char* parent_column;
+    int32_t on_delete;
+    int32_t on_update;
+} StoolapForeignKeyDef;
+
 /**
  * Create `table` (stoolap's name) from `columns` and `keys` (in MariaDB's
- * key order), in MariaDB's database `db_name`, with its secondary indexes.
- * A single-column PRIMARY KEY is inline; a composite one and each UNIQUE
+ * key order), with its `foreign_keys` and secondary indexes. A
+ * single-column PRIMARY KEY is inline; a composite one and each UNIQUE
  * key are table-level constraints, numbered in that order (the ordinals
- * stoolap_error_class gives). `create_sql`, the statement's
- * `create_sql_len` bytes as the client sent them (any character set, NUL
- * inside literals) or NULL, is read for FOREIGN KEY clauses, which
- * MariaDB does not hand an engine
- * that does not claim them; their parent tables get stoolap's names, and a
- * composite or self-referencing one is refused.
+ * stoolap_error_class gives). A self-referencing foreign key is refused.
  */
 int32_t stoolap_create_table(
     StoolapDB* db,
     const char* table,
-    const char* db_name,
     const StoolapColumnDef* columns, int32_t ncolumns,
     const StoolapKeyDef* keys, int32_t nkeys,
-    const uint8_t* create_sql, int64_t create_sql_len,
+    const StoolapForeignKeyDef* foreign_keys, int32_t nforeign_keys,
     int32_t if_not_exists
 );
 

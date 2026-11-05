@@ -66,10 +66,10 @@ INSERT INTO tchild  VALUES (10,1),(20,2);
     h.assert_ok("TRUNCATE parent (now ok)", "TRUNCATE TABLE tparent")
     h.assert_scalar("post-success TRUNCATE COUNT", "SELECT COUNT(*) FROM tparent", "0")
 
-    # The CREATE's FOREIGN KEY clauses are read from the statement's bytes
-    # as the client sent them: a NUL inside a literal before the clause
-    # must not hide it, nor bytes of another character set stop the scan.
-    h.section("FOREIGN KEY read past a NUL literal and non-UTF-8 text")
+    # The FOREIGN KEYs come from MariaDB's parser: a NUL inside a literal
+    # before the clause, or a client in another character set, changes
+    # nothing.
+    h.section("FOREIGN KEY next to a NUL literal and non-UTF-8 text")
     h.exec_script(f"""
 CREATE TABLE np (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
 INSERT INTO np VALUES (1);
@@ -99,8 +99,8 @@ INSERT INTO np VALUES (1);
     h.assert_err("FK of the latin1 CREATE is enforced",
                  "INSERT INTO nl VALUES (1, 99)",
                  r"foreign key constraint fails")
-    # A latin1 name in the clause would read lossily as U+FFFD, itself a
-    # column name: the CREATE is refused instead of binding to that one.
+    # A latin1 name binds to its own column, not to U+FFFD, which is
+    # another column's name: the parser converts it.
     h.exec_stmt("CREATE TABLE nq (`\u00e9` INT NOT NULL PRIMARY KEY, "
                 f"`\ufffd` INT, UNIQUE KEY u (`\ufffd`)) ENGINE={h.engine}")
     h.exec_stmt("INSERT INTO nq VALUES (1, 99)")
@@ -112,14 +112,16 @@ INSERT INTO np VALUES (1);
             "CREATE TABLE nr (id INT NOT NULL PRIMARY KEY, pid INT, "
             "FOREIGN KEY (pid) REFERENCES nq (`\u00e9`)) "
             f"ENGINE={h.engine}")
-        h._fail("latin1 FK name refused", "the CREATE succeeded")
+        h._pass("latin1 FK names a column")
     except mysql.connector.Error as e:
-        if "not UTF-8" in str(e):
-            h._pass("latin1 FK name refused")
-        else:
-            h._fail("latin1 FK name refused", str(e))
+        h._fail("latin1 FK names a column", str(e))
     finally:
         c.close()
+    h.assert_ok("latin1 FK accepts the parent's key",
+                "INSERT INTO nr VALUES (1, 1)")
+    h.assert_err("latin1 FK refuses the other column's value",
+                 "INSERT INTO nr VALUES (2, 99)",
+                 r"foreign key constraint fails")
 
     # Every spelling of a parent the clause reader takes, and refuses
     # rather than drop or misname: an FK it cannot read would leave the
@@ -154,7 +156,37 @@ INSERT INTO sp VALUES (1);
     h.assert_ok("a comment naming FOREIGN KEY is not a clause",
                 "CREATE TABLE sm (pid INT /* FOREIGN KEY later */, "
                 f"x INT) ENGINE={h.engine}")
-    h.assert_err("a parent with an encoded file name is refused",
-                 "CREATE TABLE sd (pid INT, FOREIGN KEY (pid) REFERENCES "
-                 f"`sp$1` (id)) ENGINE={h.engine}",
-                 r"FOREIGN KEY parent 'sp\$1'")
+    # A parent whose file name MariaDB encodes (sp$1 is sp@00241), in
+    # this database and another one whose name it encodes too
+    h.exec_script(f"""
+CREATE TABLE `sp$1` (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+INSERT INTO `sp$1` VALUES (1);
+CREATE DATABASE IF NOT EXISTS `my-db`;
+CREATE TABLE `my-db`.`P\u00e9` (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+INSERT INTO `my-db`.`P\u00e9` VALUES (1);
+""")
+    h.assert_ok("FK to a parent with an encoded file name",
+                "CREATE TABLE sd (pid INT, FOREIGN KEY (pid) REFERENCES "
+                f"`sp$1` (id)) ENGINE={h.engine}")
+    h.assert_ok("encoded parent's key accepted", "INSERT INTO sd VALUES (1)")
+    h.assert_err("the encoded parent's FK is enforced",
+                 "INSERT INTO sd VALUES (99)", r"foreign key constraint fails")
+    h.assert_ok("FK to an encoded parent in another database",
+                "CREATE TABLE `my-db`.c (pid INT, FOREIGN KEY (pid) REFERENCES "
+                f"`P\u00e9` (id) ON DELETE CASCADE) ENGINE={h.engine}")
+    h.assert_ok("child row", "INSERT INTO `my-db`.c VALUES (1)")
+    h.assert_err("the other database's FK is enforced",
+                 "INSERT INTO `my-db`.c VALUES (99)",
+                 r"foreign key constraint fails")
+    h.exec_script("DROP TABLE `my-db`.c; DROP DATABASE `my-db`")
+    # The actions come from the parser too
+    h.exec_script(f"""
+CREATE TABLE ap (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+INSERT INTO ap VALUES (1), (2);
+CREATE TABLE ac (id INT NOT NULL PRIMARY KEY, pid INT, FOREIGN KEY (pid)
+  REFERENCES ap (id) ON UPDATE CASCADE ON DELETE SET NULL) ENGINE={h.engine};
+INSERT INTO ac VALUES (1, 1), (2, 2);
+""")
+    h.assert_ok("delete a parent row", "DELETE FROM ap WHERE id = 1")
+    h.assert_scalar("ON DELETE SET NULL ran",
+                    "SELECT COUNT(*) FROM ac WHERE pid IS NULL", "1")

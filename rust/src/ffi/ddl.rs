@@ -16,7 +16,7 @@ use stoolap::core::{Error, Result};
 
 use super::types::StoolapDB;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
-use crate::ddl::{self, Column, Key};
+use crate::ddl::{self, Column, ForeignKey, Key};
 use crate::session::Session;
 
 /// The table was created, but some indexes were not (see
@@ -40,6 +40,19 @@ pub struct StoolapKeyDef {
     pub ncolumns: i32,
     /// `STOOLAP_KEYDEF_*`
     pub kind: i32,
+}
+
+#[repr(C)]
+pub struct StoolapForeignKeyDef {
+    /// The child column
+    pub column: *const c_char,
+    /// The parent table, by stoolap's name
+    pub parent: *const c_char,
+    /// NULL: the parent's primary key
+    pub parent_column: *const c_char,
+    /// `STOOLAP_FK_*`
+    pub on_delete: i32,
+    pub on_update: i32,
 }
 
 unsafe fn text<'a>(p: *const c_char, what: &str) -> Result<&'a str> {
@@ -86,10 +99,8 @@ unsafe fn on_session(
     }
 }
 
-/// Creates `table` (stoolap's name) from `columns` and `keys`, in
-/// MariaDB's database `db_name`; `create_sql`, the statement's
-/// `create_sql_len` bytes as the client sent them, may be NULL and is read
-/// for FOREIGN KEY clauses. `STOOLAP_INDEX_FAILED`
+/// Creates `table` (stoolap's name) from `columns`, `keys` and
+/// `foreign_keys`. `STOOLAP_INDEX_FAILED`
 /// when some secondary index was not created (listed in `stoolap_errmsg`).
 ///
 /// # Safety
@@ -100,13 +111,12 @@ unsafe fn on_session(
 pub unsafe extern "C" fn stoolap_create_table(
     db: *mut StoolapDB,
     table: *const c_char,
-    db_name: *const c_char,
     columns: *const StoolapColumnDef,
     ncolumns: i32,
     keys: *const StoolapKeyDef,
     nkeys: i32,
-    create_sql: *const u8,
-    create_sql_len: i64,
+    foreign_keys: *const StoolapForeignKeyDef,
+    nforeign_keys: i32,
     if_not_exists: i32,
 ) -> i32 {
     let mut failed = Vec::new();
@@ -136,19 +146,28 @@ pub unsafe extern "C" fn stoolap_create_table(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let sql = if create_sql.is_null() {
-            None
-        } else {
-            let len = usize::try_from(create_sql_len).map_err(|_| Error::internal("bad length"))?;
-            Some(std::slice::from_raw_parts(create_sql, len))
-        };
+        let fks = slice(foreign_keys, nforeign_keys)?
+            .iter()
+            .map(|f| {
+                Ok(ForeignKey {
+                    column: text(f.column, "foreign key column")?.to_string(),
+                    parent: text(f.parent, "foreign key parent")?.to_string(),
+                    parent_column: if f.parent_column.is_null() {
+                        None
+                    } else {
+                        Some(text(f.parent_column, "foreign key parent column")?.to_string())
+                    },
+                    on_delete: f.on_delete,
+                    on_update: f.on_update,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         failed = ddl::create_table(
             session,
             text(table, "table name")?,
-            text(db_name, "database name")?,
             &cols,
             &key_list,
-            sql,
+            &fks,
             if_not_exists != 0,
         )?;
         Ok(STOOLAP_OK)
