@@ -136,12 +136,26 @@ private:
     // from racing the global executor / error buffer.
     StoolapDB* ddl_db();
 
-    // Every read is a direct read (stoolap_read): rnd_next parses the
-    // cursor's current packed chunk, which the cursor owns, and fetches the
-    // next when it runs out. Chunks start small when the statement has a
-    // LIMIT and grow.
+    // Every read is a direct read (stoolap_read) into cursor_, which the
+    // handler keeps for all its reads: rnd_next parses the cursor's current
+    // packed chunk, which the cursor owns, and fetches the next when it
+    // runs out and the read has more (reading_). Chunks start small when
+    // the statement has a LIMIT and grow.
     stoolap_mariadb::CursorPtr cursor_;
+    bool reading_ = false;
     uint32_t cursor_chunk_ = 0;
+    StoolapCursor* read_cursor();
+    int load_chunk(int rc, const uint8_t* buf, int64_t len);
+    void end_read() {
+        if (reading_) stoolap_cursor_end(cursor_.get());
+        reading_ = false;
+    }
+    // At the end of a scan: also lets go of a buffer a large chunk grew,
+    // which a handler cached with its TABLE would keep otherwise.
+    void release_read() {
+        reset_scan_state();
+        if (cursor_) stoolap_cursor_end(cursor_.get());
+    }
     int open_read(const StoolapCond* conds, int32_t nconds,
                   const int32_t* order, int32_t norder, bool desc,
                   uint32_t first_chunk = 0);
@@ -170,7 +184,7 @@ private:
     // Centralized reset: a stale cursor left over from a prior read would
     // shadow a fresh one. Every scan entry point routes through here.
     void reset_scan_state() {
-        cursor_.reset();
+        end_read();
         pkt_ = nullptr;
         pkt_len_ = 0;
         scan_buf_pos_ = 0;
