@@ -596,14 +596,16 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
                         static_cast<int32_t>(parts[i].size()), kind});
     }
     const std::string db_name(form->s->db.str, form->s->db.length);
+    // The statement's bytes, by their length: a literal may hold a NUL,
+    // and the text is in the client's character set.
     LEX_STRING* qs = current_thd ? thd_query_string(current_thd) : nullptr;
-    const std::string sql =
-        qs && qs->str ? std::string(qs->str, qs->length) : std::string();
+    const bool has_sql = qs && qs->str;
     const int rc = stoolap_create_table(
         db, tbl.c_str(), db_name.c_str(), columns.data(),
         static_cast<int32_t>(columns.size()), keys.data(),
         static_cast<int32_t>(keys.size()),
-        qs && qs->str ? sql.c_str() : nullptr, if_not_exists);
+        has_sql ? reinterpret_cast<const uint8_t*>(qs->str) : nullptr,
+        has_sql ? static_cast<int64_t>(qs->length) : 0, if_not_exists);
     if (rc == STOOLAP_INDEX_FAILED) {
         sql_print_warning(
             "stoolap: failed to create indexes of '%s': %s -- queries on "

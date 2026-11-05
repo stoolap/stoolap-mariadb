@@ -74,7 +74,7 @@ pub fn create_table(
     db: &str,
     columns: &[Column],
     keys: &[Key],
-    create_sql: Option<&str>,
+    create_sql: Option<&[u8]>,
     if_not_exists: bool,
 ) -> Result<Vec<String>> {
     let column_name = |i: usize| -> Result<&str> {
@@ -359,9 +359,9 @@ fn foreign_key(
 }
 
 /// Appends every FOREIGN KEY clause of `sql` (outside quotes) to `out`,
-/// each led by ", "
-fn foreign_keys(sql: &str, db: &str, table: &str, out: &mut String) -> Result<()> {
-    let s = sql.as_bytes();
+/// each led by ", ". `sql` is the statement's bytes as the client sent
+/// them: any character set, a NUL inside a literal
+fn foreign_keys(s: &[u8], db: &str, table: &str, out: &mut String) -> Result<()> {
     let mut i = 0;
     while i < s.len() {
         match s[i] {
@@ -391,7 +391,7 @@ mod tests {
 
     fn fks(sql: &str, table: &str) -> Result<String> {
         let mut out = String::new();
-        foreign_keys(sql, "d", table, &mut out).map(|_| out)
+        foreign_keys(sql.as_bytes(), "d", table, &mut out).map(|_| out)
     }
 
     #[test]
@@ -431,5 +431,16 @@ mod tests {
             "d_1c"
         )
         .is_err());
+        // A NUL inside a literal, and bytes that are not UTF-8 (a latin1
+        // comment), do not stop the scan
+        let mut out = String::new();
+        foreign_keys(
+            b"CREATE TABLE c (b VARBINARY(4) DEFAULT 'a\0b', pid INT, FOREIGN KEY (pid) REFERENCES p (id)) COMMENT='caf\xe9'",
+            "d",
+            "d_1c",
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, ", FOREIGN KEY (pid) REFERENCES \"d_1p\" (id)");
     }
 }

@@ -87,8 +87,9 @@ unsafe fn on_session(
 }
 
 /// Creates `table` (stoolap's name) from `columns` and `keys`, in
-/// MariaDB's database `db_name`; `create_sql`, the statement's text, may
-/// be NULL and is read for FOREIGN KEY clauses. `STOOLAP_INDEX_FAILED`
+/// MariaDB's database `db_name`; `create_sql`, the statement's
+/// `create_sql_len` bytes as the client sent them, may be NULL and is read
+/// for FOREIGN KEY clauses. `STOOLAP_INDEX_FAILED`
 /// when some secondary index was not created (listed in `stoolap_errmsg`).
 ///
 /// # Safety
@@ -104,7 +105,8 @@ pub unsafe extern "C" fn stoolap_create_table(
     ncolumns: i32,
     keys: *const StoolapKeyDef,
     nkeys: i32,
-    create_sql: *const c_char,
+    create_sql: *const u8,
+    create_sql_len: i64,
     if_not_exists: i32,
 ) -> i32 {
     let mut failed = Vec::new();
@@ -137,7 +139,8 @@ pub unsafe extern "C" fn stoolap_create_table(
         let sql = if create_sql.is_null() {
             None
         } else {
-            Some(text(create_sql, "CREATE statement")?)
+            let len = usize::try_from(create_sql_len).map_err(|_| Error::internal("bad length"))?;
+            Some(std::slice::from_raw_parts(create_sql, len))
         };
         failed = ddl::create_table(
             session,
