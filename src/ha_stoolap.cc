@@ -408,6 +408,7 @@ namespace {
 // MariaDB hands us "./db/tbl"; both db and tbl can contain '_' and '/'.
 // Inject `_0` for `_` and `_1` for `/` so distinct (db, tbl) pairs never
 // collide (naive `/` -> `__` collides on db=`p`,tbl=`q__r` vs db=`p__q`,tbl=`r`).
+// One past stoolap's name limit is shortened (fit_table_name).
 std::string stoolap_table_from_path(const char* mariadb_path) {
     if (!mariadb_path) return std::string();
     std::string_view s(mariadb_path);
@@ -422,7 +423,7 @@ std::string stoolap_table_from_path(const char* mariadb_path) {
         else
             out.push_back(c);
     }
-    return out;
+    return stoolap_mariadb::fit_table_name(std::move(out));
 }
 
 std::string quote_ident(std::string_view s) {

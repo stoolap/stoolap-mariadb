@@ -150,7 +150,7 @@ std::string stoolap_name_for(const char* db, const char* tbl) {
         out.append("_1");
     }
     append_escaped(out, tbl);
-    return out;
+    return stoolap_mariadb::fit_table_name(std::move(out));
 }
 
 struct LeafName {

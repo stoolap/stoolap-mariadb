@@ -139,6 +139,15 @@ struct PushdownStats {
     std::atomic<uint64_t> perf_next_row_count{0};
 };
 
+// `flat`, the escaped (db, table) name, as stoolap holds it: a long one
+// shortened (stoolap_fit_table_name).
+inline std::string fit_table_name(std::string flat) {
+    char out[STOOLAP_MAX_TABLE_NAME];
+    const size_t n = stoolap_fit_table_name(flat.data(), flat.size(), out);
+    if (n) flat.assign(out, n);
+    return flat;
+}
+
 // Hot-path read with memory_order_relaxed; bool read + branch, free off.
 extern std::atomic<bool> g_perf_trace_enabled;
 
