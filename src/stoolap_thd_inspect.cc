@@ -84,7 +84,8 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
 
 bool stoolap_thd_altered_table(
     THD* thd, std::string* path,
-    std::vector<std::pair<std::string, std::string>>* renames) {
+    std::vector<std::pair<std::string, std::string>>* renames,
+    std::vector<std::string>* dropped) {
     if (!thd || !thd->lex) return false;
     LEX* lex = thd->lex;
     if (lex->sql_command != SQLCOM_ALTER_TABLE &&
@@ -93,7 +94,17 @@ bool stoolap_thd_altered_table(
         return false;
     const TABLE_LIST* t = lex->query_tables;
     if (!t) return false;
-    *path = file_name(t->db) + '/' + file_name(t->table_name);
+    // The opened table's own path: a TEMPORARY one is a file in the
+    // tmpdir, not the permanent table of its name
+    if (t->table)
+        path->assign(t->table->s->normalized_path.str,
+                     t->table->s->normalized_path.length);
+    else
+        *path = file_name(t->db) + '/' + file_name(t->table_name);
+    List_iterator_fast<Alter_drop> drops(lex->alter_info.drop_list);
+    while (const Alter_drop* d = drops++) {
+        if (d->type == Alter_drop::COLUMN) dropped->emplace_back(d->name);
+    }
     // CHANGE old new ...
     List_iterator_fast<Create_field> fields(lex->alter_info.create_list);
     while (const Create_field* f = fields++) {

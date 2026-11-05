@@ -109,7 +109,8 @@ unsafe fn on_session(
 /// Creates `table` (stoolap's name) from `columns`, `keys` and
 /// `foreign_keys`, and, when `keep_from` is not NULL, the foreign keys of
 /// that table, which a copying ALTER rebuilds into this one (`renames`,
-/// the columns it renames). `STOOLAP_INDEX_FAILED`
+/// the columns it renames; `dropped`, those it drops).
+/// `STOOLAP_INDEX_FAILED`
 /// when some secondary index was not created (listed in `stoolap_errmsg`).
 ///
 /// # Safety
@@ -129,6 +130,8 @@ pub unsafe extern "C" fn stoolap_create_table(
     keep_from: *const c_char,
     renames: *const StoolapColumnRename,
     nrenames: i32,
+    dropped: *const *const c_char,
+    ndropped: i32,
     if_not_exists: i32,
 ) -> i32 {
     let mut failed = Vec::new();
@@ -170,7 +173,16 @@ pub unsafe extern "C" fn stoolap_create_table(
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            ddl::kept_foreign_keys(session, text(keep_from, "altered table")?, &renames)?
+            let dropped = slice(dropped, ndropped)?
+                .iter()
+                .map(|&d| Ok(text(d, "dropped column")?.to_string()))
+                .collect::<Result<Vec<_>>>()?;
+            ddl::kept_foreign_keys(
+                session,
+                text(keep_from, "altered table")?,
+                &renames,
+                &dropped,
+            )?
         };
         let new_fks = slice(foreign_keys, nforeign_keys)?
             .iter()

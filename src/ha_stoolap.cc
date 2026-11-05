@@ -640,18 +640,23 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
     std::string altered;
     std::vector<std::pair<std::string, std::string>> renamed;
     std::vector<StoolapColumnRename> renames;
+    std::vector<std::string> dropped;
+    std::vector<const char*> drops;
     if (with_fks &&
-        stoolap_thd_altered_table(current_thd, &altered, &renamed)) {
+        stoolap_thd_altered_table(current_thd, &altered, &renamed, &dropped)) {
         altered = stoolap_table_from_path(altered.c_str());
         for (const auto& r : renamed)
             renames.push_back({r.first.c_str(), r.second.c_str()});
+        for (const auto& d : dropped)
+            drops.push_back(d.c_str());
     }
     const int rc = stoolap_create_table(
         db, tbl.c_str(), columns.data(), static_cast<int32_t>(columns.size()),
         keys.data(), static_cast<int32_t>(keys.size()), fk_defs.data(),
         static_cast<int32_t>(fk_defs.size()),
         altered.empty() ? nullptr : altered.c_str(), renames.data(),
-        static_cast<int32_t>(renames.size()), if_not_exists);
+        static_cast<int32_t>(renames.size()), drops.data(),
+        static_cast<int32_t>(drops.size()), if_not_exists);
     if (rc == STOOLAP_INDEX_FAILED) {
         sql_print_warning(
             "stoolap: failed to create indexes of '%s': %s -- queries on "
