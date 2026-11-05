@@ -559,7 +559,10 @@ SELECT n FROM mixq_other.q;
             "UPDATE concat SET v = concat('1', '2') WHERE id = 1",
         ]:
             cur.execute(stmt)
-        h.assert_eq("keyword and call words fall back", 0,
+        # Without case folding the first one's SET is no match: direct
+        cur.execute("SELECT @@lower_case_table_names")
+        folds = int(cur.fetchone()[0]) != 0
+        h.assert_eq("keyword and call words fall back", 0 if folds else 1,
                     _direct_hits(h) - before)
         cur.execute("SELECT id, v FROM `set` ORDER BY id")
         h.assert_eq("a table named set", [(1, 1), (2, 2)], cur.fetchall())
