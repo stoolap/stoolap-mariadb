@@ -93,8 +93,10 @@ public:
     bool unit(SELECT_LEX_UNIT* u, const std::vector<std::string>* names);
     // A single-table UPDATE / DELETE (gen_modify).
     bool modify(SELECT_LEX* sel, Item* where);
-    // Its checked SET value, if any (ModifyGuard)
+    // Its checked SET value, if any (ModifyGuard), and how to count the
+    // rows it finds (ModifyCount)
     ModifyGuard guard;
+    ModifyCount count;
 
     std::string out;
     const char* why = nullptr;
@@ -156,7 +158,8 @@ private:
                           std::string* lit);
     bool compare(Item_func* f, Item** a, const char* op);
     bool args_csv(Item** args, uint n);
-    bool assignment(Item* target, const Field* fl, Item* v);
+    bool assignment(Item* target, const Field* fl, Item* v,
+                    std::string* stored);
 
     Cls cls(Item* it);
     bool cs_safe(const CHARSET_INFO* cs);
@@ -1458,6 +1461,53 @@ bool Gen::order_list(SQL_I_List<ORDER>* lst, bool directions) {
     return true;
 }
 
+// Whether the running server stores a DOUBLE's -0.0 as 0.0, which
+// Field_double::store does from 11.4.11 on: the server's version, as the
+// plugin may run on another 11.4 than it was built against
+bool server_stores_zero_for_negative_zero() {
+    static const bool yes = [] {
+        unsigned major = 0, minor = 0, patch = 0;
+        if (std::sscanf(server_version, "%u.%u.%u", &major, &minor, &patch) !=
+            3)
+            return false;
+        if (major != 11) return major > 11;
+        if (minor != 4) return minor > 4;
+        return patch >= 11;
+    }();
+    return yes;
+}
+
+// Whether `it` takes at most one row of `tb`: an equality of its
+// single-column primary key with a constant, alone or in an AND
+bool pk_equality(Item* it, TABLE* tb) {
+    if (it->type() == Item::COND_ITEM &&
+        static_cast<Item_cond*>(it)->functype() == Item_func::COND_AND_FUNC) {
+        List_iterator<Item> li(*static_cast<Item_cond*>(it)->argument_list());
+        while (Item* a = li++)
+            if (pk_equality(a, tb)) return true;
+        return false;
+    }
+    if (it->type() != Item::FUNC_ITEM) return false;
+    auto* f = static_cast<Item_func*>(it);
+    if (f->functype() != Item_func::EQ_FUNC || f->argument_count() != 2)
+        return false;
+    const uint pk = tb->s->primary_key;
+    if (pk >= MAX_KEY || tb->key_info[pk].user_defined_key_parts != 1)
+        return false;
+    const uint col = tb->key_info[pk].key_part[0].fieldnr - 1;
+    for (int i = 0; i < 2; ++i) {
+        Item* a = f->arguments()[i]->real_item();
+        Item* b = f->arguments()[1 - i];
+        if (a->type() == Item::FIELD_ITEM) {
+            const Field* fl = static_cast<Item_field*>(a)->field;
+            if (fl && fl->table == tb && fl->field_index == col &&
+                b->const_item())
+                return true;
+        }
+    }
+    return false;
+}
+
 // A single-table UPDATE / DELETE. Stoolap's UPDATE takes no alias, so
 // the table's own name qualifies its columns.
 bool Gen::modify(SELECT_LEX* sel, Item* where) {
@@ -1467,6 +1517,7 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
         return fail("modified table");
     const std::string name = quote_ident(stoolap_table_name(t->table->s));
     alias_[t] = name;
+    std::string changes;  // UPDATE: a row's SET changes it
     if (thd_->lex->sql_command == SQLCOM_UPDATE) {
         // What MariaDB does around the row it writes: its CHECK
         // constraints, its ON UPDATE CURRENT_TIMESTAMP columns
@@ -1480,6 +1531,11 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
         Item* f;
         Item* v;
         bool first = true;
+        // MariaDB counts (and writes) only the rows a SET changes, unless
+        // the client asked for the rows found (CLIENT_FOUND_ROWS): the
+        // statement then names them, a column against what it stores
+        const bool changed_only =
+            !(thd_->client_capabilities & CLIENT_FOUND_ROWS);
         while ((f = fit++)) {
             if (!(v = vit++)) return fail("SET without a value");
             if (f->type() != Item::FIELD_ITEM) return fail("SET target");
@@ -1487,18 +1543,47 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             if (!fl || fl->table != t->table) return fail("SET target");
             if (!first) out += ", ";
             first = false;
-            ident(std::string_view(fl->field_name.str, fl->field_name.length));
-            out += " = ";
-            if (!assignment(f, fl, v)) return false;
+            const std::string column = quote_ident(
+                std::string_view(fl->field_name.str, fl->field_name.length));
+            out += column + " = ";
+            std::string stored;
+            if (!assignment(f, fl, v, &stored)) return false;
+            if (changed_only) {
+                if (!changes.empty()) changes += " OR ";
+                changes += name + "." + column + " IS DISTINCT FROM " + stored;
+            }
             assigned_.push_back(fl);
         }
         assigned_.clear();  // WHERE reads the old row in both
     } else {
         out += "DELETE FROM " + name;
     }
+    std::string cond_sql;
     if (where) {
-        out += " WHERE ";
+        const size_t at = out.size();
         if (!condition(where)) return false;
+        cond_sql = out.substr(at);
+        out.resize(at);
+    }
+    if (!changes.empty()) {
+        count.sql = "SELECT COUNT(*) FROM " + name;
+        if (!cond_sql.empty()) count.sql += " WHERE " + cond_sql;
+        count.one_row = where && pk_equality(where, t->table);
+    }
+    if (!changes.empty() && !cond_sql.empty()) {
+        // The condition first: stoolap reads an AND left to right (a SET
+        // value may fail for a row the condition does not take, as an
+        // overflow would), and its single-row path keys on it. A CASE
+        // would order it for certain but loses that path. An AND goes on
+        // past a NULL: a condition that may be NULL is made FALSE first,
+        // which costs that path, a condition that may not keeps it.
+        out += " WHERE (" + cond_sql + ")";
+        if (where->maybe_null()) out += " AND ((" + cond_sql + ") IS NOT NULL)";
+        out += " AND (" + changes + ")";
+    } else if (!changes.empty()) {
+        out += " WHERE (" + changes + ")";
+    } else if (!cond_sql.empty()) {
+        out += " WHERE " + cond_sql;
     }
     return true;
 }
@@ -1544,7 +1629,8 @@ bool int_range(const Field* f, longlong* lo, longlong* hi) {
 // mode: a literal is checked here, an expression in the statement, which
 // stoolap then fails with an integer overflow (guard_). Out of strict
 // mode MariaDB stores a clipped value with a warning: the row-pump.
-bool Gen::assignment(Item* target, const Field* fl, Item* v) {
+bool Gen::assignment(Item* target, const Field* fl, Item* v,
+                     std::string* stored) {
     // A parameter is a PARAM_ITEM only without a value: unbound, or a
     // DEFAULT / IGNORE (the bulk protocol keeps its type, and reading
     // its value raises an error)
@@ -1556,6 +1642,7 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
     if (k && k->const_is_null()) {
         if (fl->flags & NOT_NULL_FLAG) return fail("NULL into NOT NULL");
         out += "NULL";
+        *stored = "NULL";
         return true;
     }
     // A NULL into NOT NULL is error 1048 in strict mode, a zero outside
@@ -1566,6 +1653,7 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
     if (tc == Cls::UNSAFE || (tc != vc && !(tc == Cls::REAL && vc == Cls::INT)))
         return fail("SET converts its value");
     const bool literal_value = v->type() == Item::CONST_ITEM;
+    bool real = false;
     const bool strict = thd_->is_strict_mode();
     // The check an expression's value needs: a CASE around it, `@` the
     // value and `!` the overflow that fails the statement
@@ -1591,6 +1679,11 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
             if (fl->real_type() != MYSQL_TYPE_DOUBLE ||
                 fl->decimals() < NOT_FIXED_DEC)
                 return fail("rounding float target");
+            // Before 11.4.11 MariaDB keeps -0.0, and compares its bytes
+            // to 0.0's: that one leaves a DOUBLE to the row-pump
+            if (!server_stores_zero_for_negative_zero())
+                return fail("DOUBLE target on a server keeping -0.0");
+            real = true;
             break;
         case Cls::STR: {
             // utf8mb4 holds any stoolap TEXT; CHAR strips trailing spaces
@@ -1640,21 +1733,36 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
             break;
         }
     }
-    if (check.empty()) return expr(v);
+    const size_t at = out.size();
+    if (check.empty()) {
+        if (!expr(v)) return false;
+        // A DOUBLE stores -0.0 as 0.0 (so it is no change from 0.0 either):
+        // adding 0.0 does that (server_stores_zero_for_negative_zero)
+        if (real) out += " + 0.0";
+        *stored = "(" + out.substr(at) + ")";
+        return true;
+    }
     if (!strict) return fail("value may not fit, outside strict mode");
     if (guard.error) return fail("two checked SET values");
-    const size_t at = out.size();
     if (!expr(v)) return false;
     const std::string e = "(" + out.substr(at) + ")";
     out.resize(at);
-    // Stoolap evaluates the overflow only for a row that reaches it
+    // Stoolap evaluates the overflow only for a row that reaches it. What
+    // the column stores is the same CASE with the value for the overflow,
+    // which for a range is the value itself.
+    const bool range = error == ER_WARN_DATA_OUT_OF_RANGE;
+    if (range) *stored = e;
     for (const char c : check) {
-        if (c == '@')
+        if (c == '@') {
             out += e;
-        else if (c == '!')
+            if (!range) *stored += e;
+        } else if (c == '!') {
             out += kGuardOverflow;
-        else
+            if (!range) *stored += e;
+        } else {
             out.push_back(c);
+            if (!range) stored->push_back(c);
+        }
     }
     guard.column.assign(fl->field_name.str, fl->field_name.length);
     guard.error = error;
@@ -1664,7 +1772,7 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
 }  // namespace
 
 bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
-                std::string* why, ModifyGuard* guard) {
+                std::string* why, ModifyGuard* guard, ModifyCount* count) {
     Gen g(thd);
     g.top = sel;
     if (!g.modify(sel, where)) {
@@ -1673,6 +1781,7 @@ bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
     }
     *out = std::move(g.out);
     if (guard) *guard = std::move(g.guard);
+    if (count) *count = std::move(g.count);
     return true;
 }
 

@@ -53,10 +53,21 @@ struct ModifyGuard {
     unsigned error = 0;
 };
 
+// The rows an UPDATE that writes only the rows it changes finds, which
+// MariaDB reports apart ("Rows matched"): `sql` counts them, empty when
+// the UPDATE's count is already the rows found. Run before the UPDATE
+// (which may change what the condition takes), unless `one_row`: at most
+// one row qualifies, so an UPDATE that changed one found one.
+struct ModifyCount {
+    std::string sql;
+    bool one_row = false;
+};
+
 // The single-table UPDATE or DELETE whose SELECT_LEX is `sel`, as the
 // direct DML hooks run it: `where` is the condition MariaDB pushed (null
 // for none), an UPDATE's SET list its item_list and LEX::value_list.
 bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
-                std::string* why, ModifyGuard* guard = nullptr);
+                std::string* why, ModifyGuard* guard = nullptr,
+                ModifyCount* count = nullptr);
 
 }  // namespace stoolap_sqlgen

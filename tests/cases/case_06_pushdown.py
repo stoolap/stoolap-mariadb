@@ -13,6 +13,10 @@ access plan.
 
 import os
 import re
+import subprocess
+
+import mysql.connector
+from mysql.connector.constants import ClientFlag
 
 
 def _direct_hits(h):
@@ -900,6 +904,76 @@ INSERT INTO wdup VALUES (1, 'Integer overflow'), (2, 'Integer ');
     h.assert_err("a duplicate naming the overflow's words",
                  "UPDATE wdup SET s = CONCAT(s, 'overflow') WHERE id = 2",
                  "1062")
+
+    h.section("Direct UPDATE counts the rows it changes")
+    # MariaDB reports the rows a SET changes, or with CLIENT_FOUND_ROWS
+    # the rows it finds; a row left as it was is not written.
+    h.exec_script(f"""
+CREATE TABLE wcnt (id INT PRIMARY KEY, v INT, s VARCHAR(4) COLLATE utf8mb4_bin)
+    ENGINE={h.engine};
+INSERT INTO wcnt VALUES (1, 1, 'abcd'), (2, 2, 'ab'), (3, 3, NULL);
+""")
+    for flags, label, want in [
+            ([], "changed", [0, 2, 1, 0]),
+            ([ClientFlag.FOUND_ROWS], "found", [3, 3, 1, 1])]:
+        c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                    database=h.db, autocommit=True,
+                                    client_flags=flags)
+        cur = c.cursor()
+        got = []
+        before = _direct_hits(h)
+        for stmt in ["UPDATE wcnt SET v = v",
+                     "UPDATE wcnt SET v = 2 WHERE id > 0",
+                     "UPDATE wcnt SET v = v + 1 WHERE id = 1",
+                     # Cut to 'abcd': unchanged
+                     "UPDATE wcnt SET s = CONCAT(s, '  ') WHERE id = 1"]:
+            cur.execute(stmt)
+            got.append(cur.rowcount)
+        h.assert_eq(f"rows {label}", want, got)
+        h.assert_eq(f"rows {label} ran direct", 4, _direct_hits(h) - before)
+        c.close()
+    h.assert_scalar("values", "SELECT GROUP_CONCAT(v ORDER BY id) FROM wcnt",
+                    "3,2,2")
+    # MariaDB's "Rows matched" stays the rows found
+    proc = subprocess.run(
+        [h.mariadb, "--no-defaults", "-S", h.socket, "-uroot", "-vvv", h.db],
+        input="UPDATE wcnt SET v = v;\nUPDATE wcnt SET v = 2 WHERE id > 0;\n"
+              "UPDATE wcnt SET v = v WHERE id = 1;\n"
+              "UPDATE wcnt SET v = v WHERE id = 9;\n",
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    h.assert_eq("rows matched and changed",
+                ["Rows matched: 3  Changed: 0", "Rows matched: 3  Changed: 1",
+                 "Rows matched: 1  Changed: 0", "Rows matched: 0  Changed: 0"],
+                re.findall(r"Rows matched: \d+  Changed: \d+", proc.stdout))
+    # A condition that is NULL for a row does not take it: its SET value
+    # is not read there (n + 1 would overflow)
+    h.exec_script(f"""
+CREATE TABLE wnul (id INT PRIMARY KEY, a INT, b INT, n BIGINT) ENGINE={h.engine};
+INSERT INTO wnul VALUES (1, NULL, 1, 9223372036854775807), (2, 1, 2, 0);
+""")
+    h.assert_ok("a NULL condition", "UPDATE wnul SET n = n + 1 WHERE a + 1 = b")
+    h.assert_scalar("only the row it takes",
+                    "SELECT GROUP_CONCAT(n ORDER BY id) FROM wnul",
+                    "9223372036854775807,1")
+    # From 11.4.11 a DOUBLE stores -0.0 as 0.0: no change from 0.0, and 0.0
+    # elsewhere. Before, MariaDB keeps -0.0 (the row-pump writes it).
+    h.exec_script(f"""
+CREATE TABLE wneg (id INT PRIMARY KEY, d DOUBLE) ENGINE={h.engine};
+INSERT INTO wneg VALUES (1, 0e0), (2, 5);
+""")
+    c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=True)
+    cur = c.cursor()
+    cur.execute("SELECT VERSION()")
+    version = tuple(int(x) for x in
+                    re.match(r"(\d+)\.(\d+)\.(\d+)", cur.fetchone()[0]).groups())
+    zero = version >= (11, 4, 11)
+    cur.execute("UPDATE wneg SET d = -0e0")
+    h.assert_eq("-0.0 changes", 1 if zero else 2, cur.rowcount)
+    c.close()
+    h.assert_scalar("stored as the server stores it",
+                    "SELECT GROUP_CONCAT(ATAN2(d, -1) > 0 ORDER BY id) FROM wneg",
+                    "1,1" if zero else "0,0")
 
     h.section("Direct DML keeps string literals")
     h.exec_script(f"""

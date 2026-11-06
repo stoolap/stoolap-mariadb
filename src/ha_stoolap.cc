@@ -1312,13 +1312,15 @@ int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
     if (direct_modify_in_pre_) {
         direct_modify_in_pre_ = false;
         if (update_rows) *update_rows = direct_modify_affected_pre_;
-        if (found_rows) *found_rows = direct_modify_affected_pre_;
+        if (found_rows) *found_rows = direct_modify_found_pre_;
         return 0;
     }
     ha_rows affected = 0;
+    ha_rows found = 0;
     unsigned ek = MAX_KEY;
     int rc = stoolap_pushdown::try_direct_modify(
-        ha_thd(), static_cast<const Item*>(pushed_cond), &affected, &ek);
+        ha_thd(), static_cast<const Item*>(pushed_cond), &affected, &ek,
+        &found);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;
@@ -1327,8 +1329,7 @@ int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
         return rc;
     }
     if (update_rows) *update_rows = affected;
-    // No found-but-unchanged tracking; report found == affected.
-    if (found_rows) *found_rows = affected;
+    if (found_rows) *found_rows = found;
     return 0;
 }
 
@@ -1375,9 +1376,11 @@ int ha_stoolap::pre_direct_update_rows_init(List<Item>* fields) {
 
 int ha_stoolap::pre_direct_update_rows() {
     ha_rows affected = 0;
+    ha_rows found = 0;
     unsigned ek = MAX_KEY;
     int rc = stoolap_pushdown::try_direct_modify(
-        ha_thd(), static_cast<const Item*>(pushed_cond), &affected, &ek);
+        ha_thd(), static_cast<const Item*>(pushed_cond), &affected, &ek,
+        &found);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;
@@ -1387,6 +1390,7 @@ int ha_stoolap::pre_direct_update_rows() {
     }
     direct_modify_in_pre_ = true;
     direct_modify_affected_pre_ = affected;
+    direct_modify_found_pre_ = found;
     return 0;
 }
 

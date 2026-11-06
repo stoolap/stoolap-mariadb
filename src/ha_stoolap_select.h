@@ -31,8 +31,10 @@ namespace stoolap_pushdown {
 // the per-row update_row/delete_row path.
 // `where` is the condition MariaDB pushed (handler::pushed_cond), null
 // for none: the statement is written from it and the SET list.
+// *found (if given) is the rows the condition found, which an UPDATE
+// that writes only the rows it changes counts apart.
 int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
-                      unsigned* errkey_out = nullptr);
+                      unsigned* errkey_out = nullptr, ha_rows* found = nullptr);
 
 // Eligibility predicate; same checks try_direct_modify runs internally.
 bool can_direct_modify(THD* thd, const Item* where);
