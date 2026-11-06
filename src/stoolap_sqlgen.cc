@@ -736,8 +736,11 @@ bool Gen::node(Item* it) {
         }
         case Item::CONST_ITEM:
         case Item::NULL_ITEM:
-        case Item::PARAM_ITEM:
             return literal(it);
+        case Item::PARAM_ITEM:
+            // Bound, a parameter is a CONST_ITEM or NULL_ITEM: this one
+            // has no value (unbound, DEFAULT or IGNORE)
+            return fail("parameter without a value");
         case Item::FUNC_ITEM:
             return func(static_cast<Item_func*>(it));
         case Item::COND_ITEM:
@@ -1477,6 +1480,11 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             // one and '1.2' to the other, 2.7 into an INT 3 and 2. Only a
             // value of the column's class (an integer into a float) or a
             // NULL is written the same.
+            // A parameter is a PARAM_ITEM only without a value: unbound,
+            // or a DEFAULT / IGNORE (the bulk protocol keeps its type,
+            // and reading its value raises an error)
+            if (v->type() == Item::PARAM_ITEM)
+                return fail("parameter without a value");
             const Cls tc = cls(f);
             const Cls vc = cls(v);
             // const_is_null() evaluates nothing: is_null() would run an
