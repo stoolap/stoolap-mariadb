@@ -586,6 +586,87 @@ SELECT n FROM mixq_other.q;
     finally:
         c.close()
 
+    h.section("Direct DML declines what stoolap's parser or the rewriter cannot take")
+    # DELETE QUICK / LOW_PRIORITY / IGNORE, UPDATE LOW_PRIORITY, "t" under
+    # ANSI_QUOTES, a spaced d . t: left to the row-pump, with and without
+    # WHERE (DELETE without WHERE runs as direct DML).
+    c, cur = h.open_session()
+    try:
+        for stmt in [
+            "DROP DATABASE IF EXISTS dml_opt", "CREATE DATABASE dml_opt",
+            "USE dml_opt",
+            f"CREATE TABLE t (id INT PRIMARY KEY, v INT) ENGINE={h.engine}",
+            "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), "
+            "(6, 0), (7, 0)",
+        ]:
+            cur.execute(stmt)
+        before = _direct_hits(h)
+        for stmt in [
+            "DELETE QUICK FROM t WHERE id = 1",
+            "DELETE LOW_PRIORITY FROM t WHERE id = 2",
+            "DELETE IGNORE FROM t WHERE id = 3",
+            "UPDATE LOW_PRIORITY t SET v = 1 WHERE id = 4",
+            "UPDATE dml_opt . t SET v = 2 WHERE id = 5",
+            "DELETE FROM dml_opt/**/.t WHERE id = 6",
+            "SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')",
+            'UPDATE "t" SET v = 3 WHERE id = 7',
+            "SET SESSION sql_mode = DEFAULT",
+        ]:
+            cur.execute(stmt)
+        h.assert_eq("none ran as direct DML", 0, _direct_hits(h) - before)
+        cur.execute("SELECT id, v FROM t ORDER BY id")
+        h.assert_eq("each ran", [(4, 1), (5, 2), (7, 3)], cur.fetchall())
+        for stmt in ["DELETE QUICK FROM t", "INSERT INTO t VALUES (1, 0)",
+                     "DELETE FROM dml_opt . t"]:
+            cur.execute(stmt)
+        cur.execute("SELECT COUNT(*) FROM t")
+        h.assert_eq("without WHERE too", [(0,)], cur.fetchall())
+        # A comment holding an apostrophe, a name holding a backtick, a
+        # mixed-quote form that is a longer name's prefix
+        for stmt in [
+            "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)",
+            f"CREATE TABLE tx (id INT PRIMARY KEY) ENGINE={h.engine}",
+            "INSERT INTO tx VALUES (2), (9)",
+            f"CREATE TABLE `a``b` (id INT PRIMARY KEY) ENGINE={h.engine}",
+            "INSERT INTO `a``b` VALUES (1), (2)",
+            "DELETE /* it's fine */ FROM t WHERE id = 1",
+            "DELETE FROM `dml_opt`.tx WHERE id IN "
+            "(SELECT id FROM `dml_opt`.t)",
+            "DELETE FROM `a``b` WHERE id = 1",
+        ]:
+            cur.execute(stmt)
+        cur.execute("SELECT id FROM t ORDER BY id")
+        h.assert_eq("a comment with an apostrophe", [(2,), (3,)],
+                    cur.fetchall())
+        cur.execute("SELECT id FROM tx")
+        h.assert_eq("a qualified name's prefix", [(9,)], cur.fetchall())
+        cur.execute("SELECT id FROM `a``b`")
+        h.assert_eq("a name with a backtick", [(2,)], cur.fetchall())
+        for stmt in ["DELETE /* it's fine */ FROM t", "DELETE FROM `a``b`"]:
+            cur.execute(stmt)
+        cur.execute("SELECT (SELECT COUNT(*) FROM t), "
+                    "(SELECT COUNT(*) FROM `a``b`)")
+        h.assert_eq("both without WHERE", [(0, 0)], cur.fetchall())
+        # Executable comments: MariaDB runs their text, stoolap skips it
+        before = _direct_hits(h)
+        for stmt in [
+            "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0)",
+            "UPDATE t SET v = 1 /*!WHERE id = 1 */",
+            "DELETE FROM t /*M!100000 WHERE id = 2 */",
+            "DELETE /*! FROM */ t WHERE id = 3",
+        ]:
+            cur.execute(stmt)
+        cur.execute("SELECT id, v FROM t ORDER BY id")
+        h.assert_eq("executable comments keep their text", [(1, 1), (4, 0)],
+                    cur.fetchall())
+        h.assert_eq("and run on the row-pump", 0, _direct_hits(h) - before)
+        cur.execute("DELETE /*! FROM */ t")
+        cur.execute("SELECT COUNT(*) FROM t")
+        h.assert_eq("without WHERE too", [(0,)], cur.fetchall())
+        cur.execute("DROP DATABASE dml_opt")
+    finally:
+        c.close()
+
     h.section("Direct DML respects ci-collation guard")
     h.exec_script(f"""
 CREATE TABLE pds (id INT NOT NULL PRIMARY KEY, s VARCHAR(32), n INT NOT NULL) ENGINE={h.engine};

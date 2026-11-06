@@ -46,7 +46,7 @@ public:
     int write_row(const uchar* buf) override;
     int update_row(const uchar* old_data, const uchar* new_data) override;
     int delete_row(const uchar* buf) override;
-    int delete_all_rows() override;
+    int truncate() override;
 
     // cond_push: return value is the unhandled remainder MariaDB must
     // apply on top; NULL means "engine handled everything". We accept

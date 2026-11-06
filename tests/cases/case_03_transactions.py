@@ -125,3 +125,34 @@ COMMIT;
     h.assert_eq("COMMIT duplicate errno", True, "ERROR 1062" in out)
     h.assert_scalar("COMMIT duplicate rolled back",
                     "SELECT GROUP_CONCAT(u ORDER BY id) FROM st_u", "1,3,6")
+
+    h.section("DELETE without WHERE is a DELETE, not a TRUNCATE")
+    # MariaDB's delete_all_rows fast path ran stoolap's TRUNCATE: outside
+    # the transaction, past ON DELETE actions, resetting AUTO_INCREMENT.
+    h.exec_script(f"""
+CREATE TABLE da (id INT PRIMARY KEY AUTO_INCREMENT, v INT) ENGINE={h.engine};
+INSERT INTO da (v) VALUES (1), (2), (3);
+CREATE TABLE da_p (id INT PRIMARY KEY) ENGINE={h.engine};
+CREATE TABLE da_c (id INT PRIMARY KEY, pid INT,
+                   FOREIGN KEY (pid) REFERENCES da_p(id) ON DELETE CASCADE)
+                   ENGINE={h.engine};
+INSERT INTO da_p VALUES (1), (2);
+INSERT INTO da_c VALUES (10, 1), (20, 2);
+""")
+    rc, out = h.run_client("""
+START TRANSACTION;
+DELETE FROM da;
+ROLLBACK;
+""", force=True)
+    h.assert_scalar("ROLLBACK keeps the deleted rows",
+                    "SELECT COUNT(*) FROM da", "3")
+    h.assert_ok("DELETE all", "DELETE FROM da")
+    h.assert_ok("insert after DELETE", "INSERT INTO da (v) VALUES (9)")
+    h.assert_scalar("DELETE keeps AUTO_INCREMENT", "SELECT id FROM da", "4")
+    h.assert_ok("TRUNCATE", "TRUNCATE TABLE da")
+    h.assert_ok("insert after TRUNCATE", "INSERT INTO da (v) VALUES (9)")
+    h.assert_scalar("TRUNCATE resets AUTO_INCREMENT", "SELECT id FROM da", "1")
+    h.assert_err("TRUNCATE of a referenced parent is refused",
+                 "TRUNCATE TABLE da_p", "1451")
+    h.assert_ok("DELETE all from a parent", "DELETE FROM da_p")
+    h.assert_scalar("ON DELETE CASCADE ran", "SELECT COUNT(*) FROM da_c", "0")
