@@ -93,8 +93,10 @@ public:
     bool unit(SELECT_LEX_UNIT* u, const std::vector<std::string>* names);
     // A single-table UPDATE / DELETE (gen_modify).
     bool modify(SELECT_LEX* sel, Item* where);
-    // Its checked SET value, if any (ModifyGuard)
+    // Its checked SET value, if any (ModifyGuard), and how to count the
+    // rows it finds (ModifyCount)
     ModifyGuard guard;
+    ModifyCount count;
 
     std::string out;
     const char* why = nullptr;
@@ -1459,6 +1461,37 @@ bool Gen::order_list(SQL_I_List<ORDER>* lst, bool directions) {
     return true;
 }
 
+// Whether `it` takes at most one row of `tb`: an equality of its
+// single-column primary key with a constant, alone or in an AND
+bool pk_equality(Item* it, TABLE* tb) {
+    if (it->type() == Item::COND_ITEM &&
+        static_cast<Item_cond*>(it)->functype() == Item_func::COND_AND_FUNC) {
+        List_iterator<Item> li(*static_cast<Item_cond*>(it)->argument_list());
+        while (Item* a = li++)
+            if (pk_equality(a, tb)) return true;
+        return false;
+    }
+    if (it->type() != Item::FUNC_ITEM) return false;
+    auto* f = static_cast<Item_func*>(it);
+    if (f->functype() != Item_func::EQ_FUNC || f->argument_count() != 2)
+        return false;
+    const uint pk = tb->s->primary_key;
+    if (pk >= MAX_KEY || tb->key_info[pk].user_defined_key_parts != 1)
+        return false;
+    const uint col = tb->key_info[pk].key_part[0].fieldnr - 1;
+    for (int i = 0; i < 2; ++i) {
+        Item* a = f->arguments()[i]->real_item();
+        Item* b = f->arguments()[1 - i];
+        if (a->type() == Item::FIELD_ITEM) {
+            const Field* fl = static_cast<Item_field*>(a)->field;
+            if (fl && fl->table == tb && fl->field_index == col &&
+                b->const_item())
+                return true;
+        }
+    }
+    return false;
+}
+
 // A single-table UPDATE / DELETE. Stoolap's UPDATE takes no alias, so
 // the table's own name qualifies its columns.
 bool Gen::modify(SELECT_LEX* sel, Item* where) {
@@ -1516,12 +1549,21 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
         cond_sql = out.substr(at);
         out.resize(at);
     }
+    if (!changes.empty()) {
+        count.sql = "SELECT COUNT(*) FROM " + name;
+        if (!cond_sql.empty()) count.sql += " WHERE " + cond_sql;
+        count.one_row = where && pk_equality(where, t->table);
+    }
     if (!changes.empty() && !cond_sql.empty()) {
         // The condition first: stoolap reads an AND left to right (a SET
         // value may fail for a row the condition does not take, as an
         // overflow would), and its single-row path keys on it. A CASE
-        // would order it for certain but loses that path.
-        out += " WHERE (" + cond_sql + ") AND (" + changes + ")";
+        // would order it for certain but loses that path. An AND goes on
+        // past a NULL: a condition that may be NULL is made FALSE first,
+        // which costs that path, a condition that may not keeps it.
+        out += " WHERE (" + cond_sql + ")";
+        if (where->maybe_null()) out += " AND ((" + cond_sql + ") IS NOT NULL)";
+        out += " AND (" + changes + ")";
     } else if (!changes.empty()) {
         out += " WHERE (" + changes + ")";
     } else if (!cond_sql.empty()) {
@@ -1595,6 +1637,7 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
     if (tc == Cls::UNSAFE || (tc != vc && !(tc == Cls::REAL && vc == Cls::INT)))
         return fail("SET converts its value");
     const bool literal_value = v->type() == Item::CONST_ITEM;
+    bool real = false;
     const bool strict = thd_->is_strict_mode();
     // The check an expression's value needs: a CASE around it, `@` the
     // value and `!` the overflow that fails the statement
@@ -1620,6 +1663,7 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
             if (fl->real_type() != MYSQL_TYPE_DOUBLE ||
                 fl->decimals() < NOT_FIXED_DEC)
                 return fail("rounding float target");
+            real = true;
             break;
         case Cls::STR: {
             // utf8mb4 holds any stoolap TEXT; CHAR strips trailing spaces
@@ -1672,6 +1716,9 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
     const size_t at = out.size();
     if (check.empty()) {
         if (!expr(v)) return false;
+        // A DOUBLE stores -0.0 as 0.0 (so it is no change from 0.0 either):
+        // adding 0.0 does that
+        if (real) out += " + 0.0";
         *stored = "(" + out.substr(at) + ")";
         return true;
     }
@@ -1705,7 +1752,7 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
 }  // namespace
 
 bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
-                std::string* why, ModifyGuard* guard) {
+                std::string* why, ModifyGuard* guard, ModifyCount* count) {
     Gen g(thd);
     g.top = sel;
     if (!g.modify(sel, where)) {
@@ -1714,6 +1761,7 @@ bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
     }
     *out = std::move(g.out);
     if (guard) *guard = std::move(g.guard);
+    if (count) *count = std::move(g.count);
     return true;
 }
 

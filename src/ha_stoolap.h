@@ -209,6 +209,7 @@ private:
     // pre_direct_*_rows ran the modify and stashed the count.
     bool direct_modify_in_pre_ = false;
     ha_rows direct_modify_affected_pre_ = 0;
+    ha_rows direct_modify_found_pre_ = 0;  // an UPDATE's rows found
 
     // The direct read's projection, the fields it fills, rebuilt only when
     // read_set | write_set changes (a join probes the same columns once

@@ -217,15 +217,38 @@ bool can_direct_modify(THD* thd, const Item* where) {
                                       nullptr);
 }
 
+// The one INTEGER `sql` reads (a COUNT), or false
+bool count_rows(StoolapDB* db, StoolapTx* tx, const std::string& sql,
+                uint64_t* n) {
+    const uint8_t* buf = nullptr;
+    int64_t len = 0;
+    if (stoolap_query_params_all(db, tx, sql.c_str(), nullptr, 0, &buf, &len) !=
+            STOOLAP_OK ||
+        !buf)
+        return false;
+    size_t pos = 0;
+    uint32_t cols = 0;
+    if (!stoolap_mariadb::pkt_parse_header(buf, static_cast<size_t>(len), &pos,
+                                           &cols) ||
+        cols != 1 || pos + 4 + 1 + 8 > static_cast<size_t>(len) ||
+        stoolap_mariadb::pkt_le32(buf + pos) != 1 ||
+        buf[pos + 4] != STOOLAP_TYPE_INTEGER)
+        return false;
+    const int64_t v = stoolap_mariadb::pkt_i64(buf + pos + 5);
+    *n = v > 0 ? static_cast<uint64_t>(v) : 0;
+    return true;
+}
+
 int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
-                      unsigned* errkey_out) {
+                      unsigned* errkey_out, ha_rows* found) {
     if (!can_direct_modify(thd, where)) return HA_ERR_WRONG_COMMAND;
 
     std::string sql;
     stoolap_sqlgen::ModifyGuard guard;
+    stoolap_sqlgen::ModifyCount count;
     if (!stoolap_sqlgen::gen_modify(thd, thd->lex->first_select_lex(),
                                     const_cast<Item*>(where), &sql, nullptr,
-                                    &guard))
+                                    &guard, &count))
         return HA_ERR_WRONG_COMMAND;
 
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
@@ -236,6 +259,15 @@ int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
     }
     StoolapDB* db = ctx->db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
+
+    // The rows found, when the UPDATE counts only the rows it changes: read
+    // before it, since it may change what the condition takes. Reported
+    // only ("Rows matched"), so a failed count leaves the changed count.
+    StoolapTx* tx = ctx->has_tx() ? ctx->tx() : nullptr;
+    uint64_t found_n = 0;
+    bool have_found = false;
+    if (!count.sql.empty() && !count.one_row)
+        have_found = count_rows(db, tx, count.sql, &found_n);
 
     // A prepared statement's parameters are literals in the generated
     // SQL (their bound values), as in a pushed SELECT.
@@ -294,6 +326,15 @@ int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
         return mapped;
     }
     if (affected) *affected = static_cast<ha_rows>(rows_aff);
+    // At most one row qualifies: one changed is one found; none changed,
+    // and the row (if any) is as it was, so the count reads it the same
+    if (!count.sql.empty() && count.one_row) {
+        found_n = static_cast<uint64_t>(rows_aff);
+        have_found = rows_aff > 0 || count_rows(db, tx, count.sql, &found_n);
+    }
+    if (found)
+        *found = have_found ? static_cast<ha_rows>(found_n)
+                            : static_cast<ha_rows>(rows_aff);
     stoolap_mariadb::g_stats.direct_modify_hits.fetch_add(
         1, std::memory_order_relaxed);
     return 0;

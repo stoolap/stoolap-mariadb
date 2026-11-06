@@ -13,6 +13,7 @@ access plan.
 
 import os
 import re
+import subprocess
 
 import mysql.connector
 from mysql.connector.constants import ClientFlag
@@ -933,6 +934,41 @@ INSERT INTO wcnt VALUES (1, 1, 'abcd'), (2, 2, 'ab'), (3, 3, NULL);
         c.close()
     h.assert_scalar("values", "SELECT GROUP_CONCAT(v ORDER BY id) FROM wcnt",
                     "3,2,2")
+    # MariaDB's "Rows matched" stays the rows found
+    proc = subprocess.run(
+        [h.mariadb, "--no-defaults", "-S", h.socket, "-uroot", "-vvv", h.db],
+        input="UPDATE wcnt SET v = v;\nUPDATE wcnt SET v = 2 WHERE id > 0;\n"
+              "UPDATE wcnt SET v = v WHERE id = 1;\n"
+              "UPDATE wcnt SET v = v WHERE id = 9;\n",
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    h.assert_eq("rows matched and changed",
+                ["Rows matched: 3  Changed: 0", "Rows matched: 3  Changed: 1",
+                 "Rows matched: 1  Changed: 0", "Rows matched: 0  Changed: 0"],
+                re.findall(r"Rows matched: \d+  Changed: \d+", proc.stdout))
+    # A condition that is NULL for a row does not take it: its SET value
+    # is not read there (n + 1 would overflow)
+    h.exec_script(f"""
+CREATE TABLE wnul (id INT PRIMARY KEY, a INT, b INT, n BIGINT) ENGINE={h.engine};
+INSERT INTO wnul VALUES (1, NULL, 1, 9223372036854775807), (2, 1, 2, 0);
+""")
+    h.assert_ok("a NULL condition", "UPDATE wnul SET n = n + 1 WHERE a + 1 = b")
+    h.assert_scalar("only the row it takes",
+                    "SELECT GROUP_CONCAT(n ORDER BY id) FROM wnul",
+                    "9223372036854775807,1")
+    # A DOUBLE stores -0.0 as 0.0: no change from 0.0, and 0.0 elsewhere
+    h.exec_script(f"""
+CREATE TABLE wneg (id INT PRIMARY KEY, d DOUBLE) ENGINE={h.engine};
+INSERT INTO wneg VALUES (1, 0e0), (2, 5);
+""")
+    c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=True)
+    cur = c.cursor()
+    cur.execute("UPDATE wneg SET d = -0e0")
+    h.assert_eq("-0.0 changes only the 5", 1, cur.rowcount)
+    c.close()
+    h.assert_scalar("stored as 0.0",
+                    "SELECT GROUP_CONCAT(ATAN2(d, -1) > 0 ORDER BY id) FROM wneg",
+                    "1,1")
 
     h.section("Direct DML keeps string literals")
     h.exec_script(f"""
