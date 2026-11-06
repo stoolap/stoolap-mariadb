@@ -647,6 +647,22 @@ SELECT n FROM mixq_other.q;
         cur.execute("SELECT (SELECT COUNT(*) FROM t), "
                     "(SELECT COUNT(*) FROM `a``b`)")
         h.assert_eq("both without WHERE", [(0, 0)], cur.fetchall())
+        # Executable comments: MariaDB runs their text, stoolap skips it
+        before = _direct_hits(h)
+        for stmt in [
+            "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0)",
+            "UPDATE t SET v = 1 /*!WHERE id = 1 */",
+            "DELETE FROM t /*M!100000 WHERE id = 2 */",
+            "DELETE /*! FROM */ t WHERE id = 3",
+        ]:
+            cur.execute(stmt)
+        cur.execute("SELECT id, v FROM t ORDER BY id")
+        h.assert_eq("executable comments keep their text", [(1, 1), (4, 0)],
+                    cur.fetchall())
+        h.assert_eq("and run on the row-pump", 0, _direct_hits(h) - before)
+        cur.execute("DELETE /*! FROM */ t")
+        cur.execute("SELECT COUNT(*) FROM t")
+        h.assert_eq("without WHERE too", [(0,)], cur.fetchall())
         cur.execute("DROP DATABASE dml_opt")
     finally:
         c.close()

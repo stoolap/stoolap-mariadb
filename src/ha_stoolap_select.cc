@@ -359,10 +359,12 @@ bool replace_all_literal_aware(std::string& s, std::string_view from,
     return true;
 }
 
-/** Whether `s` has a `.` the rewriter's qualified forms cannot match: one
- *  not joining two names directly (`d . t`, or a comment beside it). A number's
- *  `.` is followed by a digit. */
-bool has_spaced_dot(const std::string& s) {
+/** Whether `s` holds what the rewritten statement cannot keep: an
+ *  executable comment anywhere (stoolap skips it, MariaDB runs its text:
+ *  a WHERE in one would be lost), or a `.` the rewriter's qualified forms
+ *  cannot match, one not joining two names directly (`d . t`, or a
+ *  comment beside it). A number's `.` is followed by a digit. */
+bool text_declined(const std::string& s) {
     auto name_end = [](unsigned char c) {
         return is_ident_char(c) || c >= 0x80 || c == '`';
     };
@@ -372,6 +374,7 @@ bool has_spaced_dot(const std::string& s) {
             i = e;
             continue;
         }
+        if (executable_comment_at(s, i)) return true;
         if (s[i] == '.') {
             const unsigned char prev = i ? s[i - 1] : ' ';
             const unsigned char next = i + 1 < s.size() ? s[i + 1] : ' ';
@@ -657,14 +660,15 @@ bool can_direct_modify(THD* thd) {
 
     // What stoolap's parser does not take, or the rewriter cannot name
     // the table in: DELETE QUICK / LOW_PRIORITY / IGNORE and UPDATE
-    // LOW_PRIORITY, a "t" under ANSI_QUOTES, a spaced `d . t`.
+    // LOW_PRIORITY, a "t" under ANSI_QUOTES, a spaced `d . t`, an
+    // executable comment.
     if (cmd == SQLCOM_DELETE &&
         ((sel->options & OPTION_QUICK) || thd->lex->ignore))
         return false;
     if (sel->get_table_list()->lock_type == TL_WRITE_LOW_PRIORITY) return false;
     if (thd->variables.sql_mode & MODE_ANSI_QUOTES) return false;
     const std::string raw(thd->query(), thd->query_length());
-    if (has_spaced_dot(raw)) return false;
+    if (text_declined(raw)) return false;
 
     // Decline a bare word the rewriter cannot tell from the table
     // (rewrite_table_names): MariaDB has chosen the path by the time
