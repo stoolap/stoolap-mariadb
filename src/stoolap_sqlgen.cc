@@ -1567,7 +1567,8 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
         return fail("SET converts its value");
     const bool literal_value = v->type() == Item::CONST_ITEM;
     const bool strict = thd_->is_strict_mode();
-    // The check an expression's value needs, written around it
+    // The check an expression's value needs: a CASE around it, `@` the
+    // value and `!` the overflow that fails the statement
     std::string check;
     unsigned error = 0;
     switch (tc) {
@@ -1580,8 +1581,8 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
                 if (n < lo || n > hi) return fail("value out of range");
                 break;
             }
-            check = "(@) < " + std::to_string(lo) + " OR (@) > " +
-                    std::to_string(hi);
+            check = "CASE WHEN @ < " + std::to_string(lo) + " OR @ > " +
+                    std::to_string(hi) + " THEN ! ELSE @ END";
             error = ER_WARN_DATA_OUT_OF_RANGE;
             break;
         }
@@ -1611,7 +1612,15 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
                 break;
             }
             if (!varchar) return fail("text target");
-            check = "CHAR_LENGTH(@) > " + std::to_string(fl->char_length());
+            // Past the column, MariaDB cuts ASCII white space (space,
+            // \t \n \v \f \r) with a note and fails on anything else
+            const std::string n = std::to_string(fl->char_length());
+            std::string rest = "SUBSTR(@, " + n + " + 1)";
+            for (const char* ws : {" ", "\t", "\n", "\v", "\f", "\r"})
+                rest = "REPLACE(" + rest + ", '" + ws + "', '')";
+            check = "CASE WHEN @ IS NULL OR CHAR_LENGTH(@) <= " + n +
+                    " THEN @ WHEN " + rest + " = '' THEN SUBSTR(@, 1, " + n +
+                    ") ELSE ! END";
             error = ER_DATA_TOO_LONG;
             break;
         }
@@ -1634,16 +1643,15 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
     if (!expr(v)) return false;
     const std::string e = "(" + out.substr(at) + ")";
     out.resize(at);
-    std::string cond;
+    // Stoolap evaluates the overflow only for a row that reaches it
     for (const char c : check) {
         if (c == '@')
-            cond += e;
+            out += e;
+        else if (c == '!')
+            out += kGuardOverflow;
         else
-            cond.push_back(c);
+            out.push_back(c);
     }
-    // Stoolap evaluates the overflow only for a row that reaches it
-    out += "CASE WHEN " + cond + " THEN 9223372036854775807 + 1 ELSE " + e +
-           " END";
     guard.column.assign(fl->field_name.str, fl->field_name.length);
     guard.error = error;
     return true;

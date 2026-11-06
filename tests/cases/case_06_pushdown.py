@@ -835,7 +835,8 @@ EXECUTE i USING IGNORE;
     # row-pump, an expression in the statement (one per UPDATE).
     h.exec_script(f"""
 CREATE TABLE wck (id INT NOT NULL PRIMARY KEY, n TINYINT NOT NULL,
-                  s VARCHAR(4), v INT, c INT CHECK (c > 0)) ENGINE={h.engine};
+                  s VARCHAR(4) COLLATE utf8mb4_bin, v INT,
+                  c INT CHECK (c > 0)) ENGINE={h.engine};
 INSERT INTO wck VALUES (1, 120, 'ab', 2147483646, 5);
 CREATE TABLE wts (id INT PRIMARY KEY, a INT, ts TIMESTAMP NULL DEFAULT NULL
                   ON UPDATE CURRENT_TIMESTAMP) ENGINE={h.engine};
@@ -867,6 +868,24 @@ INSERT INTO wts VALUES (1, 1, '2000-01-01 00:00:00');
     h.assert_scalar("the row kept its values",
                     "SELECT CONCAT_WS(':', n, s, v) FROM wck",
                     "121:\u00e9\u00e9\u00e9\u00e9:2147483647")
+    # Past the column MariaDB cuts ASCII white space and fails on the rest
+    before = _direct_hits(h)
+    h.assert_ok("trailing white space past the column is cut",
+                "UPDATE wck SET s = CONCAT(s, ' \\t ') WHERE id = 1")
+    h.assert_eq("in the statement's check", 1, _direct_hits(h) - before)
+    h.assert_err("anything else past it fails",
+                 "UPDATE wck SET s = CONCAT(s, ' x') WHERE id = 1", "1406")
+    h.assert_scalar("cut to the column", "SELECT HEX(s) FROM wck",
+                    "C3A9C3A9C3A9C3A9")
+    # The check's overflow is told from a duplicate naming such a value
+    h.exec_script(f"""
+CREATE TABLE wdup (id INT PRIMARY KEY,
+                   s VARCHAR(64) COLLATE utf8mb4_bin UNIQUE) ENGINE={h.engine};
+INSERT INTO wdup VALUES (1, 'Integer overflow'), (2, 'Integer ');
+""")
+    h.assert_err("a duplicate naming the overflow's words",
+                 "UPDATE wdup SET s = CONCAT(s, 'overflow') WHERE id = 2",
+                 "1062")
 
     h.section("Direct DML keeps string literals")
     h.exec_script(f"""

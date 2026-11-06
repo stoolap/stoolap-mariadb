@@ -249,7 +249,8 @@ int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
         const char* msg = *verr.message ? verr.message : "unknown error";
         // A row's SET value that does not fit its column (ModifyGuard):
         // MariaDB's strict-mode error. The row is not known: row 1.
-        if (guard.error && strstr(msg, "Integer overflow")) {
+        if (guard.error &&
+            strcmp(msg, stoolap_sqlgen::kGuardOverflowError) == 0) {
             my_error(guard.error, MYF(0), guard.column.c_str(), 1L);
             return HA_ERR_GENERIC;
         }
