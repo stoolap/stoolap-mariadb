@@ -811,6 +811,8 @@ UPDATE set_cv SET v = 1.50, n = 2.7 WHERE id = 2;
     h.assert_ok("an integer into a float, a NULL",
                 "UPDATE set_cv SET f = 3, n = NULL WHERE id = 3")
     h.assert_eq("run direct", 1, _direct_hits(h) - before)
+    h.assert_ok("a constant expression is not evaluated with no row",
+                "UPDATE set_cv SET f = EXP(1000) WHERE n = 9")
     h.assert_scalar("converted values",
                     "SELECT GROUP_CONCAT(CONCAT_WS(':', v, IFNULL(n, 'N'), f) "
                     "ORDER BY id) FROM set_cv", "1.20:0:0,1.50:3:0,a:N:3")
