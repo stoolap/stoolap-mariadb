@@ -29,11 +29,13 @@ namespace stoolap_pushdown {
 
 // 0 + *affected on success; HA_ERR_WRONG_COMMAND signals fall-back to
 // the per-row update_row/delete_row path.
-int try_direct_modify(THD* thd, ha_rows* affected,
+// `where` is the condition MariaDB pushed (handler::pushed_cond), null
+// for none: the statement is written from it and the SET list.
+int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
                       unsigned* errkey_out = nullptr);
 
 // Eligibility predicate; same checks try_direct_modify runs internally.
-bool can_direct_modify(THD* thd);
+bool can_direct_modify(THD* thd, const Item* where);
 
 // Pushdown factories. Wired in stoolap_init_func; NULL is a clean
 // fall-through to row-pump for ineligible plans.

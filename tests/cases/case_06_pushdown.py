@@ -231,7 +231,7 @@ INSERT INTO sdv_o VALUES (1, 'COMPLETED'), (2, 'pending');
         h._fail("trust_binary_strings=1 should push EXISTS-derived")
 
     # Generated SQL quotes and aliases every name, so a column named like
-    # its table is no hazard (direct DML's text rewriter still bails).
+    # its table is no hazard.
     h.section("Shadow column (column shares table name) pushes")
     h.exec_script(f"""
 CREATE TABLE shsel (id INT NOT NULL PRIMARY KEY, shsel INT NOT NULL) ENGINE={h.engine};
@@ -363,7 +363,9 @@ INSERT INTO pdc VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
     h.assert_scalar("WHERE UPDATE skipped row 2", "SELECT n FROM pdc WHERE id = 2", "2")
     h.assert_scalar("WHERE DELETE id=5 result",   "SELECT COUNT(*) FROM pdc WHERE id = 5", "0")
 
-    h.section("Direct DML declines when a column shares the table name")
+    h.section("Direct DML with a column sharing a table name")
+    # The statement is written from MariaDB's Item tree, so a column named
+    # like a table is a column: these run as direct DML.
     h.exec_script(f"""
 CREATE TABLE shadow (id INT NOT NULL PRIMARY KEY, shadow INT NOT NULL) ENGINE={h.engine};
 INSERT INTO shadow VALUES (1, 100), (2, 200), (3, 300);
@@ -371,10 +373,7 @@ INSERT INTO shadow VALUES (1, 100), (2, 200), (3, 300);
     before = _direct_hits(h)
     h.run_client(f"USE {h.db}; UPDATE shadow SET shadow = 999 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
-    if after == before:
-        h._pass("UPDATE column-name=table-name avoided direct path")
-    else:
-        h._fail(f"UPDATE column-name=table-name took direct path (delta={after - before})")
+    h.assert_eq("UPDATE column-name=table-name ran direct", 1, after - before)
     h.assert_scalar("UPDATE column=table applied",
                     "SELECT shadow FROM shadow WHERE id = 1", "999")
     h.assert_scalar("UPDATE skipped other rows",
@@ -387,10 +386,8 @@ INSERT INTO shdw VALUES (1, 11), (2, 22);
     before = _direct_hits(h)
     h.run_client(f"USE {h.db}; UPDATE shdw SET SHDW = 77 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
-    if after == before:
-        h._pass("case-insensitive column=table also avoids direct path")
-    else:
-        h._fail("case-insensitive column=table took direct path")
+    h.assert_eq("case-insensitive column=table ran direct", 1,
+                after - before)
     h.assert_scalar("ci column=table UPDATE applied",
                     "SELECT SHDW FROM shdw WHERE id = 1", "77")
 
@@ -420,36 +417,21 @@ UPDATE shadow_outer SET n = 999 WHERE EXISTS (
     WHERE shadow_inner.uid = shadow_outer.id AND shadow_inner = 1)""",
                  use_db=False)
     after = _direct_hits(h)
-    if after == before:
-        h._pass("EXISTS-subquery shadow leaf avoided direct path")
-    else:
-        h._fail(f"EXISTS-subquery shadow leaf took direct path (delta={after - before})")
+    h.assert_eq("EXISTS-subquery shadow leaf ran direct", 1, after - before)
     h.assert_scalar("EXISTS-subquery shadow UPDATE applied (id=1)",
                     "SELECT n FROM shadow_outer WHERE id = 1", "999")
     h.assert_scalar("EXISTS-subquery shadow other rows untouched",
                     "SELECT n FROM shadow_outer WHERE id = 2", "20")
 
-    before = _direct_hits(h)
     h.run_client(f"""
 USE {h.db};
 UPDATE shadow_outer SET n = 555 WHERE id IN (
     SELECT uid FROM shadow_inner WHERE shadow_inner = 2)""", use_db=False)
-    after = _direct_hits(h)
-    if after == before:
-        h._pass("IN-subquery shadow leaf avoided direct path")
-    else:
-        h._fail("IN-subquery shadow leaf took direct path")
     h.assert_scalar("IN-subquery shadow UPDATE applied (id=2)",
                     "SELECT n FROM shadow_outer WHERE id = 2", "555")
 
     # Cross-leaf shadow: outer leaf's column matches a SUBQUERY leaf's
-    # table name. The text rewriter rewrites every word-boundary
-    # occurrence of every leaf table name, so the bare `o` in
-    # `SET o = o + 1` gets mangled to the flat form of subquery table
-    # `o`. Original guard only checked own-leaf shadow (leaf `u` has
-    # column `u`?) and missed cross-leaf collisions; verify both that
-    # direct path is declined AND that the row-pump fallback applied
-    # the UPDATE correctly.
+    # table name (`SET o = o + 1` with a subquery on table `o`).
     h.exec_script(f"""
 CREATE TABLE x_outer (id INT NOT NULL PRIMARY KEY, o INT NOT NULL) ENGINE={h.engine};
 CREATE TABLE o (id INT NOT NULL PRIMARY KEY, n INT NOT NULL) ENGINE={h.engine};
@@ -462,23 +444,15 @@ USE {h.db};
 UPDATE x_outer SET o = o + 1 WHERE EXISTS (
     SELECT 1 FROM o WHERE o.id = x_outer.id)""", use_db=False)
     after = _direct_hits(h)
-    if after == before:
-        h._pass("cross-leaf shadow (outer col == subquery table) avoided direct")
-    else:
-        h._fail(f"cross-leaf shadow took direct path (delta={after - before})")
+    h.assert_eq("cross-leaf shadow ran direct", 1, after - before)
     h.assert_scalar("cross-leaf shadow UPDATE id=1 applied",
                     "SELECT o FROM x_outer WHERE id = 1", "101")
     h.assert_scalar("cross-leaf shadow UPDATE id=2 applied",
                     "SELECT o FROM x_outer WHERE id = 2", "201")
 
     h.section("Mixed-quote db.tbl direct DML")
-    # rewrite_table_names handles `db`.`tbl`, db.tbl, but used to miss
-    # `db`.tbl and db.`tbl`. Direct DML accepted those statements,
-    # left the table reference unrewritten, and stoolap returned a
-    # parse error like "expected SET after <db>, got '.'" instead of
-    # falling back to the row-pump path. Verify all four quoting
-    # combos run cleanly when the target db differs from the
-    # session's current db.
+    # All four quoting combos run cleanly when the target db differs
+    # from the session's current db.
     h.exec_script(f"""
 CREATE DATABASE IF NOT EXISTS mixq_other;
 CREATE TABLE mixq_other.q (id INT PRIMARY KEY, n INT) ENGINE={h.engine};
@@ -499,10 +473,9 @@ SELECT n FROM mixq_other.q;
     h.exec_script("DROP DATABASE mixq_other")
 
     h.section("Direct DML names tables as the handler does")
-    # The rewriter names each table from its opened path, as the handler
-    # does: a database or table name MariaDB encodes (my-db, P\u00e9, t$1)
-    # and, under lower_case_table_names, the statement's own letter case
-    # (MariaDB lowercases the names it lists, not the text).
+    # Each table is named from its opened path, as the handler does: a
+    # database or table name MariaDB encodes (my-db, P\u00e9, t$1) and,
+    # under lower_case_table_names, the statement's own letter case.
     c, cur = h.open_session()
     try:
         script = [
@@ -541,9 +514,9 @@ SELECT n FROM mixq_other.q;
         cur.execute("SELECT id FROM `my-db`.`t$1`")
         h.assert_eq("a table name with $", [(2,)], cur.fetchall())
         h.assert_eq("every statement ran as direct DML", 7, hits)
-        # A bare word the rewriter cannot tell from the table: the keyword
+        # A word that reads like the table: the keyword
         # SET for a table `set` (any case, as MariaDB may fold), a call of
-        # a function the table shares its name with. Left to the row-pump.
+        # a function the table shares its name with: all direct DML.
         for stmt in [
             f"CREATE TABLE `set` (id INT PRIMARY KEY, v INT) ENGINE={h.engine}",
             "INSERT INTO `set` VALUES (1, 0), (2, 0)",
@@ -568,10 +541,8 @@ SELECT n FROM mixq_other.q;
             "UPDATE `abs` SET v = abs--\x01 x\n(-id) WHERE id = 5",
         ]:
             cur.execute(stmt)
-        # Without case folding SET, ABS and `ABS` are no match: direct
-        cur.execute("SELECT @@lower_case_table_names")
-        folds = int(cur.fetchone()[0]) != 0
-        h.assert_eq("keyword and call words fall back", 0 if folds else 3,
+        # concat's string into an INT converts: the row-pump
+        h.assert_eq("keyword and call words ran direct", 7,
                     _direct_hits(h) - before)
         cur.execute("SELECT id, v FROM `set` ORDER BY id")
         h.assert_eq("a table named set", [(1, 1), (2, 2)], cur.fetchall())
@@ -586,10 +557,10 @@ SELECT n FROM mixq_other.q;
     finally:
         c.close()
 
-    h.section("Direct DML declines what stoolap's parser or the rewriter cannot take")
-    # DELETE QUICK / LOW_PRIORITY / IGNORE, UPDATE LOW_PRIORITY, "t" under
-    # ANSI_QUOTES, a spaced d . t: left to the row-pump, with and without
-    # WHERE (DELETE without WHERE runs as direct DML).
+    h.section("Direct DML takes any statement text MariaDB parses")
+    # DELETE QUICK / LOW_PRIORITY, UPDATE LOW_PRIORITY, "t" under
+    # ANSI_QUOTES, a spaced d . t, comments: with and without WHERE.
+    # DELETE IGNORE is left to the row-pump (it skips a row's error).
     c, cur = h.open_session()
     try:
         for stmt in [
@@ -613,7 +584,8 @@ SELECT n FROM mixq_other.q;
             "SET SESSION sql_mode = DEFAULT",
         ]:
             cur.execute(stmt)
-        h.assert_eq("none ran as direct DML", 0, _direct_hits(h) - before)
+        h.assert_eq("all but DELETE IGNORE ran direct", 6,
+                    _direct_hits(h) - before)
         cur.execute("SELECT id, v FROM t ORDER BY id")
         h.assert_eq("each ran", [(4, 1), (5, 2), (7, 3)], cur.fetchall())
         for stmt in ["DELETE QUICK FROM t", "INSERT INTO t VALUES (1, 0)",
@@ -659,7 +631,7 @@ SELECT n FROM mixq_other.q;
         cur.execute("SELECT id, v FROM t ORDER BY id")
         h.assert_eq("executable comments keep their text", [(1, 1), (4, 0)],
                     cur.fetchall())
-        h.assert_eq("and run on the row-pump", 0, _direct_hits(h) - before)
+        h.assert_eq("and ran direct", 3, _direct_hits(h) - before)
         cur.execute("DELETE /*! FROM */ t")
         cur.execute("SELECT COUNT(*) FROM t")
         h.assert_eq("without WHERE too", [(0,)], cur.fetchall())
@@ -783,7 +755,7 @@ INSERT INTO pdh VALUES (1, 1), (2, 2), (3, 3);
         h._fail(f"UPDATE no-WHERE did not increment counter (still {after})")
     h.assert_scalar("UPDATE no-WHERE result", "SELECT MIN(n) FROM pdh", "101")
 
-    h.section("Direct UPDATE/DELETE with subquery rewrites all leaves")
+    h.section("Direct UPDATE/DELETE with subquery names all leaves")
     h.exec_script(f"""
 CREATE TABLE sq_u (id INT NOT NULL PRIMARY KEY, n INT NOT NULL) ENGINE={h.engine};
 CREATE TABLE sq_o (oid INT NOT NULL PRIMARY KEY, uid INT NOT NULL) ENGINE={h.engine};
@@ -801,7 +773,63 @@ INSERT INTO sq_o VALUES (10, 1), (20, 1), (30, 2);
                 "DELETE FROM sq_u WHERE id IN (SELECT uid FROM sq_o WHERE oid = 30)")
     h.assert_scalar("DELETE subquery rows left", "SELECT COUNT(*) FROM sq_u", "2")
 
-    h.section("Direct DML rewriter is string-literal aware")
+    h.section("Direct UPDATE reads SET's assigned columns as MariaDB does")
+    # MariaDB assigns SET left to right, a later value reading the new
+    # column; stoolap reads the old row. Those go to the row-pump.
+    h.exec_script(f"""
+CREATE TABLE set_ord (id INT NOT NULL PRIMARY KEY, a INT, b INT) ENGINE={h.engine};
+INSERT INTO set_ord VALUES (1, 1, 0), (2, 5, 9), (3, 1, 1);
+""")
+    before = _direct_hits(h)
+    h.assert_ok("SET a then b = a",
+                "UPDATE set_ord SET a = a + 1, b = a WHERE id = 1")
+    h.assert_ok("SET a = b, b = a", "UPDATE set_ord SET a = b, b = a WHERE id = 2")
+    h.assert_eq("both on the row-pump", 0, _direct_hits(h) - before)
+    h.assert_ok("SET b = a, a = 7 reads only the old row",
+                "UPDATE set_ord SET b = a + 1, a = 7 WHERE id = 3")
+    h.assert_eq("and runs direct", 1, _direct_hits(h) - before)
+    h.assert_scalar("SET values", "SELECT GROUP_CONCAT(a, ':', b ORDER BY id) "
+                    "FROM set_ord", "2:2,9:9,7:2")
+
+    h.section("Direct UPDATE converts SET values as MariaDB does")
+    # MariaDB converts a value to its column; stoolap by its own rules
+    # (1.20 into a VARCHAR is '1.2', 2.7 into an INT is 2). Only a value of
+    # the column's class runs direct.
+    h.exec_script(f"""
+CREATE TABLE set_cv (id INT NOT NULL PRIMARY KEY, v VARCHAR(20), n INT,
+                     f DOUBLE) ENGINE={h.engine};
+INSERT INTO set_cv VALUES (1, 'a', 0, 0), (2, 'a', 0, 0), (3, 'a', 0, 0);
+""")
+    before = _direct_hits(h)
+    rc, out = h.run_client("""
+PREPARE s FROM 'UPDATE set_cv SET v = ? WHERE id = 1';
+SET @p = CAST(1.20 AS DECIMAL(3,2));
+EXECUTE s USING @p;
+UPDATE set_cv SET v = 1.50, n = 2.7 WHERE id = 2;
+""")
+    h.assert_eq("conversions on the row-pump", 0, _direct_hits(h) - before)
+    h.assert_ok("an integer into a float, a NULL",
+                "UPDATE set_cv SET f = 3, n = NULL WHERE id = 3")
+    h.assert_eq("run direct", 1, _direct_hits(h) - before)
+    h.assert_ok("a constant expression is not evaluated with no row",
+                "UPDATE set_cv SET f = EXP(1000) WHERE n = 9")
+    rc, out = h.run_client("""
+ALTER TABLE set_cv ADD COLUMN m INT DEFAULT 5;
+PREPARE d FROM 'UPDATE set_cv SET n = ?, m = ? WHERE id = 3';
+EXECUTE d USING DEFAULT, DEFAULT;
+PREPARE i FROM 'UPDATE set_cv SET m = ? WHERE id = 2';
+EXECUTE i USING IGNORE;
+""")
+    h.assert_eq("DEFAULT and IGNORE parameters run", 0, rc)
+    h.assert_scalar("their values",
+                    "SELECT GROUP_CONCAT(CONCAT_WS(':', IFNULL(n, 'N'), m) "
+                    "ORDER BY id) FROM set_cv WHERE id > 1", "3:5,N:5")
+    h.exec_script("ALTER TABLE set_cv DROP COLUMN m")
+    h.assert_scalar("converted values",
+                    "SELECT GROUP_CONCAT(CONCAT_WS(':', v, IFNULL(n, 'N'), f) "
+                    "ORDER BY id) FROM set_cv", "1.20:0:0,1.50:3:0,a:N:3")
+
+    h.section("Direct DML keeps string literals")
     h.exec_script(f"""
 CREATE TABLE bts (id INT NOT NULL PRIMARY KEY, note VARCHAR(64) NOT NULL) ENGINE={h.engine};
 INSERT INTO bts VALUES (1, 'old');

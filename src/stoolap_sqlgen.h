@@ -13,6 +13,7 @@
 #include <string>
 
 class THD;
+class Item;
 class st_select_lex;
 class st_select_lex_unit;
 
@@ -33,5 +34,11 @@ bool gen_select(THD* thd, st_select_lex* sel, std::string* out,
 // handlers run it. Result columns come out in order, named c0, c1, ...
 bool gen_unit(THD* thd, st_select_lex_unit* unit, std::string* out,
               std::string* why);
+
+// The single-table UPDATE or DELETE whose SELECT_LEX is `sel`, as the
+// direct DML hooks run it: `where` is the condition MariaDB pushed (null
+// for none), an UPDATE's SET list its item_list and LEX::value_list.
+bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
+                std::string* why);
 
 }  // namespace stoolap_sqlgen
