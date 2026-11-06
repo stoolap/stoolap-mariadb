@@ -1612,6 +1612,10 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v) {
                 break;
             }
             if (!varchar) return fail("text target");
+            // The check's REPLACE never grows a value, but stoolap refuses
+            // one past 10 MiB: a value that may be that large goes to the
+            // row-pump (a MEDIUMTEXT source, not a VARCHAR or a TEXT)
+            if (v->max_length > (1u << 20)) return fail("value may be large");
             // Past the column, MariaDB cuts ASCII white space (space,
             // \t \n \v \f \r) with a note and fails on anything else
             const std::string n = std::to_string(fl->char_length());

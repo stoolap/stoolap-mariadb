@@ -877,6 +877,20 @@ INSERT INTO wts VALUES (1, 1, '2000-01-01 00:00:00');
                  "UPDATE wck SET s = CONCAT(s, ' x') WHERE id = 1", "1406")
     h.assert_scalar("cut to the column", "SELECT HEX(s) FROM wck",
                     "C3A9C3A9C3A9C3A9")
+    # A value that may pass stoolap's 10 MiB REPLACE limit is not checked
+    # in the statement: a MEDIUMTEXT source goes to the row-pump
+    h.exec_script(f"""
+CREATE TABLE wbig (id INT PRIMARY KEY, dst VARCHAR(4) COLLATE utf8mb4_bin,
+                   tx TEXT COLLATE utf8mb4_bin,
+                   mt MEDIUMTEXT COLLATE utf8mb4_bin) ENGINE={h.engine};
+INSERT INTO wbig VALUES (1, 'x', 'abcd  ', 'wxyz  ');
+""")
+    before = _direct_hits(h)
+    h.assert_ok("a TEXT source", "UPDATE wbig SET dst = tx WHERE id = 1")
+    h.assert_eq("checked in the statement", 1, _direct_hits(h) - before)
+    h.assert_ok("a MEDIUMTEXT source", "UPDATE wbig SET dst = mt WHERE id = 1")
+    h.assert_eq("on the row-pump", 1, _direct_hits(h) - before)
+    h.assert_scalar("cut to the column", "SELECT dst FROM wbig", "wxyz")
     # The check's overflow is told from a duplicate naming such a value
     h.exec_script(f"""
 CREATE TABLE wdup (id INT PRIMARY KEY,
