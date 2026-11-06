@@ -14,6 +14,9 @@ access plan.
 import os
 import re
 
+import mysql.connector
+from mysql.connector.constants import ClientFlag
+
 
 def _direct_hits(h):
     """Read the global Stoolap_direct_modify_hits counter via SHOW STATUS."""
@@ -900,6 +903,36 @@ INSERT INTO wdup VALUES (1, 'Integer overflow'), (2, 'Integer ');
     h.assert_err("a duplicate naming the overflow's words",
                  "UPDATE wdup SET s = CONCAT(s, 'overflow') WHERE id = 2",
                  "1062")
+
+    h.section("Direct UPDATE counts the rows it changes")
+    # MariaDB reports the rows a SET changes, or with CLIENT_FOUND_ROWS
+    # the rows it finds; a row left as it was is not written.
+    h.exec_script(f"""
+CREATE TABLE wcnt (id INT PRIMARY KEY, v INT, s VARCHAR(4) COLLATE utf8mb4_bin)
+    ENGINE={h.engine};
+INSERT INTO wcnt VALUES (1, 1, 'abcd'), (2, 2, 'ab'), (3, 3, NULL);
+""")
+    for flags, label, want in [
+            ([], "changed", [0, 2, 1, 0]),
+            ([ClientFlag.FOUND_ROWS], "found", [3, 3, 1, 1])]:
+        c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                    database=h.db, autocommit=True,
+                                    client_flags=flags)
+        cur = c.cursor()
+        got = []
+        before = _direct_hits(h)
+        for stmt in ["UPDATE wcnt SET v = v",
+                     "UPDATE wcnt SET v = 2 WHERE id > 0",
+                     "UPDATE wcnt SET v = v + 1 WHERE id = 1",
+                     # Cut to 'abcd': unchanged
+                     "UPDATE wcnt SET s = CONCAT(s, '  ') WHERE id = 1"]:
+            cur.execute(stmt)
+            got.append(cur.rowcount)
+        h.assert_eq(f"rows {label}", want, got)
+        h.assert_eq(f"rows {label} ran direct", 4, _direct_hits(h) - before)
+        c.close()
+    h.assert_scalar("values", "SELECT GROUP_CONCAT(v ORDER BY id) FROM wcnt",
+                    "3,2,2")
 
     h.section("Direct DML keeps string literals")
     h.exec_script(f"""
