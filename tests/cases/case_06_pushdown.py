@@ -955,7 +955,8 @@ INSERT INTO wnul VALUES (1, NULL, 1, 9223372036854775807), (2, 1, 2, 0);
     h.assert_scalar("only the row it takes",
                     "SELECT GROUP_CONCAT(n ORDER BY id) FROM wnul",
                     "9223372036854775807,1")
-    # A DOUBLE stores -0.0 as 0.0: no change from 0.0, and 0.0 elsewhere
+    # From 11.4.11 a DOUBLE stores -0.0 as 0.0: no change from 0.0, and 0.0
+    # elsewhere. Before, MariaDB keeps -0.0 (the row-pump writes it).
     h.exec_script(f"""
 CREATE TABLE wneg (id INT PRIMARY KEY, d DOUBLE) ENGINE={h.engine};
 INSERT INTO wneg VALUES (1, 0e0), (2, 5);
@@ -963,12 +964,16 @@ INSERT INTO wneg VALUES (1, 0e0), (2, 5);
     c = mysql.connector.connect(user="root", unix_socket=h.socket,
                                 database=h.db, autocommit=True)
     cur = c.cursor()
+    cur.execute("SELECT VERSION()")
+    version = tuple(int(x) for x in
+                    re.match(r"(\d+)\.(\d+)\.(\d+)", cur.fetchone()[0]).groups())
+    zero = version >= (11, 4, 11)
     cur.execute("UPDATE wneg SET d = -0e0")
-    h.assert_eq("-0.0 changes only the 5", 1, cur.rowcount)
+    h.assert_eq("-0.0 changes", 1 if zero else 2, cur.rowcount)
     c.close()
-    h.assert_scalar("stored as 0.0",
+    h.assert_scalar("stored as the server stores it",
                     "SELECT GROUP_CONCAT(ATAN2(d, -1) > 0 ORDER BY id) FROM wneg",
-                    "1,1")
+                    "1,1" if zero else "0,0")
 
     h.section("Direct DML keeps string literals")
     h.exec_script(f"""

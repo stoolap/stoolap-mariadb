@@ -1461,6 +1461,22 @@ bool Gen::order_list(SQL_I_List<ORDER>* lst, bool directions) {
     return true;
 }
 
+// Whether the running server stores a DOUBLE's -0.0 as 0.0, which
+// Field_double::store does from 11.4.11 on: the server's version, as the
+// plugin may run on another 11.4 than it was built against
+bool server_stores_zero_for_negative_zero() {
+    static const bool yes = [] {
+        unsigned major = 0, minor = 0, patch = 0;
+        if (std::sscanf(server_version, "%u.%u.%u", &major, &minor, &patch) !=
+            3)
+            return false;
+        if (major != 11) return major > 11;
+        if (minor != 4) return minor > 4;
+        return patch >= 11;
+    }();
+    return yes;
+}
+
 // Whether `it` takes at most one row of `tb`: an equality of its
 // single-column primary key with a constant, alone or in an AND
 bool pk_equality(Item* it, TABLE* tb) {
@@ -1663,6 +1679,10 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
             if (fl->real_type() != MYSQL_TYPE_DOUBLE ||
                 fl->decimals() < NOT_FIXED_DEC)
                 return fail("rounding float target");
+            // Before 11.4.11 MariaDB keeps -0.0, and compares its bytes
+            // to 0.0's: that one leaves a DOUBLE to the row-pump
+            if (!server_stores_zero_for_negative_zero())
+                return fail("DOUBLE target on a server keeping -0.0");
             real = true;
             break;
         case Cls::STR: {
@@ -1717,7 +1737,7 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
     if (check.empty()) {
         if (!expr(v)) return false;
         // A DOUBLE stores -0.0 as 0.0 (so it is no change from 0.0 either):
-        // adding 0.0 does that
+        // adding 0.0 does that (server_stores_zero_for_negative_zero)
         if (real) out += " + 0.0";
         *stored = "(" + out.substr(at) + ")";
         return true;

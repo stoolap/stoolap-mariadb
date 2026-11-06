@@ -263,6 +263,9 @@ int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
     // The rows found, when the UPDATE counts only the rows it changes: read
     // before it, since it may change what the condition takes. Reported
     // only ("Rows matched"), so a failed count leaves the changed count.
+    // In autocommit it is a statement of its own, so a commit between it
+    // and the UPDATE can make it off; stoolap#936 would count both in the
+    // UPDATE.
     StoolapTx* tx = ctx->has_tx() ? ctx->tx() : nullptr;
     uint64_t found_n = 0;
     bool have_found = false;
