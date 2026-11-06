@@ -541,7 +541,8 @@ SELECT n FROM mixq_other.q;
             "UPDATE `abs` SET v = abs--\x01 x\n(-id) WHERE id = 5",
         ]:
             cur.execute(stmt)
-        h.assert_eq("keyword and call words ran direct", 8,
+        # concat's string into an INT converts: the row-pump
+        h.assert_eq("keyword and call words ran direct", 7,
                     _direct_hits(h) - before)
         cur.execute("SELECT id, v FROM `set` ORDER BY id")
         h.assert_eq("a table named set", [(1, 1), (2, 2)], cur.fetchall())
@@ -789,6 +790,30 @@ INSERT INTO set_ord VALUES (1, 1, 0), (2, 5, 9), (3, 1, 1);
     h.assert_eq("and runs direct", 1, _direct_hits(h) - before)
     h.assert_scalar("SET values", "SELECT GROUP_CONCAT(a, ':', b ORDER BY id) "
                     "FROM set_ord", "2:2,9:9,7:2")
+
+    h.section("Direct UPDATE converts SET values as MariaDB does")
+    # MariaDB converts a value to its column; stoolap by its own rules
+    # (1.20 into a VARCHAR is '1.2', 2.7 into an INT is 2). Only a value of
+    # the column's class runs direct.
+    h.exec_script(f"""
+CREATE TABLE set_cv (id INT NOT NULL PRIMARY KEY, v VARCHAR(20), n INT,
+                     f DOUBLE) ENGINE={h.engine};
+INSERT INTO set_cv VALUES (1, 'a', 0, 0), (2, 'a', 0, 0), (3, 'a', 0, 0);
+""")
+    before = _direct_hits(h)
+    rc, out = h.run_client("""
+PREPARE s FROM 'UPDATE set_cv SET v = ? WHERE id = 1';
+SET @p = CAST(1.20 AS DECIMAL(3,2));
+EXECUTE s USING @p;
+UPDATE set_cv SET v = 1.50, n = 2.7 WHERE id = 2;
+""")
+    h.assert_eq("conversions on the row-pump", 0, _direct_hits(h) - before)
+    h.assert_ok("an integer into a float, a NULL",
+                "UPDATE set_cv SET f = 3, n = NULL WHERE id = 3")
+    h.assert_eq("run direct", 1, _direct_hits(h) - before)
+    h.assert_scalar("converted values",
+                    "SELECT GROUP_CONCAT(CONCAT_WS(':', v, IFNULL(n, 'N'), f) "
+                    "ORDER BY id) FROM set_cv", "1.20:0:0,1.50:3:0,a:N:3")
 
     h.section("Direct DML keeps string literals")
     h.exec_script(f"""

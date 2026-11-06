@@ -1472,6 +1472,17 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             if (f->type() != Item::FIELD_ITEM) return fail("SET target");
             const Field* fl = static_cast<Item_field*>(f)->field;
             if (!fl || fl->table != t->table) return fail("SET target");
+            // MariaDB converts the value to the column (Field::store),
+            // stoolap by its own rules: 1.20 into a VARCHAR is '1.20' to
+            // one and '1.2' to the other, 2.7 into an INT 3 and 2. Only a
+            // value of the column's class (an integer into a float) or a
+            // NULL is written the same.
+            const Cls tc = cls(f);
+            const Cls vc = cls(v);
+            const bool null = v->const_item() && v->is_null();
+            if (!null && (tc == Cls::UNSAFE ||
+                          (tc != vc && !(tc == Cls::REAL && vc == Cls::INT))))
+                return fail("SET converts its value");
             if (!first) out += ", ";
             first = false;
             ident(std::string_view(fl->field_name.str, fl->field_name.length));
