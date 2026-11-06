@@ -1,4 +1,4 @@
--- known-diff-file: direct UPDATE: no MariaDB range / length / rounding checks, matched counted as changed
+-- known-diff-file: direct UPDATE: matched counted as changed
 CREATE TABLE t (id INT PRIMARY KEY, a TINYINT, s VARCHAR(3), d DATE, i INT) ENGINE={E};
 INSERT INTO t VALUES (1, 1, 'x', '2020-01-05', 0);
 UPDATE t SET a = 300;

@@ -829,6 +829,78 @@ EXECUTE i USING IGNORE;
                     "SELECT GROUP_CONCAT(CONCAT_WS(':', v, IFNULL(n, 'N'), f) "
                     "ORDER BY id) FROM set_cv", "1.20:0:0,1.50:3:0,a:N:3")
 
+    h.section("Direct UPDATE keeps MariaDB's checks on the written row")
+    # CHECK constraints and ON UPDATE CURRENT_TIMESTAMP go to the row-pump;
+    # a value out of its column fails as in strict mode: a literal on the
+    # row-pump, an expression in the statement (one per UPDATE).
+    h.exec_script(f"""
+CREATE TABLE wck (id INT NOT NULL PRIMARY KEY, n TINYINT NOT NULL,
+                  s VARCHAR(4) COLLATE utf8mb4_bin, v INT,
+                  c INT CHECK (c > 0)) ENGINE={h.engine};
+INSERT INTO wck VALUES (1, 120, 'ab', 2147483646, 5);
+CREATE TABLE wts (id INT PRIMARY KEY, a INT, ts TIMESTAMP NULL DEFAULT NULL
+                  ON UPDATE CURRENT_TIMESTAMP) ENGINE={h.engine};
+INSERT INTO wts VALUES (1, 1, '2000-01-01 00:00:00');
+""")
+    h.assert_err("CHECK constraint", "UPDATE wck SET c = -1 WHERE id = 1",
+                 "4025")
+    h.assert_ok("ON UPDATE CURRENT_TIMESTAMP", "UPDATE wts SET a = 2")
+    h.assert_scalar("ON UPDATE column set",
+                    "SELECT ts > '2000-01-01 00:00:00' FROM wts", "1")
+    h.exec_script("ALTER TABLE wck DROP CONSTRAINT IF EXISTS c")
+    h.exec_script("ALTER TABLE wck MODIFY c INT")
+    before = _direct_hits(h)
+    h.assert_ok("a counter that fits", "UPDATE wck SET n = n + 1 WHERE id = 1")
+    h.assert_ok("an INT that fits", "UPDATE wck SET v = v + 1 WHERE id = 1")
+    h.assert_ok("a string that fits", "UPDATE wck SET s = '\u00e9\u00e9\u00e9\u00e9' "
+                "WHERE id = 1")
+    h.assert_eq("run direct", 3, _direct_hits(h) - before)
+    h.assert_err("a TINYINT past its range", "UPDATE wck SET n = n + 10 WHERE id = 1",
+                 "1264")
+    h.assert_err("an INT past its range", "UPDATE wck SET v = v + 1 WHERE id = 1",
+                 "1264")
+    h.assert_err("a literal past its range", "UPDATE wck SET n = 300 WHERE id = 1",
+                 "1264")
+    h.assert_err("a literal too long", "UPDATE wck SET s = 'abcde' WHERE id = 1",
+                 "1406")
+    h.assert_err("NULL into NOT NULL", "UPDATE wck SET n = NULL WHERE id = 1",
+                 "1048")
+    h.assert_scalar("the row kept its values",
+                    "SELECT CONCAT_WS(':', n, s, v) FROM wck",
+                    "121:\u00e9\u00e9\u00e9\u00e9:2147483647")
+    # Past the column MariaDB cuts ASCII white space and fails on the rest
+    before = _direct_hits(h)
+    h.assert_ok("trailing white space past the column is cut",
+                "UPDATE wck SET s = CONCAT(s, ' \\t ') WHERE id = 1")
+    h.assert_eq("in the statement's check", 1, _direct_hits(h) - before)
+    h.assert_err("anything else past it fails",
+                 "UPDATE wck SET s = CONCAT(s, ' x') WHERE id = 1", "1406")
+    h.assert_scalar("cut to the column", "SELECT HEX(s) FROM wck",
+                    "C3A9C3A9C3A9C3A9")
+    # A value that may pass stoolap's 10 MiB REPLACE limit is not checked
+    # in the statement: a MEDIUMTEXT source goes to the row-pump
+    h.exec_script(f"""
+CREATE TABLE wbig (id INT PRIMARY KEY, dst VARCHAR(4) COLLATE utf8mb4_bin,
+                   tx TEXT COLLATE utf8mb4_bin,
+                   mt MEDIUMTEXT COLLATE utf8mb4_bin) ENGINE={h.engine};
+INSERT INTO wbig VALUES (1, 'x', 'abcd  ', 'wxyz  ');
+""")
+    before = _direct_hits(h)
+    h.assert_ok("a TEXT source", "UPDATE wbig SET dst = tx WHERE id = 1")
+    h.assert_eq("checked in the statement", 1, _direct_hits(h) - before)
+    h.assert_ok("a MEDIUMTEXT source", "UPDATE wbig SET dst = mt WHERE id = 1")
+    h.assert_eq("on the row-pump", 1, _direct_hits(h) - before)
+    h.assert_scalar("cut to the column", "SELECT dst FROM wbig", "wxyz")
+    # The check's overflow is told from a duplicate naming such a value
+    h.exec_script(f"""
+CREATE TABLE wdup (id INT PRIMARY KEY,
+                   s VARCHAR(64) COLLATE utf8mb4_bin UNIQUE) ENGINE={h.engine};
+INSERT INTO wdup VALUES (1, 'Integer overflow'), (2, 'Integer ');
+""")
+    h.assert_err("a duplicate naming the overflow's words",
+                 "UPDATE wdup SET s = CONCAT(s, 'overflow') WHERE id = 2",
+                 "1062")
+
     h.section("Direct DML keeps string literals")
     h.exec_script(f"""
 CREATE TABLE bts (id INT NOT NULL PRIMARY KEY, note VARCHAR(64) NOT NULL) ENGINE={h.engine};
