@@ -148,6 +148,29 @@ inline std::string fit_table_name(std::string flat) {
     return flat;
 }
 
+// Stoolap's name for the table at MariaDB's path "./db/tbl" (a file path:
+// its names as tablename_to_filename encodes them). `_` becomes `_0` and
+// `/` becomes `_1`, so distinct (db, tbl) pairs never collide (a naive
+// `/` -> `__` meets db=`p`,tbl=`q__r` and db=`p__q`,tbl=`r`); one past
+// stoolap's name limit is shortened (fit_table_name). The handler and the
+// direct DML rewriter both name tables by it.
+inline std::string stoolap_table_from_path(const char* mariadb_path) {
+    if (!mariadb_path) return std::string();
+    std::string_view s(mariadb_path);
+    if (s.size() >= 2 && s[0] == '.' && s[1] == '/') s.remove_prefix(2);
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (char c : s) {
+        if (c == '_')
+            out.append("_0");
+        else if (c == '/')
+            out.append("_1");
+        else
+            out.push_back(c);
+    }
+    return fit_table_name(std::move(out));
+}
+
 // Hot-path read with memory_order_relaxed; bool read + branch, free off.
 extern std::atomic<bool> g_perf_trace_enabled;
 

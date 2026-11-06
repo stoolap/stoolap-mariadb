@@ -125,34 +125,6 @@ bool every_table_is_stoolap(SELECT_LEX* sel_lex, bool& has_any_table) {
     return every_table_is_stoolap_impl(sel_lex, has_any_table);
 }
 
-/** Stoolap-side flat name for a (db, tbl) pair. Mirrors
- *  ha_stoolap.cc::stoolap_table_from_path: escapes `_` -> `_0` and
- *  emits `_1` between db and tbl, so distinct (db, tbl) pairs never
- *  flatten to the same backing name. CREATE-time names produced by
- *  the path mapper and DML-time names produced here must agree
- *  byte-for-byte; tests verify both end up addressing the same
- *  stoolap table. */
-std::string stoolap_name_for(const char* db, const char* tbl) {
-    auto append_escaped = [](std::string& out, const char* s) {
-        if (!s) return;
-        for (const char* p = s; *p; ++p) {
-            if (*p == '_')
-                out.append("_0");
-            else if (*p == '/')
-                out.append("_1");
-            else
-                out.push_back(*p);
-        }
-    };
-    std::string out;
-    if (db && *db) {
-        append_escaped(out, db);
-        out.append("_1");
-    }
-    append_escaped(out, tbl);
-    return stoolap_mariadb::fit_table_name(std::move(out));
-}
-
 struct LeafName {
     std::string db;
     std::string tbl;
@@ -177,8 +149,10 @@ void collect_leaf_names(SELECT_LEX* sel_lex, std::vector<LeafName>& out) {
         if (!tl->table->file || tl->table->file->ht != stoolap_hton) continue;
         const char* db = tl->db.str ? tl->db.str : "";
         const char* tbl = tl->table_name.str ? tl->table_name.str : "";
-        out.push_back(
-            {std::string(db), std::string(tbl), stoolap_name_for(db, tbl)});
+        out.push_back({std::string(db), std::string(tbl),
+                       // The handler's name for it, by the opened table's path
+                       stoolap_mariadb::stoolap_table_from_path(
+                           tl->table->s->normalized_path.str)});
     }
     // Subqueries: walk inner units. Without this the rewriter misses
     // tables referenced inside EXISTS/IN/scalar subqueries, and the
@@ -221,12 +195,56 @@ size_t skip_string_literal(const std::string& s, size_t start) {
     return s.size();
 }
 
+/** Whether `s` holds `name` at `i`: byte for byte, or with ASCII case
+ *  folded when MariaDB folds table names (lower_case_table_names; its
+ *  TABLE_LIST names are lowercased then, the statement's text is not). */
+bool name_at(const std::string& s, size_t i, std::string_view name) {
+    if (i + name.size() > s.size()) return false;
+    if (!lower_case_table_names) return s.compare(i, name.size(), name) == 0;
+    return strncasecmp(s.data() + i, name.data(), name.size()) == 0;
+}
+
+/** The first position at or after `i` past white space and comments
+ *  (C style, `-- ` and `#`); npos at an executable C comment (`!` or
+ *  `M!` after its opening), whose text MariaDB runs. */
+size_t skip_space_and_comments(const std::string& s, size_t i) {
+    while (i < s.size()) {
+        if (isspace(static_cast<unsigned char>(s[i]))) {
+            ++i;
+        } else if (s.compare(i, 2, "/*") == 0) {
+            if (s.compare(i, 3, "/*!") == 0 || s.compare(i, 4, "/*M!") == 0)
+                return std::string::npos;
+            const size_t close = s.find("*/", i + 2);
+            i = close == std::string::npos ? s.size() : close + 2;
+        } else if (s[i] == '#' ||
+                   (s.compare(i, 2, "--") == 0 &&
+                    (i + 2 == s.size() ||
+                     isspace(static_cast<unsigned char>(s[i + 2])) ||
+                     iscntrl(static_cast<unsigned char>(s[i + 2]))))) {
+            const size_t nl = s.find('\n', i);
+            i = nl == std::string::npos ? s.size() : nl + 1;
+        } else {
+            break;
+        }
+    }
+    return i;
+}
+
+/** Whether a call may follow a name ending at `end`: its `(` next, or an
+ *  executable comment that may hold it */
+bool call_follows(const std::string& s, size_t end) {
+    const size_t next = skip_space_and_comments(s, end);
+    return next == std::string::npos || (next < s.size() && s[next] == '(');
+}
+
 /** Word-boundary identifier replacement that skips literal regions. The
  *  `.` exclusion on the left side prevents mangling the table half of a
- *  qualified `db.tbl` reference when iterating a different leaf. */
-void replace_ident_word(std::string& s, std::string_view from,
-                        std::string_view to) {
-    if (from.empty()) return;
+ *  qualified `db.tbl` reference when iterating a different leaf. False when
+ *  a word may not be the table: a call (`from(`), or any word when `from`
+ *  is an SQL keyword (a table `set` matches `SET` with case folded). */
+bool replace_ident_word(std::string& s, std::string_view from,
+                        std::string_view to, bool keyword = false) {
+    if (from.empty()) return true;
     size_t i = 0;
     while (i < s.size()) {
         const char c = s[i];
@@ -234,11 +252,7 @@ void replace_ident_word(std::string& s, std::string_view from,
             i = skip_string_literal(s, i);
             continue;
         }
-        if (c != from[0]) {
-            ++i;
-            continue;
-        }
-        if (s.compare(i, from.size(), from) != 0) {
+        if (!name_at(s, i, from)) {
             ++i;
             continue;
         }
@@ -251,12 +265,14 @@ void replace_ident_word(std::string& s, std::string_view from,
             (end >= s.size()) ||
             !is_ident_char(static_cast<unsigned char>(s[end]));
         if (ok_left && ok_right) {
+            if (keyword || call_follows(s, end)) return false;
             s.replace(i, from.size(), to);
             i += to.size();
         } else {
             i += from.size();
         }
     }
+    return true;
 }
 
 /** Replace every occurrence of `from` with `to`, skipping single-quoted,
@@ -269,10 +285,11 @@ void replace_ident_word(std::string& s, std::string_view from,
  *  rather than string literals, but treating them as opaque regions is
  *  fine here. A backticked table reference like `t` IS itself such a
  *  region, so any nested occurrence we skip past was already part of
- *  an identifier we'd not want to rewrite. */
-void replace_all_literal_aware(std::string& s, std::string_view from,
+ *  an identifier we'd not want to rewrite. False at a call (`from`(),
+ *  as replace_ident_word. */
+bool replace_all_literal_aware(std::string& s, std::string_view from,
                                std::string_view to) {
-    if (from.empty()) return;
+    if (from.empty()) return true;
     const char first = from[0];
     size_t i = 0;
     while (i < s.size()) {
@@ -293,38 +310,47 @@ void replace_all_literal_aware(std::string& s, std::string_view from,
             i = skip_string_literal(s, i);
             continue;
         }
-        if (c != first || s.compare(i, from.size(), from) != 0) {
+        if (!name_at(s, i, from)) {
             ++i;
             continue;
         }
+        if (call_follows(s, i + from.size())) return false;
         s.replace(i, from.size(), to);
         i += to.size();
     }
+    return true;
 }
 
 /**
  * Rewrite a MariaDB-flavoured UPDATE/DELETE so every reference to a stoolap
- * base table picks up the stoolap-flat name. Covers every MariaDB qualified
- * identifier syntax:
+ * base table picks up the stoolap name the handler gives it (from its path,
+ * stoolap_table_from_path), quoted: a name MariaDB encodes holds `@`.
+ * Covers every MariaDB qualified identifier syntax:
  *
- *   `db`.`tbl`   ->   "db__tbl"
- *   db.tbl       ->   db__tbl
- *   `db`.tbl     ->   "db__tbl"   (mixed: quoted db, bare tbl)
- *   db.`tbl`     ->   "db__tbl"   (mixed: bare db, quoted tbl)
- *   `tbl`        ->   "db__tbl"   (only when the bare name is unambiguous)
- *   tbl          ->   db__tbl     (same condition; word-boundary aware)
+ *   `db`.`tbl`   ->   "<stoolap name>"
+ *   db.tbl       ->   "<stoolap name>"
+ *   `db`.tbl     ->   "<stoolap name>"   (mixed: quoted db, bare tbl)
+ *   db.`tbl`     ->   "<stoolap name>"   (mixed: bare db, quoted tbl)
+ *   `tbl`        ->   "<stoolap name>"   (only when the bare name is
+ *   tbl          ->   "<stoolap name>"    unambiguous; word-boundary aware)
+ *
+ * Under lower_case_table_names MariaDB lowercases the names it lists, not
+ * the statement's text: the names match it with ASCII case folded.
  *
  * Phase order matters: every qualified form runs first so a later bare pass
  * can't consume the table half of a qualified ref. The two mixed-quote
  * variants are common enough -- MariaDB users sometimes quote one half but
  * not the other -- that omitting them dropped direct-DML to a stoolap parse
  * error like "expected SET after <db>, got '.'".
+ *
+ * False when a name may not be the table (a call, or a bare keyword;
+ * replace_ident_word): the caller leaves the statement to the row-pump.
  */
-std::string rewrite_table_names(const std::string& sql,
-                                const std::vector<LeafName>& leaves,
-                                const char* current_db) {
-    if (leaves.empty()) return sql;
-    std::string out = sql;
+bool rewrite_table_names(const std::string& sql,
+                         const std::vector<LeafName>& leaves,
+                         const char* current_db, std::string& out) {
+    out = sql;
+    if (leaves.empty()) return true;
     const std::string cur_db = current_db ? current_db : "";
 
     for (const LeafName& l : leaves) {
@@ -334,11 +360,12 @@ std::string rewrite_table_names(const std::string& sql,
         const std::string bt_tb_qual = l.db + ".`" + l.tbl + "`";
         // Backticked-both first; the mixed forms are stricter substrings
         // of all-bare so they need their own pass before bare-bare runs.
-        replace_all_literal_aware(out, bt_qual, quoted);
-        replace_all_literal_aware(out, bt_db_qual, quoted);
-        replace_all_literal_aware(out, bt_tb_qual, quoted);
         const std::string bare_qual = l.db + "." + l.tbl;
-        replace_ident_word(out, bare_qual, l.stoolap);
+        if (!replace_all_literal_aware(out, bt_qual, quoted) ||
+            !replace_all_literal_aware(out, bt_db_qual, quoted) ||
+            !replace_all_literal_aware(out, bt_tb_qual, quoted) ||
+            !replace_ident_word(out, bare_qual, quoted))
+            return false;
     }
 
     // Bare-form rewrites only fire when the bare name is unambiguous
@@ -356,15 +383,17 @@ std::string rewrite_table_names(const std::string& sql,
     std::unordered_map<std::string, int> done;
     for (const LeafName& l : leaves) {
         if (tbl_distinct_dbs[l.tbl] != 1) continue;
-        if (l.db != cur_db) continue;
+        if (l.db.size() != cur_db.size() || !name_at(cur_db, 0, l.db)) continue;
         if (done[l.stoolap]++) continue;
 
         const std::string quoted = std::string("\"") + l.stoolap + "\"";
         const std::string bt_bare = "`" + l.tbl + "`";
-        replace_all_literal_aware(out, bt_bare, quoted);
-        replace_ident_word(out, l.tbl, l.stoolap);
+        if (!replace_all_literal_aware(out, bt_bare, quoted) ||
+            !replace_ident_word(out, l.tbl, quoted,
+                                is_keyword(l.tbl.c_str(), l.tbl.size())))
+            return false;
     }
-    return out;
+    return true;
 }
 
 // Forward decl: collect_bound_params is defined in the next anonymous
@@ -550,7 +579,15 @@ bool can_direct_modify(THD* thd) {
     // would mangle SET/WHERE tokens that share a table name. Row-pump
     // handles those via per-row callbacks.
     if (any_leaf_has_shadow_column(sel)) return false;
-    return true;
+
+    // Decline a bare word the rewriter cannot tell from the table
+    // (rewrite_table_names): MariaDB has chosen the path by the time
+    // try_direct_modify runs, so its refusal could not fall back.
+    std::vector<LeafName> leaves;
+    collect_leaf_names(sel, leaves);
+    std::string sql;
+    return rewrite_table_names(std::string(thd->query(), thd->query_length()),
+                               leaves, thd->db.str, sql);
 }
 
 int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
@@ -562,7 +599,8 @@ int try_direct_modify(THD* thd, ha_rows* affected, unsigned* errkey_out) {
 
     std::vector<LeafName> leaves;
     collect_leaf_names(sel, leaves);
-    std::string sql = rewrite_table_names(raw, leaves, thd->db.str);
+    std::string sql;
+    rewrite_table_names(raw, leaves, thd->db.str, sql);
 
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
         thd_get_ha_data(thd, stoolap_hton));

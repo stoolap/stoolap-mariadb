@@ -498,6 +498,94 @@ SELECT n FROM mixq_other.q;
                 "4", last)
     h.exec_script("DROP DATABASE mixq_other")
 
+    h.section("Direct DML names tables as the handler does")
+    # The rewriter names each table from its opened path, as the handler
+    # does: a database or table name MariaDB encodes (my-db, P\u00e9, t$1)
+    # and, under lower_case_table_names, the statement's own letter case
+    # (MariaDB lowercases the names it lists, not the text).
+    c, cur = h.open_session()
+    try:
+        script = [
+            "DROP DATABASE IF EXISTS `DmlCase`", "CREATE DATABASE `DmlCase`",
+            "USE `DmlCase`",
+            f"CREATE TABLE pQ (id INT PRIMARY KEY, v INT) ENGINE={h.engine}",
+            "INSERT INTO pQ VALUES (1, 0), (2, 0), (3, 0), (4, 0)",
+            "DROP DATABASE IF EXISTS `my-db`", "CREATE DATABASE `my-db`",
+            f"CREATE TABLE `my-db`.`P\u00e9` (id INT PRIMARY KEY, v INT) "
+            f"ENGINE={h.engine}",
+            "INSERT INTO `my-db`.`P\u00e9` VALUES (1, 0), (2, 0), (3, 0)",
+            f"CREATE TABLE `my-db`.`t$1` (id INT PRIMARY KEY) ENGINE={h.engine}",
+            "INSERT INTO `my-db`.`t$1` VALUES (1), (2)",
+        ]
+        for stmt in script:
+            cur.execute(stmt)
+        before = _direct_hits(h)
+        for stmt in [
+            "DELETE FROM pQ WHERE id = 1",
+            "DELETE FROM DmlCase.pQ WHERE id = 2",
+            "UPDATE `pQ` SET v = 7 WHERE id = 3",
+            "DELETE FROM `my-db`.`P\u00e9` WHERE id = 1",
+            "UPDATE `my-db`.`P\u00e9` SET v = 5 WHERE id = 2",
+            "USE `my-db`",
+            "DELETE FROM `P\u00e9` WHERE id = 3",
+            "DELETE FROM t$1 WHERE id = 1",
+        ]:
+            cur.execute(stmt)
+        hits = _direct_hits(h) - before
+        cur.execute("SELECT id, v FROM `DmlCase`.pQ ORDER BY id")
+        h.assert_eq("upper-case database: bare, qualified and quoted names",
+                    [(3, 7), (4, 0)], cur.fetchall())
+        cur.execute("SELECT id, v FROM `my-db`.`P\u00e9` ORDER BY id")
+        h.assert_eq("encoded database and table names", [(2, 5)],
+                    cur.fetchall())
+        cur.execute("SELECT id FROM `my-db`.`t$1`")
+        h.assert_eq("a table name with $", [(2,)], cur.fetchall())
+        h.assert_eq("every statement ran as direct DML", 7, hits)
+        # A bare word the rewriter cannot tell from the table: the keyword
+        # SET for a table `set` (any case, as MariaDB may fold), a call of
+        # a function the table shares its name with. Left to the row-pump.
+        for stmt in [
+            f"CREATE TABLE `set` (id INT PRIMARY KEY, v INT) ENGINE={h.engine}",
+            "INSERT INTO `set` VALUES (1, 0), (2, 0)",
+            f"CREATE TABLE concat (id INT PRIMARY KEY, v INT) "
+            f"ENGINE={h.engine}",
+            "INSERT INTO concat VALUES (1, 0)",
+            f"CREATE TABLE `abs` (id INT PRIMARY KEY, v INT) ENGINE={h.engine}",
+            "INSERT INTO `abs` VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)",
+        ]:
+            cur.execute(stmt)
+        before = _direct_hits(h)
+        for stmt in [
+            "UPDATE `set` SET v = 1 WHERE id = 1",
+            "UPDATE `set` set v = 2 WHERE id = 2",
+            "UPDATE concat SET v = concat('1', '2') WHERE id = 1",
+            # A comment between the call's name and its `(`
+            "UPDATE `abs` SET v = ABS/**/(-id) WHERE id = 1",
+            "UPDATE `abs` SET v = abs -- x\n (-id) WHERE id = 2",
+            "UPDATE `abs` SET v = abs /*! (-id) */ WHERE id = 3",
+            "UPDATE `abs` SET v = `ABS`(-id) WHERE id = 4",
+            # MariaDB takes -- before a control character as a comment
+            "UPDATE `abs` SET v = abs--\x01 x\n(-id) WHERE id = 5",
+        ]:
+            cur.execute(stmt)
+        # Without case folding SET, ABS and `ABS` are no match: direct
+        cur.execute("SELECT @@lower_case_table_names")
+        folds = int(cur.fetchone()[0]) != 0
+        h.assert_eq("keyword and call words fall back", 0 if folds else 3,
+                    _direct_hits(h) - before)
+        cur.execute("SELECT id, v FROM `set` ORDER BY id")
+        h.assert_eq("a table named set", [(1, 1), (2, 2)], cur.fetchall())
+        cur.execute("SELECT v FROM concat")
+        h.assert_eq("a table named like a function", [(12,)], cur.fetchall())
+        cur.execute("SELECT id, v FROM `abs` ORDER BY id")
+        h.assert_eq("a call with a comment before its (",
+                    [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)],
+                    cur.fetchall())
+        cur.execute("DROP DATABASE `DmlCase`")
+        cur.execute("DROP DATABASE `my-db`")
+    finally:
+        c.close()
+
     h.section("Direct DML respects ci-collation guard")
     h.exec_script(f"""
 CREATE TABLE pds (id INT NOT NULL PRIMARY KEY, s VARCHAR(32), n INT NOT NULL) ENGINE={h.engine};
