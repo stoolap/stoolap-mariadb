@@ -155,10 +155,10 @@ The plugin implements three of MariaDB's pushdown contracts:
 |                    | row-pump UPDATE/DELETE        | re-evaluate the WHERE; signals to       |
 |                    |                               | MariaDB it can route to the direct DML  |
 |                    |                               | hooks instead of the per-row callback.  |
-| `pre_direct_*`     | Direct UPDATE / DELETE        | Forwards `thd->query()` verbatim to     |
-|                    |                               | Stoolap with leaf-name rewriting.       |
+| `pre_direct_*`     | Direct UPDATE / DELETE        | Runs the statement in Stoolap, written  |
+|                    |                               | from its Item tree as below.            |
 
-Pushed queries are not forwarded as text. `stoolap_sqlgen` writes the
+Pushed queries and direct UPDATE / DELETE are not forwarded as text. `stoolap_sqlgen` writes the
 stoolap SQL from MariaDB's prepared Item tree (the select, unit and
 derived handlers are created after prepare, before any optimizer
 rewrite), so each construct is translated to its stoolap equivalent or

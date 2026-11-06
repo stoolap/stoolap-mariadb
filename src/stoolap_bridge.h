@@ -152,8 +152,7 @@ inline std::string fit_table_name(std::string flat) {
 // its names as tablename_to_filename encodes them). `_` becomes `_0` and
 // `/` becomes `_1`, so distinct (db, tbl) pairs never collide (a naive
 // `/` -> `__` meets db=`p`,tbl=`q__r` and db=`p__q`,tbl=`r`); one past
-// stoolap's name limit is shortened (fit_table_name). The handler and the
-// direct DML rewriter both name tables by it.
+// stoolap's name limit is shortened (fit_table_name).
 inline std::string stoolap_table_from_path(const char* mariadb_path) {
     if (!mariadb_path) return std::string();
     std::string_view s(mariadb_path);

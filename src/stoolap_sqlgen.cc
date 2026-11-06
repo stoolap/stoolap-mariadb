@@ -90,6 +90,8 @@ public:
                 const std::vector<Cls>* cols = nullptr);
     // A query expression: one SELECT, or set-operation legs.
     bool unit(SELECT_LEX_UNIT* u, const std::vector<std::string>* names);
+    // A single-table UPDATE / DELETE (gen_modify).
+    bool modify(SELECT_LEX* sel, Item* where);
 
     std::string out;
     const char* why = nullptr;
@@ -172,6 +174,9 @@ private:
     // caller's ON.
     Item* merged_on_ = nullptr;
     int next_alias_ = 0;
+    // An UPDATE's columns its SET has assigned so far: MariaDB's later
+    // values read them assigned, stoolap's read the old row (modify)
+    std::vector<const Field*> assigned_;
 };
 
 // ---------------------------------------------------------------------------
@@ -816,6 +821,8 @@ bool Gen::literal(Item* it) {
 
 bool Gen::field(Item_field* f) {
     if (!f->field || !f->field->table) return fail("unbound field");
+    for (const Field* a : assigned_)
+        if (a == f->field) return fail("SET reads a column it assigned");
     const TABLE_LIST* tl = f->field->table->pos_in_table_list;
     auto a = alias_.find(tl);
     if (a == alias_.end()) return fail("field of unknown table");
@@ -1444,7 +1451,58 @@ bool Gen::order_list(SQL_I_List<ORDER>* lst, bool directions) {
     return true;
 }
 
+// A single-table UPDATE / DELETE. Stoolap's UPDATE takes no alias, so
+// the table's own name qualifies its columns.
+bool Gen::modify(SELECT_LEX* sel, Item* where) {
+    TABLE_LIST* t = sel->get_table_list();
+    if (!t || t->next_local || t->derived || t->nested_join || !t->table ||
+        !t->table->s)
+        return fail("modified table");
+    const std::string name = quote_ident(stoolap_table_name(t->table->s));
+    alias_[t] = name;
+    if (thd_->lex->sql_command == SQLCOM_UPDATE) {
+        out += "UPDATE " + name + " SET ";
+        List_iterator<Item> fit(sel->item_list);
+        List_iterator<Item> vit(thd_->lex->value_list);
+        Item* f;
+        Item* v;
+        bool first = true;
+        while ((f = fit++)) {
+            if (!(v = vit++)) return fail("SET without a value");
+            if (f->type() != Item::FIELD_ITEM) return fail("SET target");
+            const Field* fl = static_cast<Item_field*>(f)->field;
+            if (!fl || fl->table != t->table) return fail("SET target");
+            if (!first) out += ", ";
+            first = false;
+            ident(std::string_view(fl->field_name.str, fl->field_name.length));
+            out += " = ";
+            if (!expr(v)) return false;
+            assigned_.push_back(fl);
+        }
+        assigned_.clear();  // WHERE reads the old row in both
+    } else {
+        out += "DELETE FROM " + name;
+    }
+    if (where) {
+        out += " WHERE ";
+        if (!condition(where)) return false;
+    }
+    return true;
+}
+
 }  // namespace
+
+bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
+                std::string* why) {
+    Gen g(thd);
+    g.top = sel;
+    if (!g.modify(sel, where)) {
+        if (why) *why = g.why ? g.why : "unknown";
+        return false;
+    }
+    *out = std::move(g.out);
+    return true;
+}
 
 bool gen_select(THD* thd, st_select_lex* sel, std::string* out,
                 std::string* why) {

@@ -1285,11 +1285,11 @@ const COND* ha_stoolap::cond_push(const COND* cond) {
     if (!thd) return cond;
 
     // Accept (return null) only when the engine will actually filter:
-    // the direct-DML path forwards thd->query() with WHERE intact and
-    // stoolap re-evaluates. Returning null on a shape that ends up
-    // per-row would silently mass-mutate the table.
-    if (stoolap_pushdown::can_direct_modify(thd)) {
-        Item* it = const_cast<Item*>(static_cast<const Item*>(cond));
+    // the direct-DML path writes this condition into the statement it
+    // runs. Returning null on a shape that ends up per-row would silently
+    // mass-mutate the table.
+    Item* it = const_cast<Item*>(static_cast<const Item*>(cond));
+    if (stoolap_pushdown::can_direct_modify(thd, it)) {
         const bool trust_bin = stoolap_thd_trust_binary_strings(thd);
         if (trust_bin || stoolap_pushdown::item_safe_for_byte_comparison(it)) {
             return nullptr;  // accepted; route to direct path
@@ -1301,8 +1301,10 @@ const COND* ha_stoolap::cond_push(const COND* cond) {
 
 int ha_stoolap::direct_update_rows_init(List<Item>* /*update_fields*/) {
     // Non-zero falls back to per-row update_row(); never error here.
-    return stoolap_pushdown::can_direct_modify(ha_thd()) ? 0
-                                                         : HA_ERR_WRONG_COMMAND;
+    return stoolap_pushdown::can_direct_modify(
+               ha_thd(), static_cast<const Item*>(pushed_cond))
+               ? 0
+               : HA_ERR_WRONG_COMMAND;
 }
 
 int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
@@ -1315,7 +1317,8 @@ int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
     }
     ha_rows affected = 0;
     unsigned ek = MAX_KEY;
-    int rc = stoolap_pushdown::try_direct_modify(ha_thd(), &affected, &ek);
+    int rc = stoolap_pushdown::try_direct_modify(
+        ha_thd(), static_cast<const Item*>(pushed_cond), &affected, &ek);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;
@@ -1330,8 +1333,10 @@ int ha_stoolap::direct_update_rows(ha_rows* update_rows, ha_rows* found_rows) {
 }
 
 int ha_stoolap::direct_delete_rows_init() {
-    return stoolap_pushdown::can_direct_modify(ha_thd()) ? 0
-                                                         : HA_ERR_WRONG_COMMAND;
+    return stoolap_pushdown::can_direct_modify(
+               ha_thd(), static_cast<const Item*>(pushed_cond))
+               ? 0
+               : HA_ERR_WRONG_COMMAND;
 }
 
 int ha_stoolap::direct_delete_rows(ha_rows* delete_rows) {
@@ -1342,7 +1347,8 @@ int ha_stoolap::direct_delete_rows(ha_rows* delete_rows) {
     }
     ha_rows affected = 0;
     unsigned ek = MAX_KEY;
-    int rc = stoolap_pushdown::try_direct_modify(ha_thd(), &affected, &ek);
+    int rc = stoolap_pushdown::try_direct_modify(
+        ha_thd(), static_cast<const Item*>(pushed_cond), &affected, &ek);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;
@@ -1370,7 +1376,8 @@ int ha_stoolap::pre_direct_update_rows_init(List<Item>* fields) {
 int ha_stoolap::pre_direct_update_rows() {
     ha_rows affected = 0;
     unsigned ek = MAX_KEY;
-    int rc = stoolap_pushdown::try_direct_modify(ha_thd(), &affected, &ek);
+    int rc = stoolap_pushdown::try_direct_modify(
+        ha_thd(), static_cast<const Item*>(pushed_cond), &affected, &ek);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;
@@ -1390,7 +1397,8 @@ int ha_stoolap::pre_direct_delete_rows_init() {
 int ha_stoolap::pre_direct_delete_rows() {
     ha_rows affected = 0;
     unsigned ek = MAX_KEY;
-    int rc = stoolap_pushdown::try_direct_modify(ha_thd(), &affected, &ek);
+    int rc = stoolap_pushdown::try_direct_modify(
+        ha_thd(), static_cast<const Item*>(pushed_cond), &affected, &ek);
     if (rc) {
         if (rc == HA_ERR_FOUND_DUPP_KEY) {
             last_dup_key_ = ek;
