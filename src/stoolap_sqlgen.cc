@@ -1479,9 +1479,11 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             // NULL is written the same.
             const Cls tc = cls(f);
             const Cls vc = cls(v);
-            // A literal or parameter only: is_null() would evaluate an
-            // expression (EXP(1000) fails with no row to update)
-            const bool null = v->basic_const_item() && v->is_null();
+            // const_is_null() evaluates nothing: is_null() would run an
+            // expression (EXP(1000) fails with no row to update), and
+            // basic_const_item() fails a DEFAULT parameter
+            const Item_const* k = v->get_item_const();
+            const bool null = k && k->const_is_null();
             if (!null && (tc == Cls::UNSAFE ||
                           (tc != vc && !(tc == Cls::REAL && vc == Cls::INT))))
                 return fail("SET converts its value");

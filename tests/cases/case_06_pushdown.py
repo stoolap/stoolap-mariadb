@@ -813,6 +813,18 @@ UPDATE set_cv SET v = 1.50, n = 2.7 WHERE id = 2;
     h.assert_eq("run direct", 1, _direct_hits(h) - before)
     h.assert_ok("a constant expression is not evaluated with no row",
                 "UPDATE set_cv SET f = EXP(1000) WHERE n = 9")
+    rc, out = h.run_client("""
+ALTER TABLE set_cv ADD COLUMN m INT DEFAULT 5;
+PREPARE d FROM 'UPDATE set_cv SET n = ?, m = ? WHERE id = 3';
+EXECUTE d USING DEFAULT, DEFAULT;
+PREPARE i FROM 'UPDATE set_cv SET m = ? WHERE id = 2';
+EXECUTE i USING IGNORE;
+""")
+    h.assert_eq("DEFAULT and IGNORE parameters run", 0, rc)
+    h.assert_scalar("their values",
+                    "SELECT GROUP_CONCAT(CONCAT_WS(':', IFNULL(n, 'N'), m) "
+                    "ORDER BY id) FROM set_cv WHERE id > 1", "3:5,N:5")
+    h.exec_script("ALTER TABLE set_cv DROP COLUMN m")
     h.assert_scalar("converted values",
                     "SELECT GROUP_CONCAT(CONCAT_WS(':', v, IFNULL(n, 'N'), f) "
                     "ORDER BY id) FROM set_cv", "1.20:0:0,1.50:3:0,a:N:3")
