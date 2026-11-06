@@ -661,7 +661,7 @@ int stoolap_init_func(void* p) {
     stoolap_hton->db_type = DB_TYPE_AUTOASSIGN;
     stoolap_hton->create = stoolap_create_handler;
     // HTON_CAN_RECREATE would route TRUNCATE through DROP+CREATE; we expose
-    // a real delete_all_rows that runs stoolap's native TRUNCATE instead.
+    // a real truncate that runs stoolap's native TRUNCATE instead.
     stoolap_hton->flags = 0;
     stoolap_hton->commit = stoolap_commit_cb;
     stoolap_hton->rollback = stoolap_rollback_cb;
@@ -1408,7 +1408,11 @@ int ha_stoolap::pre_direct_delete_rows() {
     return 0;
 }
 
-int ha_stoolap::delete_all_rows() {
+// TRUNCATE TABLE only. DELETE without WHERE must not run it: it would
+// skip ON DELETE actions, leave the transaction (no ROLLBACK) and reset
+// AUTO_INCREMENT, so delete_all_rows keeps the default refusal and DELETE
+// runs as direct DML.
+int ha_stoolap::truncate() {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     // Route via autocommit db (stoolap blocks TRUNCATE inside a tx).
     // Cache invalidate AFTER success: a pre-emptive set(0) would leave

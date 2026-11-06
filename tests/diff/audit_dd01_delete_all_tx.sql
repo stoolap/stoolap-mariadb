@@ -1,4 +1,3 @@
--- known-diff-file: write path: DELETE without WHERE runs TRUNCATE outside the tx and resets AUTO_INCREMENT
 CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, a INT) ENGINE={E};
 INSERT INTO t (a) VALUES (1),(2),(3);
 BEGIN;
