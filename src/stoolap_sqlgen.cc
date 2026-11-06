@@ -35,6 +35,7 @@
 #include "item_windowfunc.h"
 #include "stoolap_types.h"
 #include "sql_window.h"
+#include "mysqld_error.h"
 
 #include "ha_stoolap.h"
 #include "stoolap_sqlgen.h"
@@ -92,6 +93,8 @@ public:
     bool unit(SELECT_LEX_UNIT* u, const std::vector<std::string>* names);
     // A single-table UPDATE / DELETE (gen_modify).
     bool modify(SELECT_LEX* sel, Item* where);
+    // Its checked SET value, if any (ModifyGuard)
+    ModifyGuard guard;
 
     std::string out;
     const char* why = nullptr;
@@ -153,6 +156,7 @@ private:
                           std::string* lit);
     bool compare(Item_func* f, Item** a, const char* op);
     bool args_csv(Item** args, uint n);
+    bool assignment(Item* target, const Field* fl, Item* v);
 
     Cls cls(Item* it);
     bool cs_safe(const CHARSET_INFO* cs);
@@ -1464,6 +1468,12 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
     const std::string name = quote_ident(stoolap_table_name(t->table->s));
     alias_[t] = name;
     if (thd_->lex->sql_command == SQLCOM_UPDATE) {
+        // What MariaDB does around the row it writes: its CHECK
+        // constraints, its ON UPDATE CURRENT_TIMESTAMP columns
+        const TABLE_SHARE* s = t->table->s;
+        if (s->table_check_constraints || s->field_check_constraints)
+            return fail("CHECK constraint");
+        if (s->has_update_default_function) return fail("ON UPDATE default");
         out += "UPDATE " + name + " SET ";
         List_iterator<Item> fit(sel->item_list);
         List_iterator<Item> vit(thd_->lex->value_list);
@@ -1475,31 +1485,11 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             if (f->type() != Item::FIELD_ITEM) return fail("SET target");
             const Field* fl = static_cast<Item_field*>(f)->field;
             if (!fl || fl->table != t->table) return fail("SET target");
-            // MariaDB converts the value to the column (Field::store),
-            // stoolap by its own rules: 1.20 into a VARCHAR is '1.20' to
-            // one and '1.2' to the other, 2.7 into an INT 3 and 2. Only a
-            // value of the column's class (an integer into a float) or a
-            // NULL is written the same.
-            // A parameter is a PARAM_ITEM only without a value: unbound,
-            // or a DEFAULT / IGNORE (the bulk protocol keeps its type,
-            // and reading its value raises an error)
-            if (v->type() == Item::PARAM_ITEM)
-                return fail("parameter without a value");
-            const Cls tc = cls(f);
-            const Cls vc = cls(v);
-            // const_is_null() evaluates nothing: is_null() would run an
-            // expression (EXP(1000) fails with no row to update), and
-            // basic_const_item() fails a DEFAULT parameter
-            const Item_const* k = v->get_item_const();
-            const bool null = k && k->const_is_null();
-            if (!null && (tc == Cls::UNSAFE ||
-                          (tc != vc && !(tc == Cls::REAL && vc == Cls::INT))))
-                return fail("SET converts its value");
             if (!first) out += ", ";
             first = false;
             ident(std::string_view(fl->field_name.str, fl->field_name.length));
             out += " = ";
-            if (!expr(v)) return false;
+            if (!assignment(f, fl, v)) return false;
             assigned_.push_back(fl);
         }
         assigned_.clear();  // WHERE reads the old row in both
@@ -1513,10 +1503,156 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
     return true;
 }
 
+namespace {
+// An integer column's range, or false for one stoolap's INTEGER (i64)
+// holds whole (BIGINT) and for YEAR (not a plain range)
+bool int_range(const Field* f, longlong* lo, longlong* hi) {
+    int bits;
+    switch (f->real_type()) {
+        case MYSQL_TYPE_TINY:
+            bits = 8;
+            break;
+        case MYSQL_TYPE_SHORT:
+            bits = 16;
+            break;
+        case MYSQL_TYPE_INT24:
+            bits = 24;
+            break;
+        case MYSQL_TYPE_LONG:
+            bits = 32;
+            break;
+        default:
+            return false;
+    }
+    if (f->is_unsigned()) {
+        *lo = 0;
+        *hi = (1LL << bits) - 1;
+    } else {
+        *lo = -(1LL << (bits - 1));
+        *hi = (1LL << (bits - 1)) - 1;
+    }
+    return true;
+}
+}  // namespace
+
+// The value of `v` for column `fl`, as MariaDB would store it, or false.
+// MariaDB converts the value to its column (Field::store), stoolap by its
+// own rules (1.20 into a VARCHAR is '1.20' to one and '1.2' to the other,
+// 2.7 into an INT 3 and 2): only a value of the column's class (an
+// integer into a float) or a NULL is written. A value out of the column
+// (300 into a TINYINT, 'abcdef' into a VARCHAR(3)) is an error in strict
+// mode: a literal is checked here, an expression in the statement, which
+// stoolap then fails with an integer overflow (guard_). Out of strict
+// mode MariaDB stores a clipped value with a warning: the row-pump.
+bool Gen::assignment(Item* target, const Field* fl, Item* v) {
+    // A parameter is a PARAM_ITEM only without a value: unbound, or a
+    // DEFAULT / IGNORE (the bulk protocol keeps its type, and reading
+    // its value raises an error)
+    if (v->type() == Item::PARAM_ITEM) return fail("parameter without a value");
+    // const_is_null() evaluates nothing: is_null() would run an
+    // expression (EXP(1000) fails with no row to update), and
+    // basic_const_item() fails a DEFAULT parameter
+    const Item_const* k = v->get_item_const();
+    if (k && k->const_is_null()) {
+        if (fl->flags & NOT_NULL_FLAG) return fail("NULL into NOT NULL");
+        out += "NULL";
+        return true;
+    }
+    // A NULL into NOT NULL is error 1048 in strict mode, a zero outside
+    if ((fl->flags & NOT_NULL_FLAG) && v->maybe_null())
+        return fail("nullable value into NOT NULL");
+    const Cls tc = cls(target);
+    const Cls vc = cls(v);
+    if (tc == Cls::UNSAFE || (tc != vc && !(tc == Cls::REAL && vc == Cls::INT)))
+        return fail("SET converts its value");
+    const bool literal_value = v->type() == Item::CONST_ITEM;
+    const bool strict = thd_->is_strict_mode();
+    // The check an expression's value needs, written around it
+    std::string check;
+    unsigned error = 0;
+    switch (tc) {
+        case Cls::INT: {
+            longlong lo, hi;
+            if (fl->real_type() == MYSQL_TYPE_YEAR) return fail("YEAR target");
+            if (!int_range(fl, &lo, &hi)) break;  // BIGINT
+            if (literal_value) {
+                const longlong n = v->val_int();
+                if (n < lo || n > hi) return fail("value out of range");
+                break;
+            }
+            check = "(@) < " + std::to_string(lo) + " OR (@) > " +
+                    std::to_string(hi);
+            error = ER_WARN_DATA_OUT_OF_RANGE;
+            break;
+        }
+        case Cls::REAL:
+            // A FLOAT, or a DOUBLE(M,D), rounds what it stores
+            if (fl->real_type() != MYSQL_TYPE_DOUBLE ||
+                fl->decimals() < NOT_FIXED_DEC)
+                return fail("rounding float target");
+            break;
+        case Cls::STR: {
+            // utf8mb4 holds any stoolap TEXT; CHAR strips trailing spaces
+            if (fl->charset()->mbmaxlen != 4) return fail("string target");
+            const enum_field_types rt = fl->real_type();
+            const bool varchar =
+                rt == MYSQL_TYPE_VARCHAR || rt == MYSQL_TYPE_VAR_STRING;
+            const bool text =
+                rt == MYSQL_TYPE_TINY_BLOB || rt == MYSQL_TYPE_BLOB ||
+                rt == MYSQL_TYPE_MEDIUM_BLOB || rt == MYSQL_TYPE_LONG_BLOB;
+            if (!varchar && !text) return fail("string target");
+            if (literal_value) {
+                String buf;
+                const String* str = v->val_str(&buf);
+                if (!str) return fail("string value");
+                if (varchar ? str->numchars() > fl->char_length()
+                            : str->length() > fl->field_length)
+                    return fail("value too long");
+                break;
+            }
+            if (!varchar) return fail("text target");
+            check = "CHAR_LENGTH(@) > " + std::to_string(fl->char_length());
+            error = ER_DATA_TOO_LONG;
+            break;
+        }
+        default: {
+            // A date or time column takes a column of its own type only:
+            // MariaDB rounds fractions and checks ranges on the rest
+            Item* r = v->real_item();
+            if (r->type() != Item::FIELD_ITEM) return fail("temporal value");
+            const Field* src = static_cast<Item_field*>(r)->field;
+            if (!src || src->real_type() != fl->real_type() ||
+                src->decimals() != fl->decimals())
+                return fail("temporal value");
+            break;
+        }
+    }
+    if (check.empty()) return expr(v);
+    if (!strict) return fail("value may not fit, outside strict mode");
+    if (guard.error) return fail("two checked SET values");
+    const size_t at = out.size();
+    if (!expr(v)) return false;
+    const std::string e = "(" + out.substr(at) + ")";
+    out.resize(at);
+    std::string cond;
+    for (const char c : check) {
+        if (c == '@')
+            cond += e;
+        else
+            cond.push_back(c);
+    }
+    // Stoolap evaluates the overflow only for a row that reaches it
+    out += "CASE WHEN " + cond + " THEN 9223372036854775807 + 1 ELSE " + e +
+           " END";
+    guard.column.assign(fl->field_name.str, fl->field_name.length);
+    guard.error = error;
+    return true;
+}
+
 }  // namespace
 
 bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
-                std::string* why) {
+                std::string* why, ModifyGuard* guard) {
     Gen g(thd);
     g.top = sel;
     if (!g.modify(sel, where)) {
@@ -1524,6 +1660,7 @@ bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
         return false;
     }
     *out = std::move(g.out);
+    if (guard) *guard = std::move(g.guard);
     return true;
 }
 

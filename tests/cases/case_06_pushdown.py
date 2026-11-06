@@ -829,6 +829,45 @@ EXECUTE i USING IGNORE;
                     "SELECT GROUP_CONCAT(CONCAT_WS(':', v, IFNULL(n, 'N'), f) "
                     "ORDER BY id) FROM set_cv", "1.20:0:0,1.50:3:0,a:N:3")
 
+    h.section("Direct UPDATE keeps MariaDB's checks on the written row")
+    # CHECK constraints and ON UPDATE CURRENT_TIMESTAMP go to the row-pump;
+    # a value out of its column fails as in strict mode: a literal on the
+    # row-pump, an expression in the statement (one per UPDATE).
+    h.exec_script(f"""
+CREATE TABLE wck (id INT NOT NULL PRIMARY KEY, n TINYINT NOT NULL,
+                  s VARCHAR(4), v INT, c INT CHECK (c > 0)) ENGINE={h.engine};
+INSERT INTO wck VALUES (1, 120, 'ab', 2147483646, 5);
+CREATE TABLE wts (id INT PRIMARY KEY, a INT, ts TIMESTAMP NULL DEFAULT NULL
+                  ON UPDATE CURRENT_TIMESTAMP) ENGINE={h.engine};
+INSERT INTO wts VALUES (1, 1, '2000-01-01 00:00:00');
+""")
+    h.assert_err("CHECK constraint", "UPDATE wck SET c = -1 WHERE id = 1",
+                 "4025")
+    h.assert_ok("ON UPDATE CURRENT_TIMESTAMP", "UPDATE wts SET a = 2")
+    h.assert_scalar("ON UPDATE column set",
+                    "SELECT ts > '2000-01-01 00:00:00' FROM wts", "1")
+    h.exec_script("ALTER TABLE wck DROP CONSTRAINT IF EXISTS c")
+    h.exec_script("ALTER TABLE wck MODIFY c INT")
+    before = _direct_hits(h)
+    h.assert_ok("a counter that fits", "UPDATE wck SET n = n + 1 WHERE id = 1")
+    h.assert_ok("an INT that fits", "UPDATE wck SET v = v + 1 WHERE id = 1")
+    h.assert_ok("a string that fits", "UPDATE wck SET s = '\u00e9\u00e9\u00e9\u00e9' "
+                "WHERE id = 1")
+    h.assert_eq("run direct", 3, _direct_hits(h) - before)
+    h.assert_err("a TINYINT past its range", "UPDATE wck SET n = n + 10 WHERE id = 1",
+                 "1264")
+    h.assert_err("an INT past its range", "UPDATE wck SET v = v + 1 WHERE id = 1",
+                 "1264")
+    h.assert_err("a literal past its range", "UPDATE wck SET n = 300 WHERE id = 1",
+                 "1264")
+    h.assert_err("a literal too long", "UPDATE wck SET s = 'abcde' WHERE id = 1",
+                 "1406")
+    h.assert_err("NULL into NOT NULL", "UPDATE wck SET n = NULL WHERE id = 1",
+                 "1048")
+    h.assert_scalar("the row kept its values",
+                    "SELECT CONCAT_WS(':', n, s, v) FROM wck",
+                    "121:\u00e9\u00e9\u00e9\u00e9:2147483647")
+
     h.section("Direct DML keeps string literals")
     h.exec_script(f"""
 CREATE TABLE bts (id INT NOT NULL PRIMARY KEY, note VARCHAR(64) NOT NULL) ENGINE={h.engine};

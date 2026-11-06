@@ -35,10 +35,19 @@ bool gen_select(THD* thd, st_select_lex* sel, std::string* out,
 bool gen_unit(THD* thd, st_select_lex_unit* unit, std::string* out,
               std::string* why);
 
+// The SET value gen_modify wrapped in a range or length check, if any:
+// stoolap fails the statement with an integer overflow for a row whose
+// value does not fit `column`, which MariaDB reports as `error`
+// (ER_WARN_DATA_OUT_OF_RANGE or ER_DATA_TOO_LONG).
+struct ModifyGuard {
+    std::string column;
+    unsigned error = 0;
+};
+
 // The single-table UPDATE or DELETE whose SELECT_LEX is `sel`, as the
 // direct DML hooks run it: `where` is the condition MariaDB pushed (null
 // for none), an UPDATE's SET list its item_list and LEX::value_list.
 bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
-                std::string* why);
+                std::string* why, ModifyGuard* guard = nullptr);
 
 }  // namespace stoolap_sqlgen

@@ -222,8 +222,10 @@ int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
     if (!can_direct_modify(thd, where)) return HA_ERR_WRONG_COMMAND;
 
     std::string sql;
+    stoolap_sqlgen::ModifyGuard guard;
     if (!stoolap_sqlgen::gen_modify(thd, thd->lex->first_select_lex(),
-                                    const_cast<Item*>(where), &sql, nullptr))
+                                    const_cast<Item*>(where), &sql, nullptr,
+                                    &guard))
         return HA_ERR_WRONG_COMMAND;
 
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
@@ -245,6 +247,12 @@ int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
         StoolapErrorView verr =
             ctx->has_tx() ? fetch_tx_error(ctx->tx()) : fetch_db_error(db);
         const char* msg = *verr.message ? verr.message : "unknown error";
+        // A row's SET value that does not fit its column (ModifyGuard):
+        // MariaDB's strict-mode error. The row is not known: row 1.
+        if (guard.error && strstr(msg, "Integer overflow")) {
+            my_error(guard.error, MYF(0), guard.column.c_str(), 1L);
+            return HA_ERR_GENERIC;
+        }
         sql_print_error("stoolap: direct DML failed: %s", msg);
         // MariaDB's direct-DML path does not always call print_error
         // after the engine returns, so a mapped FK / dup-key would
