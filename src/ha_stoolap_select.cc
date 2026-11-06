@@ -204,25 +204,48 @@ bool name_at(const std::string& s, size_t i, std::string_view name) {
     return strncasecmp(s.data() + i, name.data(), name.size()) == 0;
 }
 
-/** The first position at or after `i` past white space and comments
- *  (C style, `-- ` and `#`); npos at an executable C comment (`!` or
- *  `M!` after its opening), whose text MariaDB runs. */
+/** Whether an executable C comment (`!` or `M!` after its opening),
+ *  whose text MariaDB runs, starts at `i` */
+bool executable_comment_at(const std::string& s, size_t i) {
+    return s.compare(i, 3, "/*!") == 0 || s.compare(i, 4, "/*M!") == 0;
+}
+
+/** One past the comment starting at `i` (C style, `-- ` and `#`), or npos
+ *  if none does. An executable comment is not one: its text is SQL. */
+size_t comment_end(const std::string& s, size_t i) {
+    if (s.compare(i, 2, "/*") == 0) {
+        if (executable_comment_at(s, i)) return std::string::npos;
+        const size_t close = s.find("*/", i + 2);
+        return close == std::string::npos ? s.size() : close + 2;
+    }
+    if (s[i] == '#' ||
+        (s.compare(i, 2, "--") == 0 &&
+         (i + 2 == s.size() || isspace(static_cast<unsigned char>(s[i + 2])) ||
+          iscntrl(static_cast<unsigned char>(s[i + 2]))))) {
+        const size_t nl = s.find('\n', i);
+        return nl == std::string::npos ? s.size() : nl + 1;
+    }
+    return std::string::npos;
+}
+
+/** One past the literal or comment starting at `i`, or npos if none does:
+ *  a region the scanners keep as it is */
+size_t opaque_end(const std::string& s, size_t i) {
+    const char c = s[i];
+    if (c == '\'' || c == '"' || c == '`') return skip_string_literal(s, i);
+    return comment_end(s, i);
+}
+
+/** The first position at or after `i` past white space and comments; npos
+ *  at an executable comment */
 size_t skip_space_and_comments(const std::string& s, size_t i) {
     while (i < s.size()) {
         if (isspace(static_cast<unsigned char>(s[i]))) {
             ++i;
-        } else if (s.compare(i, 2, "/*") == 0) {
-            if (s.compare(i, 3, "/*!") == 0 || s.compare(i, 4, "/*M!") == 0)
-                return std::string::npos;
-            const size_t close = s.find("*/", i + 2);
-            i = close == std::string::npos ? s.size() : close + 2;
-        } else if (s[i] == '#' ||
-                   (s.compare(i, 2, "--") == 0 &&
-                    (i + 2 == s.size() ||
-                     isspace(static_cast<unsigned char>(s[i + 2])) ||
-                     iscntrl(static_cast<unsigned char>(s[i + 2]))))) {
-            const size_t nl = s.find('\n', i);
-            i = nl == std::string::npos ? s.size() : nl + 1;
+        } else if (executable_comment_at(s, i)) {
+            return std::string::npos;
+        } else if (const size_t e = comment_end(s, i); e != std::string::npos) {
+            i = e;
         } else {
             break;
         }
@@ -243,13 +266,13 @@ bool call_follows(const std::string& s, size_t end) {
  *  a word may not be the table: a call (`from(`), or any word when `from`
  *  is an SQL keyword (a table `set` matches `SET` with case folded). */
 bool replace_ident_word(std::string& s, std::string_view from,
-                        std::string_view to, bool keyword = false) {
+                        std::string_view to, size_t& hits,
+                        bool keyword = false) {
     if (from.empty()) return true;
     size_t i = 0;
     while (i < s.size()) {
-        const char c = s[i];
-        if (c == '\'' || c == '"' || c == '`') {
-            i = skip_string_literal(s, i);
+        if (const size_t e = opaque_end(s, i); e != std::string::npos) {
+            i = e;
             continue;
         }
         if (!name_at(s, i, from)) {
@@ -268,6 +291,7 @@ bool replace_ident_word(std::string& s, std::string_view from,
             if (keyword || call_follows(s, end)) return false;
             s.replace(i, from.size(), to);
             i += to.size();
+            ++hits;
         } else {
             i += from.size();
         }
@@ -288,7 +312,7 @@ bool replace_ident_word(std::string& s, std::string_view from,
  *  an identifier we'd not want to rewrite. False at a call (`from`(),
  *  as replace_ident_word. */
 bool replace_all_literal_aware(std::string& s, std::string_view from,
-                               std::string_view to) {
+                               std::string_view to, size_t& hits) {
     if (from.empty()) return true;
     const char first = from[0];
     size_t i = 0;
@@ -301,6 +325,11 @@ bool replace_all_literal_aware(std::string& s, std::string_view from,
             i = skip_string_literal(s, i);
             continue;
         }
+        // A comment too: an apostrophe in it would start a false literal
+        if (const size_t e = comment_end(s, i); e != std::string::npos) {
+            i = e;
+            continue;
+        }
         // A backticked identifier we encounter mid-scan that happens NOT
         // to match `from` (e.g. a different table's backticked name) is
         // an opaque region too: skip it so we don't half-match into its
@@ -310,13 +339,22 @@ bool replace_all_literal_aware(std::string& s, std::string_view from,
             i = skip_string_literal(s, i);
             continue;
         }
-        if (!name_at(s, i, from)) {
+        // A form starting or ending in a bare name ends at a word's edge
+        const size_t end = i + from.size();
+        if (!name_at(s, i, from) ||
+            (is_ident_char(static_cast<unsigned char>(from.front())) && i &&
+             (is_ident_char(static_cast<unsigned char>(s[i - 1])) ||
+              s[i - 1] == '.')) ||
+            (is_ident_char(static_cast<unsigned char>(from.back())) &&
+             end < s.size() &&
+             is_ident_char(static_cast<unsigned char>(s[end])))) {
             ++i;
             continue;
         }
-        if (call_follows(s, i + from.size())) return false;
+        if (call_follows(s, end)) return false;
         s.replace(i, from.size(), to);
         i += to.size();
+        ++hits;
     }
     return true;
 }
@@ -330,12 +368,11 @@ bool has_spaced_dot(const std::string& s) {
     };
     size_t i = 0;
     while (i < s.size()) {
-        const char c = s[i];
-        if (c == '\'' || c == '"' || c == '`') {
-            i = skip_string_literal(s, i);
+        if (const size_t e = opaque_end(s, i); e != std::string::npos) {
+            i = e;
             continue;
         }
-        if (c == '.') {
+        if (s[i] == '.') {
             const unsigned char prev = i ? s[i - 1] : ' ';
             const unsigned char next = i + 1 < s.size() ? s[i + 1] : ' ';
             if (!isdigit(next) && !(name_end(prev) && name_end(next)))
@@ -369,7 +406,8 @@ bool has_spaced_dot(const std::string& s) {
  * error like "expected SET after <db>, got '.'".
  *
  * False when a name may not be the table (a call, or a bare keyword;
- * replace_ident_word): the caller leaves the statement to the row-pump.
+ * replace_ident_word), or a table is never named in a form it matches:
+ * the caller leaves the statement to the row-pump.
  */
 bool rewrite_table_names(const std::string& sql,
                          const std::vector<LeafName>& leaves,
@@ -377,19 +415,29 @@ bool rewrite_table_names(const std::string& sql,
     out = sql;
     if (leaves.empty()) return true;
     const std::string cur_db = current_db ? current_db : "";
+    // A name as the statement backticks it: an inner ` doubled
+    auto bt = [](const std::string& name) {
+        std::string q = "`";
+        for (const char c : name)
+            q += c == '`' ? std::string("``") : std::string(1, c);
+        return q + "`";
+    };
+    // Replacements per table: one the text never names is declined
+    std::unordered_map<std::string, size_t> hits;
 
     for (const LeafName& l : leaves) {
+        size_t& n = hits[l.stoolap];
         const std::string quoted = std::string("\"") + l.stoolap + "\"";
-        const std::string bt_qual = "`" + l.db + "`.`" + l.tbl + "`";
-        const std::string bt_db_qual = "`" + l.db + "`." + l.tbl;
-        const std::string bt_tb_qual = l.db + ".`" + l.tbl + "`";
+        const std::string bt_qual = bt(l.db) + "." + bt(l.tbl);
+        const std::string bt_db_qual = bt(l.db) + "." + l.tbl;
+        const std::string bt_tb_qual = l.db + "." + bt(l.tbl);
         // Backticked-both first; the mixed forms are stricter substrings
         // of all-bare so they need their own pass before bare-bare runs.
         const std::string bare_qual = l.db + "." + l.tbl;
-        if (!replace_all_literal_aware(out, bt_qual, quoted) ||
-            !replace_all_literal_aware(out, bt_db_qual, quoted) ||
-            !replace_all_literal_aware(out, bt_tb_qual, quoted) ||
-            !replace_ident_word(out, bare_qual, quoted))
+        if (!replace_all_literal_aware(out, bt_qual, quoted, n) ||
+            !replace_all_literal_aware(out, bt_db_qual, quoted, n) ||
+            !replace_all_literal_aware(out, bt_tb_qual, quoted, n) ||
+            !replace_ident_word(out, bare_qual, quoted, n))
             return false;
     }
 
@@ -411,13 +459,15 @@ bool rewrite_table_names(const std::string& sql,
         if (l.db.size() != cur_db.size() || !name_at(cur_db, 0, l.db)) continue;
         if (done[l.stoolap]++) continue;
 
+        size_t& n = hits[l.stoolap];
         const std::string quoted = std::string("\"") + l.stoolap + "\"";
-        const std::string bt_bare = "`" + l.tbl + "`";
-        if (!replace_all_literal_aware(out, bt_bare, quoted) ||
-            !replace_ident_word(out, l.tbl, quoted,
+        if (!replace_all_literal_aware(out, bt(l.tbl), quoted, n) ||
+            !replace_ident_word(out, l.tbl, quoted, n,
                                 is_keyword(l.tbl.c_str(), l.tbl.size())))
             return false;
     }
+    for (const auto& kv : hits)
+        if (kv.second == 0) return false;
     return true;
 }
 

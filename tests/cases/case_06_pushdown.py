@@ -621,6 +621,32 @@ SELECT n FROM mixq_other.q;
             cur.execute(stmt)
         cur.execute("SELECT COUNT(*) FROM t")
         h.assert_eq("without WHERE too", [(0,)], cur.fetchall())
+        # A comment holding an apostrophe, a name holding a backtick, a
+        # mixed-quote form that is a longer name's prefix
+        for stmt in [
+            "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)",
+            f"CREATE TABLE tx (id INT PRIMARY KEY) ENGINE={h.engine}",
+            "INSERT INTO tx VALUES (2), (9)",
+            f"CREATE TABLE `a``b` (id INT PRIMARY KEY) ENGINE={h.engine}",
+            "INSERT INTO `a``b` VALUES (1), (2)",
+            "DELETE /* it's fine */ FROM t WHERE id = 1",
+            "DELETE FROM `dml_opt`.tx WHERE id IN "
+            "(SELECT id FROM `dml_opt`.t)",
+            "DELETE FROM `a``b` WHERE id = 1",
+        ]:
+            cur.execute(stmt)
+        cur.execute("SELECT id FROM t ORDER BY id")
+        h.assert_eq("a comment with an apostrophe", [(2,), (3,)],
+                    cur.fetchall())
+        cur.execute("SELECT id FROM tx")
+        h.assert_eq("a qualified name's prefix", [(9,)], cur.fetchall())
+        cur.execute("SELECT id FROM `a``b`")
+        h.assert_eq("a name with a backtick", [(2,)], cur.fetchall())
+        for stmt in ["DELETE /* it's fine */ FROM t", "DELETE FROM `a``b`"]:
+            cur.execute(stmt)
+        cur.execute("SELECT (SELECT COUNT(*) FROM t), "
+                    "(SELECT COUNT(*) FROM `a``b`)")
+        h.assert_eq("both without WHERE", [(0, 0)], cur.fetchall())
         cur.execute("DROP DATABASE dml_opt")
     finally:
         c.close()
