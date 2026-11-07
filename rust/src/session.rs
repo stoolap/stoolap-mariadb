@@ -37,6 +37,11 @@ pub struct Session {
     stmt_tx: Mutex<Option<Box<dyn Transaction>>>,
     /// Whether a direct write went to `stmt_tx`, which then needs a commit
     stmt_wrote: AtomicBool,
+    /// Whether the statement wrote in the open transaction, after a
+    /// savepoint (`STMT_SAVEPOINT`) that `end_statement` releases or, for a
+    /// failed statement, rolls back to: MariaDB undoes a failed statement
+    /// and keeps the transaction
+    stmt_savepoint: AtomicBool,
     /// The isolation level of the open transaction
     level: Mutex<IsolationLevel>,
     /// The table handles direct access goes through in this statement, of
@@ -81,6 +86,7 @@ impl Session {
             open: AtomicBool::new(false),
             stmt_tx: Mutex::new(None),
             stmt_wrote: AtomicBool::new(false),
+            stmt_savepoint: AtomicBool::new(false),
             level: Mutex::new(IsolationLevel::ReadCommitted),
             tables: Mutex::new(FxHashMap::default()),
             write_tables: Mutex::new(FxHashMap::default()),
@@ -122,6 +128,12 @@ impl Session {
     pub fn run_plan(&self, plan: &CachedPlanRef, params: ParamVec) -> Result<Box<dyn QueryResult>> {
         if self.in_transaction() {
             runs_in_transaction(&plan.statement)?;
+            if matches!(
+                *plan.statement,
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            ) {
+                self.statement_writes()?;
+            }
         }
         let ctx = if params.is_empty() {
             ExecutionContext::new()
@@ -209,7 +221,9 @@ impl Session {
         f: impl FnOnce(&mut dyn Table) -> Result<R>,
     ) -> Result<Option<R>> {
         let engine = self.exec.engine();
-        if !self.in_transaction() {
+        if self.in_transaction() {
+            self.statement_writes()?;
+        } else {
             self.stmt_wrote.store(true, Ordering::Relaxed);
         }
         self.with_handle(&self.write_tables, table, false, |t| {
@@ -291,13 +305,45 @@ impl Session {
         tx.get_table_with_view(table, view.as_ref().expect("captured above").clone())
     }
 
+    /// Marks the statement as writing in the open transaction: the first
+    /// write takes a savepoint, between statements of the transaction
+    fn statement_writes(&self) -> Result<()> {
+        if self.stmt_savepoint.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut tx = self
+            .exec
+            .take_transaction()
+            .ok_or(Error::TransactionEnded)?;
+        let result = tx.create_savepoint(STMT_SAVEPOINT);
+        self.exec.install_transaction(tx);
+        result?;
+        self.stmt_savepoint.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Ends the statement's direct access: its table handles and view, and
     /// the statement's own transaction if it opened one, committed or
-    /// rolled back as `commit` says
+    /// rolled back as `commit` says. In an open transaction, a statement
+    /// that wrote keeps its writes or, failed, has them undone
     pub fn end_statement(&self, commit: bool) -> Result<()> {
         lock(&self.tables).clear();
         lock(&self.write_tables).clear();
         *lock(&self.view) = None;
+        if self.stmt_savepoint.swap(false, Ordering::Relaxed) && self.in_transaction() {
+            let mut tx = self
+                .exec
+                .take_transaction()
+                .ok_or(Error::TransactionEnded)?;
+            let result = if commit {
+                tx.release_savepoint(STMT_SAVEPOINT)
+            } else {
+                tx.rollback_to_savepoint(STMT_SAVEPOINT)
+                    .and_then(|()| tx.release_savepoint(STMT_SAVEPOINT))
+            };
+            self.exec.install_transaction(tx);
+            result?;
+        }
         let Some(mut tx) = lock(&self.stmt_tx).take() else {
             return Ok(());
         };
@@ -315,6 +361,7 @@ impl Session {
 
     fn take(&self) -> Result<Box<dyn Transaction>> {
         self.open.store(false, Ordering::Relaxed);
+        self.stmt_savepoint.store(false, Ordering::Relaxed);
         // The handles go before the transaction ends
         lock(&self.tables).clear();
         lock(&self.write_tables).clear();
@@ -330,6 +377,10 @@ impl Drop for Session {
         }
     }
 }
+
+/// The savepoint a statement writing in an open transaction takes; a
+/// user's savepoint has a name MariaDB makes up per connection, never this
+const STMT_SAVEPOINT: &str = "__stoolap_mariadb_statement";
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())

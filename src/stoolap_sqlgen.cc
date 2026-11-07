@@ -1477,6 +1477,18 @@ bool server_stores_zero_for_negative_zero() {
     return yes;
 }
 
+// Whether `f` is a part of its table's PRIMARY KEY or of a UNIQUE key
+bool in_unique_key(const Field* f) {
+    const TABLE* tb = f->table;
+    for (uint k = 0; k < tb->s->keys; ++k) {
+        const KEY& key = tb->key_info[k];
+        if (!(key.flags & HA_NOSAME)) continue;
+        for (uint p = 0; p < key.user_defined_key_parts; ++p)
+            if (key.key_part[p].fieldnr == f->field_index + 1) return true;
+    }
+    return false;
+}
+
 // Whether `it` takes at most one row of `tb`: an equality of its
 // single-column primary key with a constant, alone or in an AND
 bool pk_equality(Item* it, TABLE* tb) {
@@ -1541,6 +1553,12 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             if (f->type() != Item::FIELD_ITEM) return fail("SET target");
             const Field* fl = static_cast<Item_field*>(f)->field;
             if (!fl || fl->table != t->table) return fail("SET target");
+            // MariaDB writes row by row, checking each row's keys against
+            // the rows as they stand (u = u + 10 fails where the next row
+            // holds the new value), and fails the statement; stoolap writes
+            // the set, and in a transaction checks UNIQUE at commit. The
+            // row pump checks each row as MariaDB does.
+            if (in_unique_key(fl)) return fail("SET of a unique key column");
             if (!first) out += ", ";
             first = false;
             const std::string column = quote_ident(
