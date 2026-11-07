@@ -138,8 +138,8 @@ bool any_on_expr_matches_chain(TABLE_LIST* head, ItemPred pred);
 
 namespace stoolap_pushdown {
 
-// Whether the row pump writes `sel`'s table through SQL, one statement
-// per row (a table a FOREIGN KEY names): an UPDATE stays whole then
+// Whether the row pump writes `sel`'s table through SQL (a table a
+// FOREIGN KEY names), where it names a row by its primary key
 bool rows_through_sql(THD* thd, SELECT_LEX* sel) {
     const TABLE_LIST* t = sel->get_table_list();
     if (!t || !t->table || !t->table->s) return false;

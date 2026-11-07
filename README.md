@@ -165,9 +165,7 @@ What it cannot do the same way stays on MariaDB's row-by-row path (the
 row pump), which applies MariaDB's own rules: a table with CHECK
 constraints or `ON UPDATE CURRENT_TIMESTAMP` columns, an UPDATE of a
 PRIMARY KEY or UNIQUE column (MariaDB checks each row's keys as it
-writes it, and fails the statement, not the COMMIT; except on a table a
-FOREIGN KEY names, see [Known differences](#known-differences)), a value
-that needs
+writes it, and fails the statement, not the COMMIT), a value that needs
 conversion to its column's type, a target MariaDB rounds or checks
 specially (FLOAT, `DOUBLE(M,D)`, YEAR, CHAR, dates and times), any value
 that may not fit outside strict mode, a SET value reading a column the
@@ -286,10 +284,9 @@ the list stays current.
 - **`utf8mb4_bin` UNIQUE** ignores PAD SPACE (`'a'` and `'a '` are both
   accepted).
 - **A FOREIGN KEY to an indexed non-unique column** is refused.
-- **On a table a FOREIGN KEY names**, an UPDATE of a UNIQUE column is
-  checked as a set (`u = u + 10` passes where MariaDB meets the next
-  row's value), and inside a transaction only at COMMIT; the row pump
-  cannot name a row of such a table that has no primary key.
+- **On a table a FOREIGN KEY names that has no primary key**, the row
+  pump cannot name a row: an UPDATE with ORDER BY / LIMIT fails (1296),
+  and an UPDATE of a UNIQUE column is checked as a set.
 - **`HA_READ_PREFIX_LAST`** (MAX with a prefix bound) is not supported.
 - **`LOCK TABLES` with `autocommit = 0`** runs the statements after
   COMMIT in autocommit.

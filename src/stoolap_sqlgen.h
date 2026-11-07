@@ -67,8 +67,8 @@ struct ModifyCount {
 // direct DML hooks run it: `where` is the condition MariaDB pushed (null
 // for none), an UPDATE's SET list its item_list and LEX::value_list.
 // `rows_through_sql`: the row pump would write the table's rows through
-// SQL, one statement per row (a table a FOREIGN KEY names), so an UPDATE
-// it cannot keep whole is better written here.
+// SQL (a table a FOREIGN KEY names), naming each by its primary key, so
+// an UPDATE of a table with none is written here.
 bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
                 std::string* why, ModifyGuard* guard = nullptr,
                 ModifyCount* count = nullptr, bool rows_through_sql = false);

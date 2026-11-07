@@ -378,7 +378,9 @@ pub unsafe extern "C" fn stoolap_update_record(
         |session, name| {
             let set = named(session, name, &changed, &new)?;
             let key = named(session, name, field_slice(keys, nkeys)?, &old)?;
-            sql_write::update(session, name, set, key)
+            let columns: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
+            let check = (has_row_id != 0).then_some((row_id, columns.as_slice()));
+            sql_write::update(session, name, set, key, check)
         },
     )
 }

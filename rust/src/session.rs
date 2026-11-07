@@ -120,6 +120,24 @@ impl Session {
         self.exec.execute_with_params(sql, params)
     }
 
+    /// Runs a write of the handler's through SQL: in the open transaction,
+    /// or else in the statement's own, which `end_statement` commits or
+    /// rolls back, so a statement's rows land whole or not at all
+    pub fn run_write(&self, sql: &str, params: ParamVec) -> Result<Box<dyn QueryResult>> {
+        if self.in_transaction() {
+            return self.run(sql, params);
+        }
+        let plan = self.exec.get_or_create_plan(sql)?;
+        {
+            let mut stmt_tx = lock(&self.stmt_tx);
+            if stmt_tx.is_none() {
+                *stmt_tx = Some(self.exec.begin_transaction()?);
+            }
+        }
+        self.stmt_wrote.store(true, Ordering::Relaxed);
+        self.run_in_stmt_tx(&plan, params)
+    }
+
     pub fn prepare(&self, sql: &str) -> Result<CachedPlanRef> {
         self.exec.get_or_create_plan(sql)
     }

@@ -1559,11 +1559,11 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             // the rows as they stand (u = u + 10 fails where the next row
             // holds the new value), and fails the statement; stoolap writes
             // the set, and in a transaction checks UNIQUE at commit. The
-            // row pump checks each row as MariaDB does, but not for a
-            // table it writes through SQL, one autocommitted statement per
-            // row (and none without a primary key): that one stays here,
-            // whole.
-            if (!rows_through_sql && in_unique_key(fl))
+            // row pump checks each row as MariaDB does. Through SQL (a
+            // table a FOREIGN KEY names) it names a row by its primary
+            // key: a table with none stays here.
+            if (in_unique_key(fl) &&
+                !(rows_through_sql && t->table->s->primary_key >= MAX_KEY))
                 return fail("SET of a unique key column");
             if (!first) out += ", ";
             first = false;
