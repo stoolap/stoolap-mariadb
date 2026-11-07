@@ -129,6 +129,23 @@ class ServerCtx:
         self.proc:  Optional[subprocess.Popen] = None
         self.reuse = os.environ.get("REUSE_RUNNING", "0") == "1"
         self.keep  = os.environ.get("KEEP_RUNNING",  "0") == "1"
+        self.sock, self.data = SOCK, DATA
+        self.errlog, self.pidfile = ERRLOG, PIDFILE
+        self.port = 33370
+
+    def sibling(self, tag: str, dsn: str) -> "ServerCtx":
+        """Another server on the same binaries and plugin, with its own
+        datadir, socket and DSN under /tmp/stoolap-<tag>*: for a case that
+        stops and starts its server (case_22_restart). It always starts
+        and stops its own process."""
+        other = ServerCtx(self.prefix, self.plugin, dsn, self._mariadbd,
+                          self._mariadb, self._install_db, self._plugin_dir)
+        other.reuse = other.keep = False
+        base = f"/tmp/stoolap-{tag}"
+        other.sock, other.data = f"{base}.sock", f"{base}-data"
+        other.errlog, other.pidfile = f"{base}.err", f"{base}.pid"
+        other.port = self.port + 1
+        return other
 
     @property
     def mariadbd(self) -> str:
@@ -148,11 +165,11 @@ class ServerCtx:
 
     def start(self) -> None:
         if self.reuse:
-            if not Path(SOCK).is_socket() and not os.path.exists(SOCK):
-                print(f"runner: REUSE_RUNNING=1 but no socket at {SOCK}",
+            if not Path(self.sock).is_socket() and not os.path.exists(self.sock):
+                print(f"runner: REUSE_RUNNING=1 but no socket at {self.sock}",
                       file=sys.stderr)
                 sys.exit(2)
-            print(f"runner: reusing existing server at {SOCK}")
+            print(f"runner: reusing existing server at {self.sock}")
             return
 
         # Install the plugin into MariaDB's plugin dir. Skip if the
@@ -181,23 +198,23 @@ class ServerCtx:
                   file=sys.stderr)
             sys.exit(2)
 
-        for f in (SOCK, PIDFILE):
+        for f in (self.sock, self.pidfile):
             try:
                 os.unlink(f)
             except FileNotFoundError:
                 pass
-        Path(DATA).mkdir(parents=True, exist_ok=True)
+        Path(self.data).mkdir(parents=True, exist_ok=True)
 
         # First-time datadir bootstrap. mariadb-install-db reads
         # /etc/my.cnf by default, which on Homebrew can carry unknown
         # variables (e.g. mysqlx-bind-address) that abort the spawned
         # mariadbd. Pass --no-defaults so install runs in a clean
         # config the same way the test mariadbd below does.
-        if not any(Path(DATA).iterdir()):
+        if not any(Path(self.data).iterdir()):
             rc = subprocess.run(
                 [self.install_db,
                  "--no-defaults",
-                 f"--datadir={DATA}",
+                 f"--datadir={self.data}",
                  "--auth-root-authentication-method=normal"],
                 capture_output=True, text=True)
             if rc.returncode != 0:
@@ -216,12 +233,12 @@ class ServerCtx:
         argv = [
             self.mariadbd,
             "--no-defaults",
-            f"--datadir={DATA}",
-            f"--socket={SOCK}",
-            "--port=33370",
+            f"--datadir={self.data}",
+            f"--socket={self.sock}",
+            f"--port={self.port}",
             "--skip-networking",
-            f"--pid-file={PIDFILE}",
-            f"--log-error={ERRLOG}",
+            f"--pid-file={self.pidfile}",
+            f"--log-error={self.errlog}",
             f"--plugin-dir={self.plugin_dir}",
             "--plugin-maturity=alpha",
             "--plugin-load-add=ha_stoolap.so",
@@ -251,29 +268,30 @@ class ServerCtx:
 
         # Wait up to ~5s for the socket.
         for _ in range(50):
-            if os.path.exists(SOCK):
+            if os.path.exists(self.sock):
                 break
             time.sleep(0.1)
         else:
             print("runner: server did not come up within 5s; tail of "
-                  f"{ERRLOG}:", file=sys.stderr)
+                  f"{self.errlog}:", file=sys.stderr)
             self._dump_errlog()
             self.stop()
             sys.exit(2)
 
         # Verify plugin loaded.
         engines = subprocess.run(
-            [self.mariadb, "--no-defaults", "-S", SOCK, "-uroot",
+            [self.mariadb, "--no-defaults", "-S", self.sock, "-uroot",
              "-ss", "-e", "SHOW ENGINES"],
             capture_output=True, text=True)
         if "STOOLAP" not in engines.stdout.upper():
             print("runner: STOOLAP engine missing after plugin load; "
-                  f"tail of {ERRLOG}:", file=sys.stderr)
+                  f"tail of {self.errlog}:", file=sys.stderr)
             self._dump_errlog()
             self.stop()
             sys.exit(2)
 
-    def stop(self) -> None:
+    def stop(self, kill: bool = False) -> None:
+        """SIGTERM, a clean shutdown; or with `kill`, SIGKILL, a crash."""
         if self.proc is None or self.reuse:
             return
         if self.keep:
@@ -281,12 +299,12 @@ class ServerCtx:
             self.proc = None
             return
         try:
-            self.proc.send_signal(signal.SIGTERM)
+            self.proc.send_signal(signal.SIGKILL if kill else signal.SIGTERM)
             self.proc.wait(timeout=10)
         except (ProcessLookupError, subprocess.TimeoutExpired):
             self.proc.kill()
             self.proc.wait()
-        for f in (SOCK, PIDFILE):
+        for f in (self.sock, self.pidfile):
             try:
                 os.unlink(f)
             except FileNotFoundError:
@@ -295,7 +313,7 @@ class ServerCtx:
 
     def _dump_errlog(self) -> None:
         try:
-            with open(ERRLOG, "r", errors="replace") as f:
+            with open(self.errlog, "r", errors="replace") as f:
                 tail = f.readlines()[-30:]
                 sys.stderr.writelines(tail)
         except FileNotFoundError:
@@ -367,6 +385,7 @@ def main() -> int:
             harness = Harness(socket=SOCK, db=db,
                               mariadb_bin=server.mariadb,
                               errlog_path=ERRLOG)
+            harness.server = server
             mod = None
             case_counter_start = snapshot_stoolap_counters(server.mariadb)
             perf_trace_before = read_global_var(

@@ -30,12 +30,12 @@ Alpha (`MariaDB_PLUGIN_MATURITY_ALPHA`). MariaDB 11.4 only; the build
 warns on any other series.
 
 CI builds and runs the suite on Ubuntu and macOS against the current
-MariaDB 11.4 release: 20 case files, about 800 assertions, on the
-in-memory DSN. The suite includes a differential harness that runs
-every `tests/diff/*.sql` scenario on STOOLAP and on InnoDB and compares
-each statement's rows, errno and affected-row count. The persistent
-`file://` DSN runs the same suite with `STOOLAP_DSN` set (see
-[Testing](#testing)).
+MariaDB 11.4 release, twice: on the in-memory DSN and on persistent
+`file://` storage (21 case files, about 800 assertions each). The suite
+includes a differential harness that runs every `tests/diff/*.sql`
+scenario on STOOLAP and on InnoDB and compares each statement's rows,
+errno and affected-row count, and a restart test that stops and kills
+its own server on `file://` storage and checks what survives.
 
 ## Architecture
 
@@ -299,6 +299,11 @@ Also:
   1, since the failing row is not known.
 - **Tables a FOREIGN KEY names** are written through SQL, so Stoolap's
   executor checks the keys: slower than the direct write path.
+- **`ALTER TABLE` on `file://` storage** loses the table's rows at the
+  next restart when the table was already on disk (after a restart or a
+  checkpoint): Stoolap replays the ALTER's renames wrongly
+  ([stoolap#941](https://github.com/stoolap/stoolap/issues/941)).
+  `case_22_restart` reports it as known until the fix lands.
 
 ## Build
 
@@ -411,6 +416,11 @@ The runner starts a private `mariadbd` (`--no-defaults`, datadir
 `/tmp/stoolap-test-data`, socket `/tmp/stoolap-test.sock`), loads the
 plugin and runs each case file in its own database. `--no-defaults`
 matters: a system `my.cnf` can carry options this server rejects.
+
+`case_22_restart` starts a second server of its own on `file://`
+storage, stops it cleanly and kills it, and checks that committed rows,
+indexes, FOREIGN KEYs and AUTO_INCREMENT survive and uncommitted ones do
+not.
 
 `case_21_differential` runs every `tests/diff/*.sql` scenario statement
 by statement on STOOLAP and on InnoDB and requires the same rows, errno
