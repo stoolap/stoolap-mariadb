@@ -164,6 +164,9 @@ jobs:
       - name: Install plugin
         run: sudo install -m 0755 build/ha_stoolap.so $MARIADB_PLUGIN_DIR/
 
+      - name: Rust unit tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
       - name: Set up Python
         # Pinned: mysql-connector-python fails to import on Python 3.15
         # (ssl.PROTOCOL_TLSv1 removed), which macos-latest now ships.

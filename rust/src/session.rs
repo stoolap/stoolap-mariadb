@@ -228,7 +228,9 @@ impl Session {
         }
         self.with_handle(&self.write_tables, table, false, |t| {
             if !t.schema().foreign_keys.is_empty()
-                || !engine.find_referencing_fks(t.name()).is_empty()
+                || !engine
+                    .find_referencing_fks(&t.name().to_lowercase())
+                    .is_empty()
             {
                 Ok(None)
             } else {
@@ -243,7 +245,12 @@ impl Session {
         use stoolap::storage::traits::Engine;
         let engine = self.exec.engine();
         let schema = engine.get_table_schema(table)?;
-        Ok(!schema.foreign_keys.is_empty() || !engine.find_referencing_fks(table).is_empty())
+        // Keys name their parent in lower case (a table named P under
+        // lower_case_table_names = 0 is "P" here)
+        Ok(!schema.foreign_keys.is_empty()
+            || !engine
+                .find_referencing_fks(&table.to_lowercase())
+                .is_empty())
     }
 
     /// `table`'s column names, in order
@@ -465,5 +472,26 @@ impl Rows {
 impl Drop for Rows {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_parent_with_upper_case_letters_writes_through_sql() {
+        let db = Database::open("memory://").unwrap();
+        let session = Session::new(&db);
+        for sql in [
+            r#"CREATE TABLE "d_1P" (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)"#,
+            r#"CREATE TABLE "d_1c" (id INTEGER PRIMARY KEY, pu INTEGER REFERENCES "d_1P"(u))"#,
+        ] {
+            session.run(sql, ParamVec::new()).unwrap();
+        }
+        assert!(session.writes_through_sql("d_1P").unwrap());
+        assert!(session.writes_through_sql("d_1c").unwrap());
+        let direct = session.with_write_table("d_1P", |_| Ok(())).unwrap();
+        assert!(direct.is_none(), "the parent's writes go through SQL");
     }
 }
