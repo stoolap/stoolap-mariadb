@@ -138,6 +138,24 @@ bool any_on_expr_matches_chain(TABLE_LIST* head, ItemPred pred);
 
 namespace stoolap_pushdown {
 
+// Whether the row pump writes `sel`'s table through SQL, one statement
+// per row (a table a FOREIGN KEY names): an UPDATE stays whole then
+bool rows_through_sql(THD* thd, SELECT_LEX* sel) {
+    const TABLE_LIST* t = sel->get_table_list();
+    if (!t || !t->table || !t->table->s) return false;
+    auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
+        thd_get_ha_data(thd, stoolap_hton));
+    if (!ctx) {
+        ctx = new stoolap_mariadb::ThdContext(&g_engine);
+        thd_set_ha_data(thd, stoolap_hton, ctx);
+    }
+    StoolapDB* db = ctx->db();
+    return db && stoolap_writes_through_sql(
+                     db, stoolap_mariadb::stoolap_table_from_path(
+                             t->table->s->normalized_path.str)
+                             .c_str()) == 1;
+}
+
 bool can_direct_modify(THD* thd, const Item* where) {
     if (!thd) return false;
     if (thd->stmt_arena && thd->stmt_arena->is_stmt_prepare()) return false;
@@ -214,7 +232,8 @@ bool can_direct_modify(THD* thd, const Item* where) {
     // The statement from its Item tree, the condition MariaDB pushed.
     std::string sql;
     return stoolap_sqlgen::gen_modify(thd, sel, const_cast<Item*>(where), &sql,
-                                      nullptr);
+                                      nullptr, nullptr, nullptr,
+                                      rows_through_sql(thd, sel));
 }
 
 // The one INTEGER `sql` reads (a COUNT), or false
@@ -246,9 +265,10 @@ int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
     std::string sql;
     stoolap_sqlgen::ModifyGuard guard;
     stoolap_sqlgen::ModifyCount count;
-    if (!stoolap_sqlgen::gen_modify(thd, thd->lex->first_select_lex(),
-                                    const_cast<Item*>(where), &sql, nullptr,
-                                    &guard, &count))
+    SELECT_LEX* sel = thd->lex->first_select_lex();
+    if (!stoolap_sqlgen::gen_modify(thd, sel, const_cast<Item*>(where), &sql,
+                                    nullptr, &guard, &count,
+                                    rows_through_sql(thd, sel)))
         return HA_ERR_WRONG_COMMAND;
 
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(

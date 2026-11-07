@@ -93,6 +93,8 @@ public:
     bool unit(SELECT_LEX_UNIT* u, const std::vector<std::string>* names);
     // A single-table UPDATE / DELETE (gen_modify).
     bool modify(SELECT_LEX* sel, Item* where);
+    // Whether the row pump writes the table through SQL (gen_modify)
+    bool rows_through_sql = false;
     // Its checked SET value, if any (ModifyGuard), and how to count the
     // rows it finds (ModifyCount)
     ModifyGuard guard;
@@ -1557,8 +1559,12 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             // the rows as they stand (u = u + 10 fails where the next row
             // holds the new value), and fails the statement; stoolap writes
             // the set, and in a transaction checks UNIQUE at commit. The
-            // row pump checks each row as MariaDB does.
-            if (in_unique_key(fl)) return fail("SET of a unique key column");
+            // row pump checks each row as MariaDB does, but not for a
+            // table it writes through SQL, one autocommitted statement per
+            // row (and none without a primary key): that one stays here,
+            // whole.
+            if (!rows_through_sql && in_unique_key(fl))
+                return fail("SET of a unique key column");
             if (!first) out += ", ";
             first = false;
             const std::string column = quote_ident(
@@ -1790,9 +1796,11 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
 }  // namespace
 
 bool gen_modify(THD* thd, st_select_lex* sel, Item* where, std::string* out,
-                std::string* why, ModifyGuard* guard, ModifyCount* count) {
+                std::string* why, ModifyGuard* guard, ModifyCount* count,
+                bool rows_through_sql) {
     Gen g(thd);
     g.top = sel;
+    g.rows_through_sql = rows_through_sql;
     if (!g.modify(sel, where)) {
         if (why) *why = g.why ? g.why : "unknown";
         return false;
