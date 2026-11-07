@@ -93,6 +93,13 @@ jobs:
       - name: Run tests
         run: python3 tests/runner.py
 
+      - name: Run tests on persistent storage
+        # The same suite with stoolap on disk (WAL, volumes, checkpoints),
+        # in a fresh directory and datadir.
+        run: |
+          rm -rf /tmp/stoolap-test-data /tmp/stoolap-test-filedsn
+          STOOLAP_DSN=file:///tmp/stoolap-test-filedsn python3 tests/runner.py
+
       - name: Upload server log on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -169,6 +176,13 @@ jobs:
 
       - name: Run tests
         run: python3 tests/runner.py
+
+      - name: Run tests on persistent storage
+        # The same suite with stoolap on disk (WAL, volumes, checkpoints),
+        # in a fresh directory and datadir.
+        run: |
+          rm -rf /tmp/stoolap-test-data /tmp/stoolap-test-filedsn
+          STOOLAP_DSN=file:///tmp/stoolap-test-filedsn python3 tests/runner.py
 
       - name: Upload server log on failure
         if: failure()
