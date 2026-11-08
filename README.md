@@ -253,7 +253,7 @@ Tables created by an older build of the plugin must be re-created.
 | `REPEATABLE READ`, `SERIALIZABLE` | Yes (a Stoolap snapshot transaction) |
 | `START TRANSACTION WITH CONSISTENT SNAPSHOT` | Yes |
 | `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT` | Yes |
-| Write-write conflicts | `ER_LOCK_DEADLOCK` (1213) |
+| Write-write conflicts | `ER_LOCK_DEADLOCK` (1213), also for a row the row pump read that another transaction changed before the write |
 | Crash recovery (`file://` DSN) | Yes (WAL replay at open) |
 | XA / two-phase commit | No |
 
@@ -303,13 +303,6 @@ Also:
   Affected rows are exact.
 - **A strict-mode range or length error** from a direct UPDATE names row
   1, since the failing row is not known.
-- **An UPDATE on the row pump can lose a concurrent update.** MariaDB
-  reads the row, computes the new values and hands them to the handler;
-  a commit in between is written over (`SET v = v + 1` from several
-  sessions can lose increments). Direct UPDATEs are not affected: a
-  conflict there fails with 1213. The row pump runs UPDATEs with ORDER BY
-  / LIMIT, IGNORE, multi-table UPDATEs and those the generator cannot
-  translate.
 - **Tables a FOREIGN KEY names** are written through SQL, so Stoolap's
   executor checks the keys: slower than the direct write path.
 - **`ALTER TABLE` on `file://` storage** loses the table's rows at the
@@ -469,8 +462,7 @@ Analytical shapes (joins, subqueries, window functions, aggregates) are
 where Stoolap's executor pulls ahead. Point lookups and writes are close
 to InnoDB: there MariaDB's own per-statement work dominates. InnoDB's one
 win is UPDATE by ID, a direct UPDATE whose statement Stoolap parses and
-plans for one row; the row pump would be faster there but can lose a
-concurrent update (see [Known differences](#known-differences)). See
+plans for one row. See
 `benchmarks/README.md` for the full dashboard and its baseline check.
 
 ## Licensing

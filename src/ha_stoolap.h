@@ -252,6 +252,11 @@ private:
     bool key_fields_built_ = false;
     const std::vector<StoolapField>& insert_fields();
     const std::vector<StoolapField>& refresh_update_fields();
+    // The columns the statement read (read_set), which a write checks the
+    // row still holds as read
+    std::vector<StoolapField> checked_fields_;
+    std::vector<uint32_t> checked_words_;
+    const std::vector<StoolapField>& refresh_checked_fields();
     const std::vector<StoolapField>& key_fields();
 
     // Approximate row-count cache (HA_STATS_RECORDS_IS_EXACT isn't set).

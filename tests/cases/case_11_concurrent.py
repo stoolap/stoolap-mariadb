@@ -103,3 +103,157 @@ DROP TABLE concddl_{i};
         "SELECT COUNT(*) FROM information_schema.tables "
         f"WHERE table_schema = '{h.db}' AND table_name LIKE 'concddl_%'")
     h.assert_eq("no orphan tables after concurrent DDL", "0", out)
+
+    h.section("Concurrent row-pump UPDATEs do not write over each other")
+    # The row pump writes the values MariaDB computed from the row it read;
+    # the handler checks the row still holds what was read, and a commit
+    # in between fails the statement with 1213 (as a direct UPDATE's
+    # conflict does) instead of being written over. Every reported change
+    # must be in the final value.
+    h.exec_script(f"""
+CREATE TABLE cnt (id INT NOT NULL PRIMARY KEY, v INT NOT NULL) ENGINE={h.engine};
+INSERT INTO cnt VALUES (1, 0), (2, 0);
+CREATE TABLE cntp (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+INSERT INTO cntp VALUES (1);
+CREATE TABLE cntc (id INT NOT NULL PRIMARY KEY, v INT NOT NULL, pid INT,
+                   FOREIGN KEY (pid) REFERENCES cntp(id)) ENGINE={h.engine};
+INSERT INTO cntc VALUES (1, 0, 1);
+CREATE TABLE cnts (id INT NOT NULL PRIMARY KEY, s VARCHAR(2000) NOT NULL)
+    ENGINE={h.engine};
+INSERT INTO cnts VALUES (1, '');
+CREATE TABLE cntsc (id INT NOT NULL PRIMARY KEY, s VARCHAR(2000) NOT NULL,
+                    pid INT, FOREIGN KEY (pid) REFERENCES cntp(id))
+    ENGINE={h.engine};
+INSERT INTO cntsc VALUES (1, '', 1);
+""")
+    import threading
+    # A VARCHAR's trailing spaces are its value (only a CHAR's padding is
+    # not): appending one is a change the check sees
+    for label, sql, check in [
+            ("ORDER BY / LIMIT",
+             "UPDATE cnt SET v = v + 1 WHERE id = 1 ORDER BY id LIMIT 1",
+             "SELECT v FROM cnt WHERE id = 1"),
+            ("IGNORE", "UPDATE IGNORE cnt SET v = v + 1 WHERE id = 2",
+             "SELECT v FROM cnt WHERE id = 2"),
+            ("a table a FOREIGN KEY names (through SQL)",
+             "UPDATE cntc SET v = v + 1 WHERE id = 1 ORDER BY id LIMIT 1",
+             "SELECT v FROM cntc WHERE id = 1"),
+            ("a VARCHAR's trailing spaces",
+             "UPDATE cnts SET s = CONCAT(s, ' ') WHERE id = 1 "
+             "ORDER BY id LIMIT 1", "SELECT LENGTH(s) FROM cnts"),
+            ("a VARCHAR's trailing spaces through SQL",
+             "UPDATE cntsc SET s = CONCAT(s, ' ') WHERE id = 1 "
+             "ORDER BY id LIMIT 1", "SELECT LENGTH(s) FROM cntsc")]:
+        changed = []
+        lock = threading.Lock()
+
+        def work():
+            c, cur = h.open_session()
+            n = 0
+            for _ in range(400):
+                try:
+                    cur.execute(sql)
+                    n += cur.rowcount
+                except Exception:  # 1213: retried by a real client
+                    pass
+            c.close()
+            with lock:
+                changed.append(n)
+
+        threads = [threading.Thread(target=work) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        h.assert_scalar(f"{label}: every reported change kept", check,
+                        str(sum(changed)))
+
+    # A row-pump UPDATE that moves a row to a new primary key deletes and
+    # inserts it: the version it checked is held through the move, so an
+    # increment committed meanwhile is not lost with the old copy
+    h.exec_script(f"""
+CREATE TABLE mv (id INT NOT NULL PRIMARY KEY, v INT NOT NULL) ENGINE={h.engine};
+INSERT INTO mv VALUES (1, 0);
+""")
+    stop = [False]
+    incs = []
+
+    def mover():
+        c, cur = h.open_session()
+        while not stop[0]:
+            try:
+                cur.execute("UPDATE mv SET id = 3 - id WHERE id IN (1, 2) "
+                            "ORDER BY id LIMIT 1")
+            except Exception:
+                pass
+        c.close()
+
+    def incrementer():
+        c, cur = h.open_session()
+        n = 0
+        for _ in range(400):
+            try:
+                cur.execute("UPDATE mv SET v = v + 1 WHERE id IN (1, 2)")
+                n += cur.rowcount
+            except Exception:
+                pass
+        c.close()
+        with lock:
+            incs.append(n)
+
+    m = threading.Thread(target=mover)
+    m.start()
+    workers = [threading.Thread(target=incrementer) for _ in range(3)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    stop[0] = True
+    m.join()
+    h.assert_scalar("a moved row keeps every reported increment",
+                    "SELECT SUM(v) FROM mv", str(sum(incs)))
+
+    # A row-pump DELETE of a row a FOREIGN KEY names goes through SQL,
+    # which finds its rows before it deletes them: the row is held first,
+    # so a k committed meanwhile is not deleted under the old one's test
+    h.exec_script(f"""
+CREATE TABLE dk (id INT NOT NULL PRIMARY KEY, k INT NOT NULL UNIQUE)
+    ENGINE={h.engine};
+CREATE TABLE dkc (id INT NOT NULL PRIMARY KEY, pk INT,
+                  FOREIGN KEY (pk) REFERENCES dk(k) ON DELETE CASCADE)
+    ENGINE={h.engine};
+""")
+    odd = 0
+    for _ in range(200):
+        h.exec_script("DELETE FROM dk; INSERT INTO dk VALUES (1, 0);")
+        stop[0] = False
+        bumps = [0]
+
+        def bumper():
+            c, cur = h.open_session()
+            while not stop[0]:
+                try:
+                    cur.execute("UPDATE dk SET k = k + 1 WHERE id = 1")
+                    if cur.rowcount == 0:
+                        break
+                    bumps[0] += 1
+                except Exception:
+                    pass
+            c.close()
+
+        b = threading.Thread(target=bumper)
+        b.start()
+        c, cur = h.open_session()
+        while True:
+            try:
+                cur.execute("DELETE FROM dk WHERE id = 1 AND k % 2 = 0 "
+                            "ORDER BY id LIMIT 1")
+                if cur.rowcount == 1:
+                    break
+            except Exception:
+                pass
+        stop[0] = True
+        b.join()
+        c.close()
+        odd += bumps[0] % 2
+    h.assert_eq("a DELETE never takes a row past its test", 0, odd)

@@ -51,13 +51,47 @@ pub fn insert(
     Ok(n)
 }
 
-/// Sets `columns` of row `row_id` to `values`; 0 when the row is gone
+/// What a write's statement read of its row: `values` in `columns`, a CHAR
+/// without its padding (`pad`, `record::pad_unit`). The row must still hold
+/// them when written: another transaction may have committed a change
+/// since, which the values MariaDB computed from the old ones would write
+/// over (MariaDB's own engines lock the row before they read it).
+pub struct ReadCheck<'a> {
+    pub columns: &'a [usize],
+    pub values: &'a [Value],
+    pub pad: &'a [Option<&'static str>],
+}
+
+impl ReadCheck<'_> {
+    /// Whether `row` no longer holds what was read
+    fn changed(&self, row: &Row) -> bool {
+        self.columns
+            .iter()
+            .zip(self.values)
+            .zip(self.pad)
+            .any(|((&c, v), pad)| {
+                row.get(c).is_none_or(|now| match (now, v, pad) {
+                    // MariaDB encodes a CHAR with or without its padding,
+                    // as the session's sql_mode says (PAD_CHAR_TO_FULL_LENGTH)
+                    (Value::Text(a), Value::Text(b), Some(unit)) => {
+                        a.as_str().trim_end_matches(unit) != b.as_str().trim_end_matches(unit)
+                    }
+                    _ => now != v,
+                })
+            })
+    }
+}
+
+/// Sets `columns` to `values` in row `row_id`, which must still hold what
+/// `read` says: checked on the version the write replaces, which stoolap's
+/// own conflict check then holds to commit
 pub fn update(
     table: &mut dyn Table,
     table_columns: usize,
     row_id: i64,
     columns: &[usize],
     values: Vec<Value>,
+    read: &ReadCheck,
 ) -> Result<i64> {
     check_columns(table, table_columns)?;
     if columns.len() != values.len() || columns.iter().any(|&c| c >= table_columns) {
@@ -79,6 +113,9 @@ pub fn update(
             check_unique(table, row_id, &row, columns)?;
         }
         let mut set = |mut row: Row| -> Result<(Row, bool)> {
+            if read.changed(&row) {
+                return Err(conflict(row_id));
+            }
             for (&c, v) in columns.iter().zip(&values) {
                 row.set(c, v.clone())?;
             }
@@ -87,12 +124,9 @@ pub fn update(
         return Ok(table.update_by_row_ids(&[row_id], &mut set)? as i64);
     }
 
-    // An INTEGER primary key is the row id: the row moves to its new id
-    let Some((_, old)) = table
-        .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr())?
-        .into_iter()
-        .next()
-    else {
+    // An INTEGER primary key is the row id: the row moves to its new id,
+    // from the version held as read
+    let Some(old) = hold_unchanged(table, row_id, read)? else {
         return Ok(0);
     };
     let mut row = old.clone();
@@ -160,8 +194,38 @@ pub(crate) fn check_update(
     check_unique(table, row_id, &row, columns)
 }
 
-/// Deletes row `row_id`; 0 when it is gone
-pub fn delete(table: &mut dyn Table, row_id: i64) -> Result<i64> {
+/// Holds row `row_id` as read for the write that follows (a delete, or a
+/// primary key's move): writes it unchanged, checking in the setter that
+/// it still holds what was `read`, so the version checked is the one
+/// stoolap's conflict check holds to commit and no commit lands between
+/// the check and the write. The row as held, or None when it is gone.
+pub fn hold_unchanged(table: &mut dyn Table, row_id: i64, read: &ReadCheck) -> Result<Option<Row>> {
+    let mut held = None;
+    let mut hold = |row: Row| -> Result<(Row, bool)> {
+        if read.changed(&row) {
+            return Err(conflict(row_id));
+        }
+        held = Some(row.clone());
+        Ok((row, true))
+    };
+    table.update_by_row_ids(&[row_id], &mut hold)?;
+    Ok(held)
+}
+
+/// The error stoolap's own conflict check fails a write with
+fn conflict(row_id: i64) -> Error {
+    Error::internal(format!(
+        "write conflict: row {} was modified by another transaction",
+        row_id
+    ))
+}
+
+/// Deletes row `row_id`, held first as read (`hold_unchanged`) when the
+/// statement read any column; 0 when it is gone
+pub fn delete(table: &mut dyn Table, row_id: i64, read: &ReadCheck) -> Result<i64> {
+    if !read.columns.is_empty() && hold_unchanged(table, row_id, read)?.is_none() {
+        return Ok(0);
+    }
     Ok(table.delete_by_row_ids(&[row_id])? as i64)
 }
 

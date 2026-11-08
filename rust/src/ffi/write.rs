@@ -23,9 +23,10 @@ use stoolap::storage::traits::Table;
 use super::read::table_name;
 use super::types::StoolapDB;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
-use crate::record::{read_value, read_values, same_in, EncodeFn, RecordIn, StoolapField};
+use crate::record::{pad_unit, read_value, read_values, same_in, EncodeFn, RecordIn, StoolapField};
 use crate::session::Session;
-use crate::{sql_write, write};
+use crate::sql_write;
+use crate::write::{self, ReadCheck};
 
 /// Runs `direct` on `table`'s write handle, or `sql` when a foreign key
 /// names the table or the row is named `by_key`, storing the count in
@@ -118,6 +119,31 @@ unsafe fn named(
 
 fn columns(table_columns: i32) -> Result<usize> {
     usize::try_from(table_columns).map_err(|_| Error::internal("bad column count"))
+}
+
+/// Holds row `row_id` for a write through SQL as `write::hold_unchanged`
+/// does, failing it when the row no longer holds what was read; false when
+/// the row is gone, which the write must not go on to (a row inserted since
+/// under its key is another one). Through the storage handle, in the
+/// statement's transaction: an UPDATE would run the actions of the foreign
+/// keys that name the column it writes, and a DELETE finds its rows before
+/// it deletes them, with no second look.
+fn hold_read(
+    session: &Session,
+    table: &str,
+    row_id: i64,
+    columns: &[usize],
+    values: &[Value],
+    pad: &[Option<&'static str>],
+) -> Result<bool> {
+    let read = ReadCheck {
+        columns,
+        values,
+        pad,
+    };
+    Ok(session
+        .with_any_write_table(table, |t| write::hold_unchanged(t, row_id, &read))?
+        .is_some())
 }
 
 /// 1 when a foreign key names `table` (as child or parent), so its writes
@@ -334,6 +360,8 @@ pub unsafe extern "C" fn stoolap_update_record(
     nfields: i32,
     keys: *const StoolapField,
     nkeys: i32,
+    read: *const StoolapField,
+    nread: i32,
     old_record: *const u8,
     new_record: *const u8,
     encode: Option<EncodeFn>,
@@ -364,6 +392,12 @@ pub unsafe extern "C" fn stoolap_update_record(
         encode,
         ctx,
     };
+    let read = match field_slice(read, nread) {
+        Ok(fields) => fields,
+        Err(_) => return STOOLAP_ERROR,
+    };
+    let read_columns: Vec<usize> = read.iter().map(|f| f.column as usize).collect();
+    let pad: Vec<_> = read.iter().map(pad_unit).collect();
     write_through(
         db,
         table,
@@ -373,9 +407,27 @@ pub unsafe extern "C" fn stoolap_update_record(
         |t| {
             let set: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
             let values = read_values(&changed, &new)?;
-            write::update(t, columns(table_columns)?, row_id, &set, values)
+            let was = read_values(read, &old)?;
+            write::update(
+                t,
+                columns(table_columns)?,
+                row_id,
+                &set,
+                values,
+                &ReadCheck {
+                    columns: &read_columns,
+                    values: &was,
+                    pad: &pad,
+                },
+            )
         },
         |session, name| {
+            if has_row_id != 0 {
+                let was = read_values(read, &old)?;
+                if !hold_read(session, name, row_id, &read_columns, &was, &pad)? {
+                    return Ok(0);
+                }
+            }
             let set = named(session, name, &changed, &new)?;
             let key = named(session, name, field_slice(keys, nkeys)?, &old)?;
             let columns: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
@@ -399,6 +451,8 @@ pub unsafe extern "C" fn stoolap_delete_record(
     has_row_id: i32,
     keys: *const StoolapField,
     nkeys: i32,
+    read: *const StoolapField,
+    nread: i32,
     record: *const u8,
     encode: Option<EncodeFn>,
     ctx: *mut c_void,
@@ -409,14 +463,34 @@ pub unsafe extern "C" fn stoolap_delete_record(
         encode,
         ctx,
     };
+    let read = match field_slice(read, nread) {
+        Ok(fields) => fields,
+        Err(_) => return STOOLAP_ERROR,
+    };
+    let read_columns: Vec<usize> = read.iter().map(|f| f.column as usize).collect();
+    let pad: Vec<_> = read.iter().map(pad_unit).collect();
     write_through(
         db,
         table,
         affected,
         "stoolap_delete_record",
         has_row_id == 0,
-        |t| write::delete(t, row_id),
+        |t| {
+            let was = read_values(read, &src)?;
+            let check = ReadCheck {
+                columns: &read_columns,
+                values: &was,
+                pad: &pad,
+            };
+            write::delete(t, row_id, &check)
+        },
         |session, name| {
+            if has_row_id != 0 {
+                let was = read_values(read, &src)?;
+                if !hold_read(session, name, row_id, &read_columns, &was, &pad)? {
+                    return Ok(0);
+                }
+            }
             let key = named(session, name, field_slice(keys, nkeys)?, &src)?;
             sql_write::delete(session, name, key)
         },

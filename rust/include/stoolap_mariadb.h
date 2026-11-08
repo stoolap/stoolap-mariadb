@@ -345,6 +345,13 @@ StoolapCursor* stoolap_cursor_new(void);
  * prefix, then the bytes; a value of at most `max_chars` bytes always fits
  */
 #define STOOLAP_FIELD_VARCHAR   4
+/**
+ * A CHAR, handed to the store callback as STORE is; its padding is no
+ * part of its value (a write's check compares it without it). `length`
+ * is 0 for text stored as it is, else the bytes of the character set's
+ * space, given big-endian in `max_chars`, for text stored as hex.
+ */
+#define STOOLAP_FIELD_CHAR      5
 
 /**
  * One field a read fills: the stoolap column it reads and where it sits
@@ -536,6 +543,7 @@ int32_t stoolap_update_record(
     int64_t row_id, int32_t has_row_id,
     const StoolapField* fields, int32_t nfields,
     const StoolapField* keys, int32_t nkeys,
+    const StoolapField* read, int32_t nread,
     const uint8_t* old_record,
     const uint8_t* new_record,
     StoolapEncodeFn encode, void* ctx,
@@ -545,12 +553,18 @@ int32_t stoolap_update_record(
 /**
  * Delete row `row_id` when `has_row_id`, else the row the primary key
  * `keys` holds in `record` names; 0 affected when it is gone.
+ *
+ * For both writes, `read` names the columns the statement read: the row
+ * must still hold the values `old_record` / `record` has for them, or the
+ * write fails as a write conflict (another transaction changed the row
+ * since MariaDB read it, and its new values would be written over).
  */
 int32_t stoolap_delete_record(
     StoolapDB* db,
     const char* table,
     int64_t row_id, int32_t has_row_id,
     const StoolapField* keys, int32_t nkeys,
+    const StoolapField* read, int32_t nread,
     const uint8_t* record,
     StoolapEncodeFn encode, void* ctx,
     int64_t* rows_affected

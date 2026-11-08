@@ -931,6 +931,32 @@ INSERT INTO wdbl VALUES (1, 1, 1), (2, 2, 2);
     h.assert_scalar("the values", "SELECT GROUP_CONCAT(u ORDER BY id) FROM wdbl",
                     "7.5,3")
 
+    h.section("A row-pump write is checked independent of CHAR padding")
+    # The row pump checks a written row still holds what was read; a CHAR
+    # is encoded with or without its padding as sql_mode says, which is
+    # no change (no 1213 without a concurrent writer)
+    c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=True)
+    cur = c.cursor()
+    cur.execute("SET SESSION sql_mode = ''")
+    # A character set other than utf8 is stored as hex, its padding the
+    # hex of its own space (latin1 20, ucs2 0020)
+    cur.execute(f"CREATE TABLE wpad (id INT PRIMARY KEY, n INT, c CHAR(4), "
+                f"l CHAR(4) CHARACTER SET latin1, u CHAR(4) CHARACTER SET ucs2) "
+                f"ENGINE={h.engine}")
+    cur.execute("INSERT INTO wpad VALUES (1, 0, 'a', 'a', 'a')")
+    cur.execute("SET SESSION sql_mode = 'PAD_CHAR_TO_FULL_LENGTH'")
+    cur.execute("INSERT INTO wpad VALUES (2, 0, 'a', 'a', 'a')")
+    got = []
+    for mode in ["PAD_CHAR_TO_FULL_LENGTH", ""]:
+        cur.execute(f"SET SESSION sql_mode = '{mode}'")
+        for row in [1, 2]:
+            cur.execute(f"UPDATE wpad SET n = n + 1 WHERE id = {row} AND "
+                        "c = 'a' AND l = 'a' AND u = 'a' ORDER BY id LIMIT 1")
+            got.append(cur.rowcount)
+    c.close()
+    h.assert_eq("both modes update the rows", [1, 1, 1, 1], got)
+
     h.section("Direct UPDATE checks several SET values, and clips outside strict mode")
     # Each checked value fails with its own overflow, which names the
     # column; outside strict mode MariaDB clips the value to its column,
