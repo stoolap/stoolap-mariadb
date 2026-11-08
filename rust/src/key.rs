@@ -103,7 +103,7 @@ enum Pred {
 /// `f op v` in MariaDB's index order, where NULL sorts before every value
 /// and a value past INT64_MAX after every stored one. (Against a value, an
 /// upper bound leaves the NULLs out, as stoolap compares: a range whose
-/// lower bound keeps them loses them.)
+/// lower bound keeps them gets them back in `bound_nodes`.)
 fn compare(f: &StoolapField, op: i32, v: KeyValue) -> Pred {
     let upper = matches!(op, STOOLAP_OP_LT | STOOLAP_OP_LE);
     match v {
@@ -163,8 +163,50 @@ fn all(preds: Vec<Pred>) -> Option<(Vec<Node>, usize)> {
     Some((nodes, n))
 }
 
+/// Whether the range `bounds` mean, each read through `src_of`, takes rows
+/// whose first key part is NULL from below: a lower bound at NULL that
+/// keeps it. Its upper bound then keeps them too (`bound_nodes`), as NULL
+/// sorts first; without one, it leaves them out, which keeps the index for
+/// the usual `a < 2` (whose lower bound is `a > NULL`).
+///
+/// # Safety
+///
+/// Each bound's record must be a record buffer of the layout `parts`
+/// describe.
+pub unsafe fn nulls_below(
+    parts: &[StoolapField],
+    bounds: &[StoolapKeyBound],
+    src_of: impl Fn(&StoolapKeyBound) -> RecordIn,
+) -> Result<bool> {
+    let Some(f) = parts.first().filter(|f| f.null_mask != 0) else {
+        return Ok(false);
+    };
+    for b in bounds {
+        let n = (b.nparts.max(0) as usize).min(parts.len());
+        let lower = match b.op {
+            STOOLAP_OP_GE => true,
+            // (NULL, x) > ... still takes rows whose first part is NULL
+            STOOLAP_OP_GT => n > 1 && b.mode != STOOLAP_BOUND_LEADING,
+            _ => false,
+        };
+        if n > 0 && lower && matches!(key_value(f, &src_of(b))?, KeyValue::Null) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The count of top-level conditions in `nodes`, which the read ANDs
+fn top_level(nodes: &[Node]) -> usize {
+    nodes.iter().fold(0, |n, node| match node {
+        Node::Cond(_) => n + 1,
+        Node::And(k) | Node::Or(k) => n + 1 - k,
+    })
+}
+
 /// Appends the conditions `bound` means over the key `parts`; false when
-/// no row can meet them
+/// no row can meet them. With `nulls_below`, an upper bound against a
+/// value keeps the rows whose first part is NULL.
 ///
 /// # Safety
 ///
@@ -173,12 +215,44 @@ pub unsafe fn bound_nodes(
     parts: &[StoolapField],
     bound: &StoolapKeyBound,
     src: &RecordIn,
+    nulls_below: bool,
     out: &mut Vec<Node>,
 ) -> Result<bool> {
     let n = (bound.nparts.max(0) as usize).min(parts.len());
     if n == 0 {
         return Ok(true);
     }
+    let start = out.len();
+    let met = bound_nodes_of(parts, bound, src, n, out)?;
+    let upper =
+        matches!(bound.op, STOOLAP_OP_LT | STOOLAP_OP_LE) && bound.mode != STOOLAP_BOUND_LEADING;
+    if nulls_below && upper && matches!(key_value(&parts[0], src)?, KeyValue::Value(_)) {
+        if !met {
+            // Below the bound only the NULLs are left
+            out.truncate(start);
+            out.push(cond(&parts[0], CondOp::IsNull, Value::null_unknown()));
+            return Ok(true);
+        }
+        let count = top_level(&out[start..]);
+        if count > 0 {
+            if count > 1 {
+                out.push(Node::And(count));
+            }
+            out.push(cond(&parts[0], CondOp::IsNull, Value::null_unknown()));
+            out.push(Node::Or(2));
+        }
+    }
+    Ok(met)
+}
+
+/// `bound_nodes` but for the NULLs below an upper bound, over its `n` parts
+unsafe fn bound_nodes_of(
+    parts: &[StoolapField],
+    bound: &StoolapKeyBound,
+    src: &RecordIn,
+    n: usize,
+    out: &mut Vec<Node>,
+) -> Result<bool> {
     if bound.mode == STOOLAP_BOUND_LEADING {
         let f = &parts[0];
         let upper = bound.op == STOOLAP_OP_LE;

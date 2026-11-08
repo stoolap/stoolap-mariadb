@@ -14,8 +14,13 @@ INSERT INTO kb VALUES (1, NULL, 1, 0, 'abc', 1.50), (2, 1, NULL, 5, 'ABC', -2.00
 CREATE TABLE o (x INT) ENGINE=InnoDB;
 INSERT INTO o VALUES (1);
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ka) WHERE kb.a <=> NULL ORDER BY kb.id;
--- known-diff: the range [NULL, 2) loses its NULLs: an upper bound compares as stoolap does, NULL never below 2 (an OR IS NULL would cost the index)
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ka) WHERE kb.a IS NULL OR kb.a < 2 ORDER BY kb.id;
+-- the NULLs a range from NULL keeps, under every upper bound
+SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ka) WHERE kb.a IS NULL OR kb.a <= 2 ORDER BY kb.id;
+SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ka) WHERE kb.a IS NULL OR kb.a < 2 ORDER BY kb.a DESC, kb.id;
+SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (kab) WHERE kb.a IS NULL OR kb.a < 2 ORDER BY kb.id;
+SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (kab) WHERE kb.a = 2 AND (kb.b IS NULL OR kb.b < 3) ORDER BY kb.id;
+SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ka) WHERE kb.a < 2 ORDER BY kb.id;
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ka) WHERE kb.a > 1 ORDER BY kb.a DESC, kb.id;
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ku) WHERE kb.u = 18446744073709551615;
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ku) WHERE kb.u > 18446744073709551000 ORDER BY kb.id;

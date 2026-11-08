@@ -19,7 +19,7 @@ use stoolap::core::{Error, Result};
 
 use super::types::{StoolapDB, StoolapRows};
 use super::{STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
-use crate::key::{bound_nodes, StoolapKeyBound};
+use crate::key::{bound_nodes, nulls_below, StoolapKeyBound};
 use crate::read::{Cursor, ReadSpec};
 use crate::record::{write_record, EncodeFn, RecordIn, Sink, StoolapField, StoreFn};
 
@@ -165,14 +165,16 @@ pub unsafe extern "C" fn stoolap_read(
         let name = table_name(table)?;
         let order = positions(order, norder)?;
         let parts = slice(keys, nkeys)?;
+        let bounds = slice(bounds, nbounds)?;
+        let src_of = |bound: &StoolapKeyBound| RecordIn {
+            record: bound.record,
+            encode,
+            ctx,
+        };
+        let nulls = nulls_below(parts, bounds, src_of)?;
         let mut conds = Vec::new();
-        for bound in slice(bounds, nbounds)? {
-            let src = RecordIn {
-                record: bound.record,
-                encode,
-                ctx,
-            };
-            if !bound_nodes(parts, bound, &src, &mut conds)? {
+        for bound in bounds {
+            if !bound_nodes(parts, bound, &src_of(bound), nulls, &mut conds)? {
                 return Ok(None);
             }
         }
