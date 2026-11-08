@@ -176,12 +176,16 @@ fn all(preds: Vec<Pred>) -> Option<(Vec<Node>, usize)> {
 }
 
 /// The key parts (bit i) at which the range from `lower` to `upper` takes
-/// rows whose part is NULL below the upper bound's value: the lower bound
-/// holds NULL there, after the same values as the upper bound before it
-/// (MariaDB's ranges share their leading parts), and takes it (`>=`, or
-/// `>` with parts after it). The upper bound keeps those rows (`compare`),
-/// as NULL sorts first; elsewhere it leaves them out, which keeps the
-/// index for the usual `a < 2` (whose lower bound is `a > NULL`).
+/// rows whose part is NULL below the upper bound's value: those whose
+/// lower bound, in MariaDB's index order (NULL first), is at or below the
+/// upper bound's leading values followed by NULL. A range's lower bound is
+/// below its upper one, so once the two differ at a part, it is below any
+/// such row (values equal in a collation but not in their bytes only keep
+/// a few more rows, which the caller filters); while they agree, it takes
+/// the NULL that it holds itself (`>=`, or `>` with parts after it). The
+/// upper bound keeps those rows (`compare`); elsewhere it leaves them out,
+/// which keeps the index for the usual `a < 2` (whose lower bound is
+/// `a > NULL`).
 ///
 /// # Safety
 ///
@@ -197,18 +201,28 @@ pub unsafe fn null_parts(
     let nu = (upper.nparts.max(0) as usize).min(parts.len()).min(32);
     let (l, u) = (src_of(lower), src_of(upper));
     let mut mask = 0;
-    for (k, f) in parts[..nl.min(nu)].iter().enumerate() {
-        match (key_value(f, &l)?, key_value(f, &u)?) {
-            (KeyValue::Null, KeyValue::Value(_)) => {
-                if f.null_mask != 0 && (lower.op == STOOLAP_OP_GE || nl > k + 1) {
-                    mask |= 1 << k;
-                }
-                break;
-            }
-            (KeyValue::Null, KeyValue::Null) => {}
-            (KeyValue::Value(a), KeyValue::Value(b)) if a == b => {}
-            _ => break,
+    let mut below = false;
+    for (k, f) in parts[..nu].iter().enumerate() {
+        let lk = if k < nl {
+            Some(key_value(f, &l)?)
+        } else {
+            None
+        };
+        let uk = key_value(f, &u)?;
+        let takes = below
+            || match &lk {
+                None => lower.op == STOOLAP_OP_GE,
+                Some(KeyValue::Null) => lower.op == STOOLAP_OP_GE || nl > k + 1,
+                Some(_) => false,
+            };
+        if takes && f.null_mask != 0 && matches!(uk, KeyValue::Value(_)) {
+            mask |= 1 << k;
         }
+        below |= match (lk, uk) {
+            (Some(KeyValue::Null), KeyValue::Null) | (None, _) => false,
+            (Some(KeyValue::Value(a)), KeyValue::Value(b)) => a != b,
+            _ => true,
+        };
     }
     Ok(mask)
 }
