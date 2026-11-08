@@ -1194,10 +1194,19 @@ const std::vector<StoolapField>& ha_stoolap::refresh_checked_fields() {
             w[i / 32] |= uint32_t(1) << (i % 32);
     if (w == checked_words_ && !checked_fields_.empty()) return checked_fields_;
     checked_fields_.clear();
-    for (uint i = 0; i < fields; ++i)
-        if (w[i / 32] & (uint32_t(1) << (i % 32)))
-            checked_fields_.push_back(stoolap_mariadb::record_field(
-                table, i, static_cast<int32_t>(i)));
+    for (uint i = 0; i < fields; ++i) {
+        if (!(w[i / 32] & (uint32_t(1) << (i % 32)))) continue;
+        StoolapField d =
+            stoolap_mariadb::record_field(table, i, static_cast<int32_t>(i));
+        // A CHAR is encoded with or without its padding, as sql_mode
+        // says, so the check compares it without trailing spaces
+        const Field* f = table->field[i];
+        if (d.kind == STOOLAP_FIELD_STORE &&
+            f->real_type() == MYSQL_TYPE_STRING &&
+            f->charset() != &my_charset_bin)
+            d.kind = STOOLAP_FIELD_CHAR;
+        checked_fields_.push_back(d);
+    }
     checked_words_ = w;
     return checked_fields_;
 }

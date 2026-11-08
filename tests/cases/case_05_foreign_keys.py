@@ -123,6 +123,23 @@ INSERT INTO np VALUES (1);
                  "INSERT INTO nr VALUES (2, 99)",
                  r"foreign key constraint fails")
 
+    h.section("A row-pump DELETE runs the parent's ON DELETE action")
+    # The delete holds its row first under the check that it is unchanged;
+    # that must not write a column a key names, whose ON UPDATE action
+    # (RESTRICT here) is not the statement's
+    h.exec_script(f"""
+CREATE TABLE odp (id INT NOT NULL PRIMARY KEY, k INT NOT NULL UNIQUE)
+    ENGINE={h.engine};
+INSERT INTO odp VALUES (1, 10);
+CREATE TABLE odc (id INT NOT NULL PRIMARY KEY, pk INT,
+                  FOREIGN KEY (pk) REFERENCES odp(k)
+                  ON DELETE CASCADE ON UPDATE RESTRICT) ENGINE={h.engine};
+INSERT INTO odc VALUES (1, 10);
+""")
+    h.assert_ok("DELETE of a referenced row through the row pump",
+                "DELETE FROM odp WHERE id = 1 AND k = 10 ORDER BY id LIMIT 1")
+    h.assert_scalar("the child row cascaded", "SELECT COUNT(*) FROM odc", "0")
+
     # Every spelling of a parent the clause reader takes, and refuses
     # rather than drop or misname: an FK it cannot read would leave the
     # table without the key.

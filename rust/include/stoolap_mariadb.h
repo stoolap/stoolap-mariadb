@@ -345,6 +345,11 @@ StoolapCursor* stoolap_cursor_new(void);
  * prefix, then the bytes; a value of at most `max_chars` bytes always fits
  */
 #define STOOLAP_FIELD_VARCHAR   4
+/**
+ * A CHAR, handed to the store callback as STORE is; its padding is no
+ * part of its value (a write's check compares it without trailing spaces)
+ */
+#define STOOLAP_FIELD_CHAR      5
 
 /**
  * One field a read fills: the stoolap column it reads and where it sits

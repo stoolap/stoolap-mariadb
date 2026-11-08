@@ -118,15 +118,32 @@ INSERT INTO cntp VALUES (1);
 CREATE TABLE cntc (id INT NOT NULL PRIMARY KEY, v INT NOT NULL, pid INT,
                    FOREIGN KEY (pid) REFERENCES cntp(id)) ENGINE={h.engine};
 INSERT INTO cntc VALUES (1, 0, 1);
+CREATE TABLE cnts (id INT NOT NULL PRIMARY KEY, s VARCHAR(2000) NOT NULL)
+    ENGINE={h.engine};
+INSERT INTO cnts VALUES (1, '');
+CREATE TABLE cntsc (id INT NOT NULL PRIMARY KEY, s VARCHAR(2000) NOT NULL,
+                    pid INT, FOREIGN KEY (pid) REFERENCES cntp(id))
+    ENGINE={h.engine};
+INSERT INTO cntsc VALUES (1, '', 1);
 """)
     import threading
-    for label, sql, table in [
+    # A VARCHAR's trailing spaces are its value (only a CHAR's padding is
+    # not): appending one is a change the check sees
+    for label, sql, check in [
             ("ORDER BY / LIMIT",
-             "UPDATE cnt SET v = v + 1 WHERE id = 1 ORDER BY id LIMIT 1", "cnt"),
-            ("IGNORE", "UPDATE IGNORE cnt SET v = v + 1 WHERE id = 2", "cnt"),
+             "UPDATE cnt SET v = v + 1 WHERE id = 1 ORDER BY id LIMIT 1",
+             "SELECT v FROM cnt WHERE id = 1"),
+            ("IGNORE", "UPDATE IGNORE cnt SET v = v + 1 WHERE id = 2",
+             "SELECT v FROM cnt WHERE id = 2"),
             ("a table a FOREIGN KEY names (through SQL)",
              "UPDATE cntc SET v = v + 1 WHERE id = 1 ORDER BY id LIMIT 1",
-             "cntc")]:
+             "SELECT v FROM cntc WHERE id = 1"),
+            ("a VARCHAR's trailing spaces",
+             "UPDATE cnts SET s = CONCAT(s, ' ') WHERE id = 1 "
+             "ORDER BY id LIMIT 1", "SELECT LENGTH(s) FROM cnts"),
+            ("a VARCHAR's trailing spaces through SQL",
+             "UPDATE cntsc SET s = CONCAT(s, ' ') WHERE id = 1 "
+             "ORDER BY id LIMIT 1", "SELECT LENGTH(s) FROM cntsc")]:
         changed = []
         lock = threading.Lock()
 
@@ -148,9 +165,7 @@ INSERT INTO cntc VALUES (1, 0, 1);
             t.start()
         for t in threads:
             t.join()
-        row = 2 if "IGNORE" in label else 1
-        h.assert_scalar(f"{label}: every reported change kept",
-                        f"SELECT v FROM {table} WHERE id = {row}",
+        h.assert_scalar(f"{label}: every reported change kept", check,
                         str(sum(changed)))
 
     # A row-pump UPDATE that moves a row to a new primary key deletes and

@@ -23,9 +23,12 @@ use stoolap::storage::traits::Table;
 use super::read::table_name;
 use super::types::StoolapDB;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
-use crate::record::{read_value, read_values, same_in, EncodeFn, RecordIn, StoolapField};
+use crate::record::{
+    read_value, read_values, same_in, EncodeFn, RecordIn, StoolapField, STOOLAP_FIELD_CHAR,
+};
 use crate::session::Session;
-use crate::{sql_write, write};
+use crate::sql_write;
+use crate::write::{self, ReadCheck};
 
 /// Runs `direct` on `table`'s write handle, or `sql` when a foreign key
 /// names the table or the row is named `by_key`, storing the count in
@@ -371,6 +374,7 @@ pub unsafe extern "C" fn stoolap_update_record(
         Err(_) => return STOOLAP_ERROR,
     };
     let read_columns: Vec<usize> = read.iter().map(|f| f.column as usize).collect();
+    let pad: Vec<bool> = read.iter().map(|f| f.kind == STOOLAP_FIELD_CHAR).collect();
     write_through(
         db,
         table,
@@ -387,8 +391,11 @@ pub unsafe extern "C" fn stoolap_update_record(
                 row_id,
                 &set,
                 values,
-                &read_columns,
-                &was,
+                &ReadCheck {
+                    columns: &read_columns,
+                    values: &was,
+                    pad: &pad,
+                },
             )
         },
         |session, name| {
@@ -397,7 +404,7 @@ pub unsafe extern "C" fn stoolap_update_record(
             let was = named(session, name, read, &old)?;
             let columns: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
             let check = (has_row_id != 0).then_some((row_id, columns.as_slice()));
-            sql_write::update(session, name, set, key, was, check)
+            sql_write::update(session, name, set, key, was, &pad, check)
         },
     )
 }
@@ -433,17 +440,26 @@ pub unsafe extern "C" fn stoolap_delete_record(
         Err(_) => return STOOLAP_ERROR,
     };
     let read_columns: Vec<usize> = read.iter().map(|f| f.column as usize).collect();
+    let pad: Vec<bool> = read.iter().map(|f| f.kind == STOOLAP_FIELD_CHAR).collect();
     write_through(
         db,
         table,
         affected,
         "stoolap_delete_record",
         has_row_id == 0,
-        |t| write::delete(t, row_id, &read_columns, &read_values(read, &src)?),
+        |t| {
+            let was = read_values(read, &src)?;
+            let check = ReadCheck {
+                columns: &read_columns,
+                values: &was,
+                pad: &pad,
+            };
+            write::delete(t, row_id, &check)
+        },
         |session, name| {
             let key = named(session, name, field_slice(keys, nkeys)?, &src)?;
             let was = named(session, name, read, &src)?;
-            sql_write::delete(session, name, key, was)
+            sql_write::delete(session, name, key, was, &pad)
         },
     )
 }

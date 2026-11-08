@@ -30,6 +30,9 @@ pub const STOOLAP_FIELD_FLOAT: i32 = 3;
 /// A utf8mb4 VARCHAR: a `length`-byte (1 or 2) length prefix, then the
 /// bytes; a value of at most `max_chars` bytes always fits
 pub const STOOLAP_FIELD_VARCHAR: i32 = 4;
+/// A CHAR, handed to the store callback as STORE is; its padding is no
+/// part of its value (a write's check compares it without trailing spaces)
+pub const STOOLAP_FIELD_CHAR: i32 = 5;
 
 /// One field a read fills
 #[repr(C)]

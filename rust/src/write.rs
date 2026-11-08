@@ -51,18 +51,47 @@ pub fn insert(
     Ok(n)
 }
 
-/// Sets `columns` of row `row_id` to `values`; 0 when the row is gone
-/// Sets `columns` to `values` in row `row_id`, which must still hold
-/// `read` in `read_columns` (`check_unchanged`): checked on the version the
-/// write replaces, which stoolap's own conflict check then holds to commit
+/// What a write's statement read of its row: `values` in `columns`, a CHAR
+/// (`pad`) without its padding. The row must still hold them when written:
+/// another transaction may have committed a change since, which the values
+/// MariaDB computed from the old ones would write over (MariaDB's own
+/// engines lock the row before they read it).
+pub struct ReadCheck<'a> {
+    pub columns: &'a [usize],
+    pub values: &'a [Value],
+    pub pad: &'a [bool],
+}
+
+impl ReadCheck<'_> {
+    /// Whether `row` no longer holds what was read
+    fn changed(&self, row: &Row) -> bool {
+        self.columns
+            .iter()
+            .zip(self.values)
+            .zip(self.pad)
+            .any(|((&c, v), &pad)| {
+                row.get(c).is_none_or(|now| match (now, v) {
+                    // MariaDB encodes a CHAR with or without its padding,
+                    // as the session's sql_mode says (PAD_CHAR_TO_FULL_LENGTH)
+                    (Value::Text(a), Value::Text(b)) if pad => {
+                        a.as_str().trim_end_matches(' ') != b.as_str().trim_end_matches(' ')
+                    }
+                    _ => now != v,
+                })
+            })
+    }
+}
+
+/// Sets `columns` to `values` in row `row_id`, which must still hold what
+/// `read` says: checked on the version the write replaces, which stoolap's
+/// own conflict check then holds to commit
 pub fn update(
     table: &mut dyn Table,
     table_columns: usize,
     row_id: i64,
     columns: &[usize],
     values: Vec<Value>,
-    read_columns: &[usize],
-    read: &[Value],
+    read: &ReadCheck,
 ) -> Result<i64> {
     check_columns(table, table_columns)?;
     if columns.len() != values.len() || columns.iter().any(|&c| c >= table_columns) {
@@ -84,7 +113,7 @@ pub fn update(
             check_unique(table, row_id, &row, columns)?;
         }
         let mut set = |mut row: Row| -> Result<(Row, bool)> {
-            if changed_since(&row, read_columns, read) {
+            if read.changed(&row) {
                 return Err(conflict(row_id));
             }
             for (&c, v) in columns.iter().zip(&values) {
@@ -97,7 +126,7 @@ pub fn update(
 
     // An INTEGER primary key is the row id: the row moves to its new id,
     // from the version held as read
-    let Some(old) = hold_unchanged(table, row_id, read_columns, read)? else {
+    let Some(old) = hold_unchanged(table, row_id, read)? else {
         return Ok(0);
     };
     let mut row = old.clone();
@@ -165,25 +194,15 @@ pub(crate) fn check_update(
     check_unique(table, row_id, &row, columns)
 }
 
-/// Refuses to write row `row_id` when its `columns` no longer hold `read`,
-/// the values MariaDB read them with: another transaction committed a
-/// change since, which the values MariaDB computed from the old ones would
-/// write over (MariaDB's own engines lock the row before it reads). Fails
-/// as stoolap's own conflict check does, which MariaDB reports as 1213.
 /// Holds row `row_id` as read for the write that follows (a delete, or a
 /// primary key's move): writes it unchanged, checking in the setter that
-/// it still holds `read` in `columns`, so the version checked is the one
+/// it still holds what was `read`, so the version checked is the one
 /// stoolap's conflict check holds to commit and no commit lands between
 /// the check and the write. The row as held, or None when it is gone.
-fn hold_unchanged(
-    table: &mut dyn Table,
-    row_id: i64,
-    columns: &[usize],
-    read: &[Value],
-) -> Result<Option<Row>> {
+fn hold_unchanged(table: &mut dyn Table, row_id: i64, read: &ReadCheck) -> Result<Option<Row>> {
     let mut held = None;
     let mut hold = |row: Row| -> Result<(Row, bool)> {
-        if changed_since(&row, columns, read) {
+        if read.changed(&row) {
             return Err(conflict(row_id));
         }
         held = Some(row.clone());
@@ -191,21 +210,6 @@ fn hold_unchanged(
     };
     table.update_by_row_ids(&[row_id], &mut hold)?;
     Ok(held)
-}
-
-/// Whether `row` no longer holds `read` in `columns`
-/// Text compares without its trailing spaces: MariaDB encodes a CHAR with
-/// or without its padding, as the session's sql_mode says
-/// (PAD_CHAR_TO_FULL_LENGTH), for the value stored and for the value read.
-fn changed_since(row: &Row, columns: &[usize], read: &[Value]) -> bool {
-    columns.iter().zip(read).any(|(&c, v)| {
-        row.get(c).is_none_or(|now| match (now, v) {
-            (Value::Text(a), Value::Text(b)) => {
-                a.as_str().trim_end_matches(' ') != b.as_str().trim_end_matches(' ')
-            }
-            _ => now != v,
-        })
-    })
 }
 
 /// The error stoolap's own conflict check fails a write with
@@ -216,16 +220,10 @@ fn conflict(row_id: i64) -> Error {
     ))
 }
 
-/// Deletes row `row_id`; 0 when it is gone
 /// Deletes row `row_id`, held first as read (`hold_unchanged`) when the
-/// statement read `columns`; 0 when it is gone
-pub fn delete(
-    table: &mut dyn Table,
-    row_id: i64,
-    columns: &[usize],
-    read: &[Value],
-) -> Result<i64> {
-    if !columns.is_empty() && hold_unchanged(table, row_id, columns, read)?.is_none() {
+/// statement read any column; 0 when it is gone
+pub fn delete(table: &mut dyn Table, row_id: i64, read: &ReadCheck) -> Result<i64> {
+    if !read.columns.is_empty() && hold_unchanged(table, row_id, read)?.is_none() {
         return Ok(0);
     }
     Ok(table.delete_by_row_ids(&[row_id])? as i64)
