@@ -48,7 +48,10 @@ fn key_clause(key: &[(String, Value)], first: usize) -> Result<String> {
 
 /// Inserts `rows`, each a value per column. Each row's UNIQUE keys are
 /// looked up first, as a direct insert's are: in a transaction stoolap
-/// may check them only at commit, and MariaDB wants the row's own error
+/// may check them only at commit, and MariaDB wants the row's own error.
+/// The rows are checked in one batch; when that finds a conflict, row by
+/// row, so the statement fails with the first failing row's error (an
+/// earlier row's missing parent before a later row's duplicate).
 pub fn insert(session: &Session, table: &str, rows: Vec<Vec<Value>>) -> Result<i64> {
     let Some(width) = rows.first().map(Vec::len) else {
         return Ok(0);
@@ -56,9 +59,16 @@ pub fn insert(session: &Session, table: &str, rows: Vec<Vec<Value>>) -> Result<i
     let marks: Vec<String> = (1..=width).map(|i| format!("${}", i)).collect();
     let sql = format!("INSERT INTO {} VALUES ({})", quote(table), marks.join(","));
     let new: Vec<Row> = rows.iter().cloned().map(Row::from_values).collect();
-    session.with_table(table, |t| write::check_insert(t, &new))?;
+    let batch_ok = session
+        .with_table(table, |t| write::check_insert(t, &new))
+        .is_ok();
     let mut total = 0;
-    for row in rows {
+    for (row, checked) in rows.into_iter().zip(new) {
+        if !batch_ok {
+            session.with_table(table, |t| {
+                write::check_insert(t, std::slice::from_ref(&checked))
+            })?;
+        }
         total += session.run_write(&sql, params(row))?.rows_affected();
     }
     Ok(total)
