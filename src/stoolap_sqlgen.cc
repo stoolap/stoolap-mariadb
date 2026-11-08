@@ -1555,6 +1555,10 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             if (f->type() != Item::FIELD_ITEM) return fail("SET target");
             const Field* fl = static_cast<Item_field*>(f)->field;
             if (!fl || fl->table != t->table) return fail("SET target");
+            // MariaDB assigns a column twice in order; stoolap keeps the
+            // last assignment, dropping the first one's check
+            for (const Field* a : assigned_)
+                if (a == fl) return fail("column set twice");
             // MariaDB writes row by row, checking each row's keys against
             // the rows as they stand (u = u + 10 fails where the next row
             // holds the new value), and fails the statement; stoolap writes

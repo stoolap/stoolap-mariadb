@@ -952,6 +952,15 @@ INSERT INTO wmul VALUES (1, 1, 120, 'ab', 9007199254740993),
     h.assert_err("the first one names it",
                  "UPDATE wmul SET u = u - 100, n = n - 1 WHERE id = 1",
                  "1264.*'u'")
+    # A column set twice: MariaDB checks both in order (the row pump)
+    h.assert_err("a column set twice keeps its first check",
+                 "UPDATE wmul SET n = n + 300, n = id + 1 WHERE id = 1", "1264")
+    # Another overflow is not taken for a checked value's
+    h.exec_script("ALTER TABLE wmul ADD COLUMN x BIGINT DEFAULT 9223372036854775807, "
+                  "ADD COLUMN y BIGINT DEFAULT -9223372036854775808")
+    h.assert_err("an overflow of an unchecked value",
+                 "UPDATE wmul SET n = n + 1, x = x - y WHERE id = 1",
+                 "^(?!.*'n').*(1296|1690)")
     c = mysql.connector.connect(user="root", unix_socket=h.socket,
                                 database=h.db, autocommit=True)
     cur = c.cursor()

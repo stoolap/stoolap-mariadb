@@ -68,9 +68,13 @@ struct ModifyGuard {
         char* end = nullptr;
         const long operand = std::strtol(msg + n, &end, 10);
         if (end == msg + n || *end != '\0') return nullptr;
-        const long i = operand - kGuardOperand;
-        if (i < 0 || static_cast<size_t>(i) >= columns.size()) return nullptr;
-        return &columns[static_cast<size_t>(i)];
+        // Bounded before the subtraction: another overflow's operand may
+        // be any value (LONG_MIN for x - y at the limits)
+        if (operand < kGuardOperand) return nullptr;
+        const unsigned long i =
+            static_cast<unsigned long>(operand) - kGuardOperand;
+        if (i >= columns.size()) return nullptr;
+        return &columns[i];
     }
 };
 
