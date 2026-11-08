@@ -1555,6 +1555,10 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
             if (f->type() != Item::FIELD_ITEM) return fail("SET target");
             const Field* fl = static_cast<Item_field*>(f)->field;
             if (!fl || fl->table != t->table) return fail("SET target");
+            // MariaDB assigns a column twice in order; stoolap keeps the
+            // last assignment, dropping the first one's check
+            for (const Field* a : assigned_)
+                if (a == fl) return fail("column set twice");
             // MariaDB writes row by row, checking each row's keys against
             // the rows as they stand (u = u + 10 fails where the next row
             // holds the new value), and fails the statement; stoolap writes
@@ -1651,8 +1655,9 @@ bool int_range(const Field* f, longlong* lo, longlong* hi) {
 // integer into a float) or a NULL is written. A value out of the column
 // (300 into a TINYINT, 'abcdef' into a VARCHAR(3)) is an error in strict
 // mode: a literal is checked here, an expression in the statement, which
-// stoolap then fails with an integer overflow (guard_). Out of strict
-// mode MariaDB stores a clipped value with a warning: the row-pump.
+// stoolap then fails with an integer overflow (guard). Out of strict mode
+// MariaDB stores the value clipped to the column, with a warning: the
+// statement clips it too (the warning is not raised).
 bool Gen::assignment(Item* target, const Field* fl, Item* v,
                      std::string* stored) {
     // A parameter is a PARAM_ITEM only without a value: unbound, or a
@@ -1693,9 +1698,15 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
                 if (n < lo || n > hi) return fail("value out of range");
                 break;
             }
-            check = "CASE WHEN @ < " + std::to_string(lo) + " OR @ > " +
-                    std::to_string(hi) + " THEN ! ELSE @ END";
-            error = ER_WARN_DATA_OUT_OF_RANGE;
+            const std::string l = std::to_string(lo), h = std::to_string(hi);
+            if (strict) {
+                check = "CASE WHEN @ < " + l + " OR @ > " + h +
+                        " THEN ! ELSE @ END";
+                error = ER_WARN_DATA_OUT_OF_RANGE;
+            } else {
+                check = "CASE WHEN @ < " + l + " THEN " + l + " WHEN @ > " + h +
+                        " THEN " + h + " ELSE @ END";
+            }
             break;
         }
         case Cls::REAL:
@@ -1708,6 +1719,23 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
             if (!server_stores_zero_for_negative_zero())
                 return fail("DOUBLE target on a server keeping -0.0");
             real = true;
+            // A DOUBLE UNSIGNED refuses a negative value in strict mode
+            // (1264), as an integer column its range: a literal is checked
+            // here, an expression in the statement; outside strict mode
+            // MariaDB stores 0 for it (with a warning), as the statement
+            // does then
+            if (fl->is_unsigned()) {
+                if (literal_value) {
+                    if (v->val_real() < 0) return fail("negative literal");
+                    break;
+                }
+                if (strict) {
+                    check = "CASE WHEN @ < 0 THEN ! ELSE @ + 0.0 END";
+                    error = ER_WARN_DATA_OUT_OF_RANGE;
+                } else {
+                    check = "CASE WHEN @ < 0 THEN 0.0 ELSE @ + 0.0 END";
+                }
+            }
             break;
         case Cls::STR: {
             // utf8mb4 holds any stoolap TEXT; CHAR strips trailing spaces
@@ -1739,10 +1767,15 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
             std::string rest = "SUBSTR(@, " + n + " + 1)";
             for (const char* ws : {" ", "\t", "\n", "\v", "\f", "\r"})
                 rest = "REPLACE(" + rest + ", '" + ws + "', '')";
-            check = "CASE WHEN @ IS NULL OR CHAR_LENGTH(@) <= " + n +
-                    " THEN @ WHEN " + rest + " = '' THEN SUBSTR(@, 1, " + n +
-                    ") ELSE ! END";
-            error = ER_DATA_TOO_LONG;
+            if (strict) {
+                check = "CASE WHEN @ IS NULL OR CHAR_LENGTH(@) <= " + n +
+                        " THEN @ WHEN " + rest + " = '' THEN SUBSTR(@, 1, " +
+                        n + ") ELSE ! END";
+                error = ER_DATA_TOO_LONG;
+            } else {
+                check = "CASE WHEN CHAR_LENGTH(@) <= " + n +
+                        " THEN @ ELSE SUBSTR(@, 1, " + n + ") END";
+            }
             break;
         }
         default: {
@@ -1759,37 +1792,54 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
     }
     const size_t at = out.size();
     if (check.empty()) {
-        if (!expr(v)) return false;
+        if (real && literal_value && v->cmp_type() == DECIMAL_RESULT) {
+            // A DOUBLE stores a decimal literal as its double, whatever its
+            // digits (a client's float, 61231.04612887165, has 16 or 17):
+            // written as that double, stoolap stores the same. literal()
+            // refuses past 15 digits for comparisons, which MariaDB may
+            // make in DECIMAL.
+            const double d = v->val_real();
+            if (!std::isfinite(d)) return fail("non-finite literal");
+            char buf[40];
+            std::snprintf(buf, sizeof(buf), "%.17g", d);
+            out += buf;
+            if (!std::strpbrk(buf, ".eE")) out += ".0";
+        } else if (!expr(v)) {
+            return false;
+        }
         // A DOUBLE stores -0.0 as 0.0 (so it is no change from 0.0 either):
         // adding 0.0 does that (server_stores_zero_for_negative_zero)
         if (real) out += " + 0.0";
         *stored = "(" + out.substr(at) + ")";
         return true;
     }
-    if (!strict) return fail("value may not fit, outside strict mode");
-    if (guard.error) return fail("two checked SET values");
     if (!expr(v)) return false;
     const std::string e = "(" + out.substr(at) + ")";
     out.resize(at);
-    // Stoolap evaluates the overflow only for a row that reaches it. What
-    // the column stores is the same CASE with the value for the overflow,
-    // which for a range is the value itself.
+    // Stoolap evaluates the overflow only for a row that reaches it, this
+    // column's own (ModifyGuard). What the column stores is the same CASE
+    // with the value for the overflow, which for a range is the value
+    // itself (as a DOUBLE stores it).
+    const std::string overflow =
+        "9223372036854775807 + " +
+        std::to_string(kGuardOperand + static_cast<long>(guard.columns.size()));
     const bool range = error == ER_WARN_DATA_OUT_OF_RANGE;
-    if (range) *stored = e;
+    if (range) *stored = real ? "(" + e + " + 0.0)" : e;
     for (const char c : check) {
         if (c == '@') {
             out += e;
             if (!range) *stored += e;
         } else if (c == '!') {
-            out += kGuardOverflow;
+            out += overflow;
             if (!range) *stored += e;
         } else {
             out.push_back(c);
             if (!range) stored->push_back(c);
         }
     }
-    guard.column.assign(fl->field_name.str, fl->field_name.length);
-    guard.error = error;
+    if (error)
+        guard.columns.push_back(
+            {std::string(fl->field_name.str, fl->field_name.length), error});
     return true;
 }
 

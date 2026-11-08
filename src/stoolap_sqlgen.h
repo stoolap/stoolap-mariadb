@@ -10,7 +10,10 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <cstring>
 #include <string>
+#include <vector>
 
 class THD;
 class Item;
@@ -39,18 +42,40 @@ bool gen_unit(THD* thd, st_select_lex_unit* unit, std::string* out,
 // stoolap fails the statement with an integer overflow for a row whose
 // value does not fit `column`, which MariaDB reports as `error`
 // (ER_WARN_DATA_OUT_OF_RANGE or ER_DATA_TOO_LONG).
-// The overflow a ModifyGuard check fails the statement with, and stoolap's
-// whole message for it: told by the message as a whole, since a user's
-// value may hold its words (a duplicate key names the value), and by
-// operands no other overflow is likely to have.
-inline constexpr const char* kGuardOverflow = "9223372036854775807 + 4242";
-inline constexpr const char* kGuardOverflowError =
+// The SET values gen_modify wrapped in a range or length check, each a
+// column with the error MariaDB reports for it (ER_WARN_DATA_OUT_OF_RANGE
+// or ER_DATA_TOO_LONG). For a row whose value does not fit, stoolap fails
+// the statement with an integer overflow, 9223372036854775807 plus
+// kGuardOperand + i for the i-th column. It is told by stoolap's whole
+// message, since a user's value may hold its words (a duplicate key names
+// the value), and by operands no other overflow is likely to have.
+inline constexpr long kGuardOperand = 4242;
+inline constexpr const char* kGuardOverflowPrefix =
     "type error: Integer overflow in arithmetic operation: "
-    "9223372036854775807 and 4242";
+    "9223372036854775807 and ";
 
 struct ModifyGuard {
-    std::string column;
-    unsigned error = 0;
+    struct Column {
+        std::string name;
+        unsigned error;
+    };
+    std::vector<Column> columns;
+
+    // The checked column stoolap's error `msg` is the overflow of, or null
+    const Column* overflowed(const char* msg) const {
+        const size_t n = std::strlen(kGuardOverflowPrefix);
+        if (std::strncmp(msg, kGuardOverflowPrefix, n) != 0) return nullptr;
+        char* end = nullptr;
+        const long operand = std::strtol(msg + n, &end, 10);
+        if (end == msg + n || *end != '\0') return nullptr;
+        // Bounded before the subtraction: another overflow's operand may
+        // be any value (LONG_MIN for x - y at the limits)
+        if (operand < kGuardOperand) return nullptr;
+        const unsigned long i =
+            static_cast<unsigned long>(operand) - kGuardOperand;
+        if (i >= columns.size()) return nullptr;
+        return &columns[i];
+    }
 };
 
 // The rows an UPDATE that writes only the rows it changes finds, which

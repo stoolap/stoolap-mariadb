@@ -905,6 +905,79 @@ INSERT INTO wdup VALUES (1, 'Integer overflow'), (2, 'Integer ');
                  "UPDATE wdup SET s = CONCAT(s, 'overflow') WHERE id = 2",
                  "1062")
 
+    h.section("Direct UPDATE writes a client's float into a DOUBLE")
+    # A float parameter comes as a decimal literal of 16 or 17 digits; a
+    # DOUBLE stores it as its double, which the statement writes as such
+    h.exec_script(f"""
+CREATE TABLE wdbl (id INT PRIMARY KEY, v DOUBLE, u DOUBLE UNSIGNED) ENGINE={h.engine};
+INSERT INTO wdbl VALUES (1, 1, 1), (2, 2, 2);
+""")
+    before = _direct_hits(h)
+    h.assert_ok("a 17-digit float", "UPDATE wdbl SET v = 61231.04612887165 WHERE id = 1")
+    h.assert_eq("runs direct", 1, _direct_hits(h) - before)
+    h.assert_scalar("stored as MariaDB stores it",
+                    "SELECT v = 61231.04612887165 FROM wdbl WHERE id = 1", "1")
+    # DOUBLE UNSIGNED: a negative literal goes to the row pump (1264); an
+    # expression stays direct, checked in the statement
+    h.assert_err("a negative literal into DOUBLE UNSIGNED",
+                 "UPDATE wdbl SET u = -61231.04612887165 "
+                 "WHERE id BETWEEN 2 AND 2", "1264")
+    h.assert_ok("an increment of DOUBLE UNSIGNED",
+                "UPDATE wdbl SET u = u + 1 WHERE id BETWEEN 2 AND 2")
+    h.assert_ok("a positive literal", "UPDATE wdbl SET u = 7.5 WHERE id BETWEEN 1 AND 1")
+    h.assert_eq("those run direct", 3, _direct_hits(h) - before)
+    h.assert_err("an expression below zero",
+                 "UPDATE wdbl SET u = u - 100 WHERE id BETWEEN 2 AND 2", "1264")
+    h.assert_scalar("the values", "SELECT GROUP_CONCAT(u ORDER BY id) FROM wdbl",
+                    "7.5,3")
+
+    h.section("Direct UPDATE checks several SET values, and clips outside strict mode")
+    # Each checked value fails with its own overflow, which names the
+    # column; outside strict mode MariaDB clips the value to its column,
+    # and so does the statement. All of them stay direct, where a
+    # concurrent update fails with 1213 rather than being written over.
+    h.exec_script(f"""
+CREATE TABLE wmul (id INT PRIMARY KEY, u DOUBLE UNSIGNED, n TINYINT,
+                   s VARCHAR(4) COLLATE utf8mb4_bin, b BIGINT) ENGINE={h.engine};
+INSERT INTO wmul VALUES (1, 1, 120, 'ab', 9007199254740993),
+                        (2, 9007199254740992, -120, 'abcd', 9007199254740993);
+""")
+    before = _direct_hits(h)
+    h.assert_ok("three checked values", "UPDATE wmul SET u = u + 1, n = n + 1, "
+                "s = CONCAT(s, 'x') WHERE id = 1")
+    h.assert_eq("run direct", 1, _direct_hits(h) - before)
+    h.assert_err("the second one past its range names it",
+                 "UPDATE wmul SET u = u + 1, n = n + 10 WHERE id = 1",
+                 "1264.*'n'")
+    h.assert_err("the first one names it",
+                 "UPDATE wmul SET u = u - 100, n = n - 1 WHERE id = 1",
+                 "1264.*'u'")
+    # A column set twice: MariaDB checks both in order (the row pump)
+    h.assert_err("a column set twice keeps its first check",
+                 "UPDATE wmul SET n = n + 300, n = id + 1 WHERE id = 1", "1264")
+    # Another overflow is not taken for a checked value's
+    h.exec_script("ALTER TABLE wmul ADD COLUMN x BIGINT DEFAULT 9223372036854775807, "
+                  "ADD COLUMN y BIGINT DEFAULT -9223372036854775808")
+    h.assert_err("an overflow of an unchecked value",
+                 "UPDATE wmul SET n = n + 1, x = x - y WHERE id = 1",
+                 "^(?!.*'n').*(1296|1690)")
+    c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=True)
+    cur = c.cursor()
+    cur.execute("UPDATE wmul SET u = b WHERE id = 2")
+    h.assert_eq("a BIGINT into a DOUBLE it rounds to is no change", 0,
+                cur.rowcount)
+    cur.execute("SET SESSION sql_mode = ''")
+    before = _direct_hits(h)
+    cur.execute("UPDATE wmul SET u = u - 100, n = n + 100, "
+                "s = CONCAT(s, 'yz') WHERE id = 1")
+    h.assert_eq("clipped outside strict mode, direct", 1,
+                _direct_hits(h) - before)
+    c.close()
+    h.assert_scalar("clipped values",
+                    "SELECT CONCAT_WS(':', u, n, s) FROM wmul WHERE id = 1",
+                    "0:127:abxy")
+
     h.section("Direct UPDATE counts the rows it changes")
     # MariaDB reports the rows a SET changes, or with CLIENT_FOUND_ROWS
     # the rows it finds; a row left as it was is not written.

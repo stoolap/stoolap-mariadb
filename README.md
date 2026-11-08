@@ -159,7 +159,9 @@ transaction. It keeps what MariaDB does around each row:
   condition found (a client with `CLIENT_FOUND_ROWS` gets those as its
   affected rows).
 - **Strict mode.** A value too large or too long for its column fails
-  with 1264 / 1406, as MariaDB's would, and NULL into NOT NULL with 1048.
+  with 1264 / 1406 naming the column, as MariaDB's would, and NULL into
+  NOT NULL with 1048. Outside strict mode the value is clipped to the
+  column, as MariaDB stores it (without MariaDB's warning).
 
 What it cannot do the same way stays on MariaDB's row-by-row path (the
 row pump), which applies MariaDB's own rules: a table with CHECK
@@ -167,8 +169,8 @@ constraints or `ON UPDATE CURRENT_TIMESTAMP` columns, an UPDATE of a
 PRIMARY KEY or UNIQUE column (MariaDB checks each row's keys as it
 writes it, and fails the statement, not the COMMIT), a value that needs
 conversion to its column's type, a target MariaDB rounds or checks
-specially (FLOAT, `DOUBLE(M,D)`, YEAR, CHAR, dates and times), any value
-that may not fit outside strict mode, a SET value reading a column the
+specially (FLOAT, `DOUBLE(M,D)`, YEAR, CHAR, dates and times), a SET
+value reading a column the
 same SET assigned before it (MariaDB reads the new value, Stoolap the old
 row), `DELETE IGNORE`, ORDER BY / LIMIT, multi-table statements, triggers
 and row-based binary logging.
@@ -301,6 +303,13 @@ Also:
   Affected rows are exact.
 - **A strict-mode range or length error** from a direct UPDATE names row
   1, since the failing row is not known.
+- **An UPDATE on the row pump can lose a concurrent update.** MariaDB
+  reads the row, computes the new values and hands them to the handler;
+  a commit in between is written over (`SET v = v + 1` from several
+  sessions can lose increments). Direct UPDATEs are not affected: a
+  conflict there fails with 1213. The row pump runs UPDATEs with ORDER BY
+  / LIMIT, IGNORE, multi-table UPDATEs and those the generator cannot
+  translate.
 - **Tables a FOREIGN KEY names** are written through SQL, so Stoolap's
   executor checks the keys: slower than the direct write path.
 - **`ALTER TABLE` on `file://` storage** loses the table's rows at the
@@ -437,27 +446,31 @@ To add a regression for a difference from InnoDB, add a scenario there.
 `benchmarks/bench.py` runs the same workload on STOOLAP and InnoDB under
 one server (10K rows; the shapes of Stoolap's own
 `examples/benchmark.rs`). One run on an Apple M5, MariaDB 11.4.13,
-in-memory DSN, Stoolap won 41 operations and InnoDB 1. Some of them:
+in-memory DSN: Stoolap won 43 operations and InnoDB 1, the rest tied.
+Some of them:
 
 | Operation | STOOLAP | InnoDB | Ratio |
 | --- | ---: | ---: | ---: |
-| Nested subquery (3 levels) | 148 us | 8907 us | 60x |
-| Compare with subquery | 128 us | 3818 us | 30x |
-| Window ROW_NUMBER (PK) | 64 us | 1589 us | 25x |
-| NOT IN subquery | 141 us | 3122 us | 22x |
-| UNION ALL | 68 us | 1185 us | 17x |
-| INNER JOIN | 105 us | 1006 us | 9.6x |
-| Aggregation (GROUP BY) | 154 us | 1030 us | 6.7x |
-| Batch INSERT (100 rows) | 288 us | 513 us | 1.8x |
-| INSERT single | 16 us | 23 us | 1.4x |
-| UPDATE by ID | 20 us | 21 us | 1.1x |
-| SELECT by ID | 27 us | 25 us | 0.95x |
+| Nested subquery (3 levels) | 145 us | 9106 us | 63x |
+| Compare with subquery | 128 us | 3702 us | 29x |
+| Window ROW_NUMBER (PK) | 65 us | 1601 us | 25x |
+| NOT IN subquery | 142 us | 3131 us | 22x |
+| UNION ALL | 69 us | 1174 us | 17x |
+| INNER JOIN | 106 us | 995 us | 9.4x |
+| Aggregation (GROUP BY) | 152 us | 1015 us | 6.7x |
+| UPDATE complex (a range) | 137 us | 337 us | 2.5x |
+| Batch INSERT (100 rows) | 290 us | 508 us | 1.8x |
+| INSERT single | 16 us | 20 us | 1.25x |
+| DELETE by ID | 17 us | 19 us | 1.1x |
+| SELECT by ID | 23 us | 23 us | 0.99x |
+| UPDATE by ID | 27 us | 20 us | 0.74x |
 
 Analytical shapes (joins, subqueries, window functions, aggregates) are
 where Stoolap's executor pulls ahead. Point lookups and writes are close
 to InnoDB: there MariaDB's own per-statement work dominates. InnoDB's one
-win is "UPDATE complex" (a range UPDATE of a random float balance,
-458 us against 308 us). See
+win is UPDATE by ID, a direct UPDATE whose statement Stoolap parses and
+plans for one row; the row pump would be faster there but can lose a
+concurrent update (see [Known differences](#known-differences)). See
 `benchmarks/README.md` for the full dashboard and its baseline check.
 
 ## Licensing
