@@ -103,3 +103,52 @@ DROP TABLE concddl_{i};
         "SELECT COUNT(*) FROM information_schema.tables "
         f"WHERE table_schema = '{h.db}' AND table_name LIKE 'concddl_%'")
     h.assert_eq("no orphan tables after concurrent DDL", "0", out)
+
+    h.section("Concurrent row-pump UPDATEs do not write over each other")
+    # The row pump writes the values MariaDB computed from the row it read;
+    # the handler checks the row still holds what was read, and a commit
+    # in between fails the statement with 1213 (as a direct UPDATE's
+    # conflict does) instead of being written over. Every reported change
+    # must be in the final value.
+    h.exec_script(f"""
+CREATE TABLE cnt (id INT NOT NULL PRIMARY KEY, v INT NOT NULL) ENGINE={h.engine};
+INSERT INTO cnt VALUES (1, 0), (2, 0);
+CREATE TABLE cntp (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+INSERT INTO cntp VALUES (1);
+CREATE TABLE cntc (id INT NOT NULL PRIMARY KEY, v INT NOT NULL, pid INT,
+                   FOREIGN KEY (pid) REFERENCES cntp(id)) ENGINE={h.engine};
+INSERT INTO cntc VALUES (1, 0, 1);
+""")
+    import threading
+    for label, sql, table in [
+            ("ORDER BY / LIMIT",
+             "UPDATE cnt SET v = v + 1 WHERE id = 1 ORDER BY id LIMIT 1", "cnt"),
+            ("IGNORE", "UPDATE IGNORE cnt SET v = v + 1 WHERE id = 2", "cnt"),
+            ("a table a FOREIGN KEY names (through SQL)",
+             "UPDATE cntc SET v = v + 1 WHERE id = 1 ORDER BY id LIMIT 1",
+             "cntc")]:
+        changed = []
+        lock = threading.Lock()
+
+        def work():
+            c, cur = h.open_session()
+            n = 0
+            for _ in range(400):
+                try:
+                    cur.execute(sql)
+                    n += cur.rowcount
+                except Exception:  # 1213: retried by a real client
+                    pass
+            c.close()
+            with lock:
+                changed.append(n)
+
+        threads = [threading.Thread(target=work) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        row = 2 if "IGNORE" in label else 1
+        h.assert_scalar(f"{label}: every reported change kept",
+                        f"SELECT v FROM {table} WHERE id = {row}",
+                        str(sum(changed)))

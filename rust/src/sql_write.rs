@@ -46,6 +46,24 @@ fn key_clause(key: &[(String, Value)], first: usize) -> Result<String> {
         .join(" AND "))
 }
 
+/// `AND col IS NOT DISTINCT FROM $n ...` over `read`, numbering from
+/// `first`: the row must still hold what MariaDB read
+fn unchanged_clause(read: &[(String, Value)], first: usize) -> String {
+    read.iter()
+        .enumerate()
+        .map(|(i, (name, _))| format!(" AND {} IS NOT DISTINCT FROM ${}", quote(name), first + i))
+        .collect()
+}
+
+/// A write that found its row no longer as MariaDB read it, or gone: the
+/// conflict stoolap's own check reports, which MariaDB reports as 1213
+fn changed_row(table: &str) -> Error {
+    Error::internal(format!(
+        "write conflict: a row of '{}' was modified by another transaction",
+        table
+    ))
+}
+
 /// Inserts `rows`, each a value per column. Each row's UNIQUE keys are
 /// looked up first, as a direct insert's are: in a transaction stoolap
 /// may check them only at commit, and MariaDB wants the row's own error.
@@ -77,11 +95,14 @@ pub fn insert(session: &Session, table: &str, rows: Vec<Vec<Value>>) -> Result<i
 /// Sets `set` in the row `key` names. The row's new UNIQUE keys are looked
 /// up first when its `row_id` is known (`check`: the columns `set` names,
 /// by position), as `insert`'s are
+/// `read` holds what MariaDB read of the row: the statement writes it
+/// only if it still holds that, checked in the same statement as the write
 pub fn update(
     session: &Session,
     table: &str,
     set: Vec<(String, Value)>,
     key: Vec<(String, Value)>,
+    read: Vec<(String, Value)>,
     check: Option<(i64, &[usize])>,
 ) -> Result<i64> {
     if let Some((row_id, columns)) = check {
@@ -94,23 +115,41 @@ pub fn update(
         .map(|(i, (name, _))| format!("{} = ${}", quote(name), i + 1))
         .collect();
     let sql = format!(
-        "UPDATE {} SET {} WHERE {}",
+        "UPDATE {} SET {} WHERE {}{}",
         quote(table),
         assign.join(", "),
-        key_clause(&key, set.len() + 1)?
+        key_clause(&key, set.len() + 1)?,
+        unchanged_clause(&read, set.len() + key.len() + 1)
     );
-    let values = set.into_iter().chain(key).map(|(_, v)| v);
-    Ok(session.run_write(&sql, params(values))?.rows_affected())
+    let checked = !read.is_empty();
+    let values = set.into_iter().chain(key).chain(read).map(|(_, v)| v);
+    let n = session.run_write(&sql, params(values))?.rows_affected();
+    if n == 0 && checked {
+        return Err(changed_row(table));
+    }
+    Ok(n)
 }
 
 /// Deletes the row `key` names
-pub fn delete(session: &Session, table: &str, key: Vec<(String, Value)>) -> Result<i64> {
+/// Deletes the row `key` names, if it still holds `read`, as `update`
+pub fn delete(
+    session: &Session,
+    table: &str,
+    key: Vec<(String, Value)>,
+    read: Vec<(String, Value)>,
+) -> Result<i64> {
     let sql = format!(
-        "DELETE FROM {} WHERE {}",
+        "DELETE FROM {} WHERE {}{}",
         quote(table),
-        key_clause(&key, 1)?
+        key_clause(&key, 1)?,
+        unchanged_clause(&read, key.len() + 1)
     );
-    Ok(session
-        .run_write(&sql, params(key.into_iter().map(|(_, v)| v)))?
-        .rows_affected())
+    let checked = !read.is_empty();
+    let n = session
+        .run_write(&sql, params(key.into_iter().chain(read).map(|(_, v)| v)))?
+        .rows_affected();
+    if n == 0 && checked {
+        return Err(changed_row(table));
+    }
+    Ok(n)
 }

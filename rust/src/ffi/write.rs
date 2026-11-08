@@ -334,6 +334,8 @@ pub unsafe extern "C" fn stoolap_update_record(
     nfields: i32,
     keys: *const StoolapField,
     nkeys: i32,
+    read: *const StoolapField,
+    nread: i32,
     old_record: *const u8,
     new_record: *const u8,
     encode: Option<EncodeFn>,
@@ -364,6 +366,11 @@ pub unsafe extern "C" fn stoolap_update_record(
         encode,
         ctx,
     };
+    let read = match field_slice(read, nread) {
+        Ok(fields) => fields,
+        Err(_) => return STOOLAP_ERROR,
+    };
+    let read_columns: Vec<usize> = read.iter().map(|f| f.column as usize).collect();
     write_through(
         db,
         table,
@@ -373,14 +380,24 @@ pub unsafe extern "C" fn stoolap_update_record(
         |t| {
             let set: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
             let values = read_values(&changed, &new)?;
-            write::update(t, columns(table_columns)?, row_id, &set, values)
+            let was = read_values(read, &old)?;
+            write::update(
+                t,
+                columns(table_columns)?,
+                row_id,
+                &set,
+                values,
+                &read_columns,
+                &was,
+            )
         },
         |session, name| {
             let set = named(session, name, &changed, &new)?;
             let key = named(session, name, field_slice(keys, nkeys)?, &old)?;
+            let was = named(session, name, read, &old)?;
             let columns: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
             let check = (has_row_id != 0).then_some((row_id, columns.as_slice()));
-            sql_write::update(session, name, set, key, check)
+            sql_write::update(session, name, set, key, was, check)
         },
     )
 }
@@ -399,6 +416,8 @@ pub unsafe extern "C" fn stoolap_delete_record(
     has_row_id: i32,
     keys: *const StoolapField,
     nkeys: i32,
+    read: *const StoolapField,
+    nread: i32,
     record: *const u8,
     encode: Option<EncodeFn>,
     ctx: *mut c_void,
@@ -409,16 +428,25 @@ pub unsafe extern "C" fn stoolap_delete_record(
         encode,
         ctx,
     };
+    let read = match field_slice(read, nread) {
+        Ok(fields) => fields,
+        Err(_) => return STOOLAP_ERROR,
+    };
+    let read_columns: Vec<usize> = read.iter().map(|f| f.column as usize).collect();
     write_through(
         db,
         table,
         affected,
         "stoolap_delete_record",
         has_row_id == 0,
-        |t| write::delete(t, row_id),
+        |t| {
+            write::check_unchanged(t, row_id, &read_columns, &read_values(read, &src)?)?;
+            write::delete(t, row_id)
+        },
         |session, name| {
             let key = named(session, name, field_slice(keys, nkeys)?, &src)?;
-            sql_write::delete(session, name, key)
+            let was = named(session, name, read, &src)?;
+            sql_write::delete(session, name, key, was)
         },
     )
 }

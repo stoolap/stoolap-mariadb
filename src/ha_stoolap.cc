@@ -1185,6 +1185,23 @@ const std::vector<StoolapField>& ha_stoolap::refresh_update_fields() {
     return update_fields_;
 }
 
+const std::vector<StoolapField>& ha_stoolap::refresh_checked_fields() {
+    const uint fields = table->s->fields;
+    std::vector<uint32_t>& w = proj_words_scratch_;
+    w.assign((fields + 31) / 32, 0);
+    for (uint i = 0; i < fields; ++i)
+        if (bitmap_is_set(table->read_set, i))
+            w[i / 32] |= uint32_t(1) << (i % 32);
+    if (w == checked_words_ && !checked_fields_.empty()) return checked_fields_;
+    checked_fields_.clear();
+    for (uint i = 0; i < fields; ++i)
+        if (w[i / 32] & (uint32_t(1) << (i % 32)))
+            checked_fields_.push_back(stoolap_mariadb::record_field(
+                table, i, static_cast<int32_t>(i)));
+    checked_words_ = w;
+    return checked_fields_;
+}
+
 // The PRIMARY KEY parts, which name a row a write has no row id for.
 const std::vector<StoolapField>& ha_stoolap::key_fields() {
     if (!key_fields_built_) {
@@ -1234,6 +1251,7 @@ int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
     const auto& fields = refresh_update_fields();
     if (fields.empty()) return 0;
     const auto& keys = key_fields();
+    const auto& read = refresh_checked_fields();
     StoolapDB* db = direct_write_db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
     RecordSource src(table);
@@ -1242,7 +1260,8 @@ int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
         db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
         cur_row_id_, cur_row_id_valid_, fields.data(),
         static_cast<int32_t>(fields.size()), keys.data(),
-        static_cast<int32_t>(keys.size()), old_data, new_data, &encode_cell,
+        static_cast<int32_t>(keys.size()), read.data(),
+        static_cast<int32_t>(read.size()), old_data, new_data, &encode_cell,
         &src, &affected);
     if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "UPDATE");
     return affected == 0 ? HA_ERR_RECORD_DELETED : 0;
@@ -1254,13 +1273,15 @@ int ha_stoolap::delete_row(const uchar* buf) {
     if (stoolap_table_.empty()) return HA_ERR_INTERNAL_ERROR;
     if (!cur_row_id_valid_) cur_row_id_valid_ = key_row_id(buf, &cur_row_id_);
     const auto& keys = key_fields();
+    const auto& read = refresh_checked_fields();
     StoolapDB* db = direct_write_db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
     RecordSource src(table);
     int64_t affected = 0;
     const int rc = stoolap_delete_record(
         db, stoolap_table_.c_str(), cur_row_id_, cur_row_id_valid_, keys.data(),
-        static_cast<int32_t>(keys.size()), buf, &encode_cell, &src, &affected);
+        static_cast<int32_t>(keys.size()), read.data(),
+        static_cast<int32_t>(read.size()), buf, &encode_cell, &src, &affected);
     if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "DELETE");
     if (affected == 0) return HA_ERR_RECORD_DELETED;
     apply_count_delta(-affected);

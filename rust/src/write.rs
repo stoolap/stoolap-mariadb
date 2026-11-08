@@ -52,12 +52,17 @@ pub fn insert(
 }
 
 /// Sets `columns` of row `row_id` to `values`; 0 when the row is gone
+/// Sets `columns` to `values` in row `row_id`, which must still hold
+/// `read` in `read_columns` (`check_unchanged`): checked on the version the
+/// write replaces, which stoolap's own conflict check then holds to commit
 pub fn update(
     table: &mut dyn Table,
     table_columns: usize,
     row_id: i64,
     columns: &[usize],
     values: Vec<Value>,
+    read_columns: &[usize],
+    read: &[Value],
 ) -> Result<i64> {
     check_columns(table, table_columns)?;
     if columns.len() != values.len() || columns.iter().any(|&c| c >= table_columns) {
@@ -79,6 +84,9 @@ pub fn update(
             check_unique(table, row_id, &row, columns)?;
         }
         let mut set = |mut row: Row| -> Result<(Row, bool)> {
+            if changed_since(&row, read_columns, read) {
+                return Err(conflict(row_id));
+            }
             for (&c, v) in columns.iter().zip(&values) {
                 row.set(c, v.clone())?;
             }
@@ -95,6 +103,9 @@ pub fn update(
     else {
         return Ok(0);
     };
+    if changed_since(&old, read_columns, read) {
+        return Err(conflict(row_id));
+    }
     let mut row = old.clone();
     for (&c, v) in columns.iter().zip(values) {
         row.set(c, v)?;
@@ -158,6 +169,49 @@ pub(crate) fn check_update(
         row.set(c, v.clone())?;
     }
     check_unique(table, row_id, &row, columns)
+}
+
+/// Refuses to write row `row_id` when its `columns` no longer hold `read`,
+/// the values MariaDB read them with: another transaction committed a
+/// change since, which the values MariaDB computed from the old ones would
+/// write over (MariaDB's own engines lock the row before it reads). Fails
+/// as stoolap's own conflict check does, which MariaDB reports as 1213.
+pub(crate) fn check_unchanged(
+    table: &dyn Table,
+    row_id: i64,
+    columns: &[usize],
+    read: &[Value],
+) -> Result<()> {
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let Some((_, row)) = table
+        .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr())?
+        .into_iter()
+        .next()
+    else {
+        return Ok(()); // gone: the write reports no row
+    };
+    if changed_since(&row, columns, read) {
+        return Err(conflict(row_id));
+    }
+    Ok(())
+}
+
+/// Whether `row` no longer holds `read` in `columns`
+fn changed_since(row: &Row, columns: &[usize], read: &[Value]) -> bool {
+    columns
+        .iter()
+        .zip(read)
+        .any(|(&c, v)| row.get(c).is_none_or(|now| now != v))
+}
+
+/// The error stoolap's own conflict check fails a write with
+fn conflict(row_id: i64) -> Error {
+    Error::internal(format!(
+        "write conflict: row {} was modified by another transaction",
+        row_id
+    ))
 }
 
 /// Deletes row `row_id`; 0 when it is gone
