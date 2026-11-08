@@ -292,6 +292,10 @@ the list stays current.
 - **On a table a FOREIGN KEY names that has no primary key**, the row
   pump cannot name a row: an UPDATE with ORDER BY / LIMIT fails (1296),
   and an UPDATE of a UNIQUE column is checked as a set.
+- **A primary key UPDATE whose row a FOREIGN KEY with ON UPDATE CASCADE
+  or SET NULL names** (with rows that name it) is refused (1296): the
+  plugin moves the row itself, and leaves the cascade to Stoolap's
+  UPDATE ([stoolap#952](https://github.com/stoolap/stoolap/issues/952)).
 - **`HA_READ_PREFIX_LAST`** (MAX with a prefix bound) is not supported.
 - **`LOCK TABLES` with `autocommit = 0`** runs the statements after
   COMMIT in autocommit.
@@ -308,6 +312,11 @@ Also:
   1, since the failing row is not known.
 - **Tables a FOREIGN KEY names** are written through SQL, so Stoolap's
   executor checks the keys: slower than the direct write path.
+- **A FOREIGN KEY under concurrent writes**: a child INSERT does not see a
+  parent DELETE another transaction has not committed yet, and both
+  commit, leaving the child without its parent (InnoDB makes the INSERT
+  wait on the parent's lock)
+  ([stoolap#953](https://github.com/stoolap/stoolap/issues/953)).
 - **`ALTER TABLE` on `file://` storage** loses the table's rows at the
   next restart when the table was already on disk (after a restart or a
   checkpoint): Stoolap replays the ALTER's renames wrongly

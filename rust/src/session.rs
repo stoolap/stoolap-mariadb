@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use rustc_hash::FxHashMap;
 
 use stoolap::api::{Database, ParamVec};
-use stoolap::core::{Error, IsolationLevel, Result, Row};
+use stoolap::core::{Error, ForeignKeyConstraint, IsolationLevel, Result, Row};
 use stoolap::executor::{CachedPlanRef, ExecutionContext, Executor};
 use stoolap::parser::ast::{RollbackStatement, Statement};
 use stoolap::storage::mvcc::registry::StatementView;
@@ -77,6 +77,19 @@ impl Session {
                     fk.referenced_column.clone(),
                 )
             })
+            .collect()
+    }
+
+    /// The foreign keys of other tables that name `parent`, each with its
+    /// table
+    pub fn referencing_keys(&self, parent: &str) -> Vec<(String, ForeignKeyConstraint)> {
+        let parent = parent.to_lowercase();
+        self.exec
+            .engine()
+            .find_referencing_fks(&parent)
+            .iter()
+            .filter(|(child, _)| *child != parent)
+            .cloned()
             .collect()
     }
 
@@ -267,6 +280,40 @@ impl Session {
         self.with_handle(&self.write_tables, table, false, f)
     }
 
+    /// Runs `f` under a savepoint of the transaction the statement writes
+    /// in, so that, failed, it leaves nothing written: one row of a
+    /// statement whose error MariaDB may skip (IGNORE)
+    pub fn atomically<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        self.with_tx(|tx| tx.create_savepoint(ROW_SAVEPOINT))?;
+        let result = f();
+        let end = self.with_tx(|tx| {
+            if result.is_err() {
+                tx.rollback_to_savepoint(ROW_SAVEPOINT)?;
+            }
+            tx.release_savepoint(ROW_SAVEPOINT)
+        });
+        let r = result?;
+        end.map(|()| r)
+    }
+
+    /// Runs `f` on the open transaction, or else the statement's own
+    fn with_tx(&self, f: impl FnOnce(&mut dyn Transaction) -> Result<()>) -> Result<()> {
+        if self.in_transaction() {
+            let mut tx = self
+                .exec
+                .take_transaction()
+                .ok_or(Error::TransactionEnded)?;
+            let result = f(tx.as_mut());
+            self.exec.install_transaction(tx);
+            return result;
+        }
+        let mut stmt_tx = lock(&self.stmt_tx);
+        if stmt_tx.is_none() {
+            *stmt_tx = Some(self.exec.begin_transaction()?);
+        }
+        f(stmt_tx.as_deref_mut().expect("begun above"))
+    }
+
     /// Whether a foreign key names `table` (as child or parent): its
     /// writes go through SQL, where the executor checks the keys
     pub fn writes_through_sql(&self, table: &str) -> Result<bool> {
@@ -416,6 +463,9 @@ impl Drop for Session {
 /// The savepoint a statement writing in an open transaction takes; a
 /// user's savepoint has a name MariaDB makes up per connection, never this
 const STMT_SAVEPOINT: &str = "__stoolap_mariadb_statement";
+
+/// The savepoint `Session::atomically` takes
+const ROW_SAVEPOINT: &str = "__stoolap_mariadb_row";
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())

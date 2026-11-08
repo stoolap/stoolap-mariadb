@@ -9,7 +9,6 @@ UPDATE c SET pid = 99 WHERE id = 10;
 -- parent side: row still referenced, direct and row-pump
 DELETE FROM p WHERE id = 2;
 DELETE FROM p WHERE id = 2 LIMIT 1;
--- known-diff: stoolap refuses UPDATE of a single-column PRIMARY KEY (see pk_update.sql)
 UPDATE p SET id = 20 WHERE id = 2;
 DELETE FROM p WHERE id = 3;
 SELECT id FROM p ORDER BY id;
