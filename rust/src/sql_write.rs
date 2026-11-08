@@ -8,14 +8,15 @@
 
 //! Writes through SQL, for a table a foreign key names (stoolap's executor
 //! checks the keys) and for a row the handler names by its primary key
-//! rather than its row id. They run as the plugin's SQL always has: in the
-//! open transaction, or else autocommit; a multi-row insert outside one
-//! runs in a transaction of its own, so it lands whole or not at all.
+//! rather than its row id. They run in the open transaction, or else in the
+//! statement's own (`Session::run_write`), so a statement lands whole or
+//! not at all.
 
 use stoolap::api::ParamVec;
-use stoolap::core::{Error, Result, Value};
+use stoolap::core::{Error, Result, Row, Value};
 
 use crate::session::Session;
+use crate::write;
 
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -45,43 +46,48 @@ fn key_clause(key: &[(String, Value)], first: usize) -> Result<String> {
         .join(" AND "))
 }
 
-/// Inserts `rows`, each a value per column
+/// Inserts `rows`, each a value per column. Each row's UNIQUE keys are
+/// looked up first, as a direct insert's are: in a transaction stoolap
+/// may check them only at commit, and MariaDB wants the row's own error.
+/// The rows are checked in one batch; when that finds a conflict, row by
+/// row, so the statement fails with the first failing row's error (an
+/// earlier row's missing parent before a later row's duplicate).
 pub fn insert(session: &Session, table: &str, rows: Vec<Vec<Value>>) -> Result<i64> {
     let Some(width) = rows.first().map(Vec::len) else {
         return Ok(0);
     };
     let marks: Vec<String> = (1..=width).map(|i| format!("${}", i)).collect();
     let sql = format!("INSERT INTO {} VALUES ({})", quote(table), marks.join(","));
-    if rows.len() == 1 || session.in_transaction() {
-        let mut total = 0;
-        for row in rows {
-            total += session.run(&sql, params(row))?.rows_affected();
-        }
-        return Ok(total);
-    }
-    let plan = session.prepare(&sql)?;
-    session.begin(session.isolation_level())?;
+    let new: Vec<Row> = rows.iter().cloned().map(Row::from_values).collect();
+    let batch_ok = session
+        .with_table(table, |t| write::check_insert(t, &new))
+        .is_ok();
     let mut total = 0;
-    for row in rows {
-        match session.run_plan(&plan, params(row)) {
-            Ok(r) => total += r.rows_affected(),
-            Err(e) => {
-                let _ = session.rollback();
-                return Err(e);
-            }
+    for (row, checked) in rows.into_iter().zip(new) {
+        if !batch_ok {
+            session.with_table(table, |t| {
+                write::check_insert(t, std::slice::from_ref(&checked))
+            })?;
         }
+        total += session.run_write(&sql, params(row))?.rows_affected();
     }
-    session.commit()?;
     Ok(total)
 }
 
-/// Sets `set` in the row `key` names
+/// Sets `set` in the row `key` names. The row's new UNIQUE keys are looked
+/// up first when its `row_id` is known (`check`: the columns `set` names,
+/// by position), as `insert`'s are
 pub fn update(
     session: &Session,
     table: &str,
     set: Vec<(String, Value)>,
     key: Vec<(String, Value)>,
+    check: Option<(i64, &[usize])>,
 ) -> Result<i64> {
+    if let Some((row_id, columns)) = check {
+        let values: Vec<Value> = set.iter().map(|(_, v)| v.clone()).collect();
+        session.with_table(table, |t| write::check_update(t, row_id, columns, &values))?;
+    }
     let assign: Vec<String> = set
         .iter()
         .enumerate()
@@ -94,7 +100,7 @@ pub fn update(
         key_clause(&key, set.len() + 1)?
     );
     let values = set.into_iter().chain(key).map(|(_, v)| v);
-    Ok(session.run(&sql, params(values))?.rows_affected())
+    Ok(session.run_write(&sql, params(values))?.rows_affected())
 }
 
 /// Deletes the row `key` names
@@ -105,6 +111,6 @@ pub fn delete(session: &Session, table: &str, key: Vec<(String, Value)>) -> Resu
         key_clause(&key, 1)?
     );
     Ok(session
-        .run(&sql, params(key.into_iter().map(|(_, v)| v)))?
+        .run_write(&sql, params(key.into_iter().map(|(_, v)| v)))?
         .rows_affected())
 }

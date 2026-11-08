@@ -113,6 +113,53 @@ pub fn update(
     Ok(1)
 }
 
+/// Refuses `rows`, new rows of `table`, when a UNIQUE index holds one's
+/// key, as `insert` does; a write through SQL, whose UNIQUE check may wait
+/// for commit, asks first
+pub(crate) fn check_insert(table: &dyn Table, rows: &[Row]) -> Result<()> {
+    if !table.has_unique_non_pk_indexes() {
+        return Ok(());
+    }
+    if let [row] = rows {
+        let all: Vec<usize> = (0..table.schema().columns.len()).collect();
+        return check_unique(table, NO_ROW, row, &all);
+    }
+    check_unique_batch(table, rows)
+}
+
+/// Refuses setting `columns` to `values` in row `row_id` when a UNIQUE
+/// index would then hold its key for another row, as `check_insert`
+pub(crate) fn check_update(
+    table: &dyn Table,
+    row_id: i64,
+    columns: &[usize],
+    values: &[Value],
+) -> Result<()> {
+    // Only a UNIQUE index over a changed column can conflict
+    let schema = table.schema();
+    let touched = table.get_unique_indexes().iter().any(|(_, names)| {
+        names.iter().any(|n| {
+            schema
+                .get_column_index(n)
+                .is_some_and(|i| columns.contains(&i))
+        })
+    });
+    if !touched {
+        return Ok(());
+    }
+    let Some((_, mut row)) = table
+        .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr())?
+        .into_iter()
+        .next()
+    else {
+        return Ok(());
+    };
+    for (&c, v) in columns.iter().zip(values) {
+        row.set(c, v.clone())?;
+    }
+    check_unique(table, row_id, &row, columns)
+}
+
 /// Deletes row `row_id`; 0 when it is gone
 pub fn delete(table: &mut dyn Table, row_id: i64) -> Result<i64> {
     Ok(table.delete_by_row_ids(&[row_id])? as i64)

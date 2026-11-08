@@ -163,7 +163,9 @@ transaction. It keeps what MariaDB does around each row:
 
 What it cannot do the same way stays on MariaDB's row-by-row path (the
 row pump), which applies MariaDB's own rules: a table with CHECK
-constraints or `ON UPDATE CURRENT_TIMESTAMP` columns, a value that needs
+constraints or `ON UPDATE CURRENT_TIMESTAMP` columns, an UPDATE of a
+PRIMARY KEY or UNIQUE column (MariaDB checks each row's keys as it
+writes it, and fails the statement, not the COMMIT), a value that needs
 conversion to its column's type, a target MariaDB rounds or checks
 specially (FLOAT, `DOUBLE(M,D)`, YEAR, CHAR, dates and times), any value
 that may not fit outside strict mode, a SET value reading a column the
@@ -244,6 +246,7 @@ Tables created by an older build of the plugin must be re-created.
 | Feature | Status |
 | --- | --- |
 | `BEGIN` / `COMMIT` / `ROLLBACK`, autocommit | Yes |
+| A failed statement inside a transaction | Undone as a whole; the transaction goes on |
 | `READ COMMITTED` | Yes (`READ UNCOMMITTED` runs as READ COMMITTED; Stoolap is MVCC) |
 | `REPEATABLE READ`, `SERIALIZABLE` | Yes (a Stoolap snapshot transaction) |
 | `START TRANSACTION WITH CONSISTENT SNAPSHOT` | Yes |
@@ -278,11 +281,12 @@ the list stays current.
 - **AUTO_INCREMENT** is recomputed from `MAX(col) + 1` after DDL;
   `ALTER TABLE ... AUTO_INCREMENT = N` is ignored; deleted top ids are
   reused and an explicit value moves the counter.
-- **A failed multi-row INSERT** keeps the rows written before the
-  failing one (no statement rollback).
 - **`utf8mb4_bin` UNIQUE** ignores PAD SPACE (`'a'` and `'a '` are both
   accepted).
 - **A FOREIGN KEY to an indexed non-unique column** is refused.
+- **On a table a FOREIGN KEY names that has no primary key**, the row
+  pump cannot name a row: an UPDATE with ORDER BY / LIMIT fails (1296),
+  and an UPDATE of a UNIQUE column is checked as a set.
 - **`HA_READ_PREFIX_LAST`** (MAX with a prefix bound) is not supported.
 - **`LOCK TABLES` with `autocommit = 0`** runs the statements after
   COMMIT in autocommit.
