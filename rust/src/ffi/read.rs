@@ -185,9 +185,12 @@ pub unsafe extern "C" fn stoolap_read(
                     }
             })
         };
-        let (nulls_at, nulls) = match (range(true), range(false)) {
-            (Some(l), Some(u)) => (u, null_parts(parts, &bounds[l], &bounds[u], src_of)?),
-            _ => (usize::MAX, 0),
+        let (nulls_at, nulls) = match range(false) {
+            Some(u) => {
+                let lower = range(true).map(|l| &bounds[l]);
+                (u, null_parts(parts, lower, &bounds[u], src_of)?)
+            }
+            None => (usize::MAX, 0),
         };
         let mut conds = Vec::new();
         for (i, bound) in bounds.iter().enumerate() {

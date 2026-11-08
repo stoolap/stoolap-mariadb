@@ -11,6 +11,10 @@ INSERT INTO kb VALUES (1, NULL, 1, 0, 'abc', 1.50), (2, 1, NULL, 5, 'ABC', -2.00
   (5, 2, 3, 100, NULL, 0.00), (6, 3, 3, 7, 'b', 1.50);
 -- Each read joins a one-row InnoDB table first, so the handler reads kb
 -- by its key rather than pushdown taking the whole statement.
+-- A NOT NULL first part: MariaDB gives `a <= 1` no lower bound
+CREATE TABLE kn (id INT NOT NULL PRIMARY KEY, a INT NOT NULL, b INT,
+                 KEY kab (a, b)) ENGINE={E};
+INSERT INTO kn VALUES (1, 0, 5), (2, 1, NULL), (3, 1, 1), (4, 1, 4), (5, 2, NULL);
 CREATE TABLE o (x INT) ENGINE=InnoDB;
 INSERT INTO o VALUES (1);
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ka) WHERE kb.a <=> NULL ORDER BY kb.id;
@@ -24,6 +28,8 @@ SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (kab) WHERE kb.a = 1 AND (
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (kab) WHERE kb.a = 2 AND (kb.b IS NULL OR kb.b < 3) ORDER BY kb.id;
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (kab) WHERE kb.a BETWEEN 0 AND 1 AND (kb.b IS NULL OR kb.b < 3) ORDER BY kb.id;
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (kab) WHERE kb.a BETWEEN 1 AND 2 AND (kb.b IS NULL OR kb.b <= 1) ORDER BY kb.a DESC, kb.id;
+SELECT STRAIGHT_JOIN kn.id FROM o JOIN kn FORCE INDEX (kab) WHERE kn.a <= 1 AND (kn.b IS NULL OR kn.b < 3) ORDER BY kn.id;
+SELECT STRAIGHT_JOIN kn.id FROM o JOIN kn FORCE INDEX (kab) WHERE kn.a < 2 AND (kn.b IS NULL OR kn.b <= 4) ORDER BY kn.a DESC, kn.id;
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ka) WHERE kb.a < 2 ORDER BY kb.id;
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ka) WHERE kb.a > 1 ORDER BY kb.a DESC, kb.id;
 SELECT STRAIGHT_JOIN kb.id FROM o JOIN kb FORCE INDEX (ku) WHERE kb.u = 18446744073709551615;

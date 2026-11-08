@@ -178,7 +178,9 @@ fn all(preds: Vec<Pred>) -> Option<(Vec<Node>, usize)> {
 /// The key parts (bit i) at which the range from `lower` to `upper` takes
 /// rows whose part is NULL below the upper bound's value: those whose
 /// lower bound, in MariaDB's index order (NULL first), is at or below the
-/// upper bound's leading values followed by NULL. A range's lower bound is
+/// upper bound's leading values followed by NULL. A range without one
+/// starts below every row (MariaDB leaves it out for a NOT NULL first part,
+/// `a <= 1`, and gives `a > NULL` for a nullable one). A range's lower bound is
 /// below its upper one, so once the two differ at a part, it is below any
 /// such row (values equal in a collation but not in their bytes only keep
 /// a few more rows, which the caller filters); while they agree, it takes
@@ -193,26 +195,32 @@ fn all(preds: Vec<Pred>) -> Option<(Vec<Node>, usize)> {
 /// describe.
 pub unsafe fn null_parts(
     parts: &[StoolapField],
-    lower: &StoolapKeyBound,
+    lower: Option<&StoolapKeyBound>,
     upper: &StoolapKeyBound,
     src_of: impl Fn(&StoolapKeyBound) -> RecordIn,
 ) -> Result<u32> {
-    let nl = (lower.nparts.max(0) as usize).min(parts.len());
     let nu = (upper.nparts.max(0) as usize).min(parts.len()).min(32);
-    let (l, u) = (src_of(lower), src_of(upper));
+    let u = src_of(upper);
+    let (nl, l, ge) = match lower {
+        Some(b) => (
+            (b.nparts.max(0) as usize).min(parts.len()),
+            Some(src_of(b)),
+            b.op == STOOLAP_OP_GE,
+        ),
+        None => (0, None, true),
+    };
     let mut mask = 0;
-    let mut below = false;
+    let mut below = lower.is_none();
     for (k, f) in parts[..nu].iter().enumerate() {
-        let lk = if k < nl {
-            Some(key_value(f, &l)?)
-        } else {
-            None
+        let lk = match &l {
+            Some(l) if k < nl => Some(key_value(f, l)?),
+            _ => None,
         };
         let uk = key_value(f, &u)?;
         let takes = below
             || match &lk {
-                None => lower.op == STOOLAP_OP_GE,
-                Some(KeyValue::Null) => lower.op == STOOLAP_OP_GE || nl > k + 1,
+                None => ge,
+                Some(KeyValue::Null) => ge || nl > k + 1,
                 Some(_) => false,
             };
         if takes && f.null_mask != 0 && matches!(uk, KeyValue::Value(_)) {
