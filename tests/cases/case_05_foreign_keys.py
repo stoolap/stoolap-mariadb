@@ -140,6 +140,31 @@ INSERT INTO odc VALUES (1, 10);
                 "DELETE FROM odp WHERE id = 1 AND k = 10 ORDER BY id LIMIT 1")
     h.assert_scalar("the child row cascaded", "SELECT COUNT(*) FROM odc", "0")
 
+    h.section("DROP DATABASE takes a chain of keys with rows")
+    # Stoolap refuses to drop a table whose rows another table's rows
+    # reference: each child goes first, down the chain
+    h.exec_script("DROP DATABASE IF EXISTS fk_chain", use_db=False, ignore_errors=True)
+    h.exec_script(f"""
+CREATE DATABASE fk_chain;
+CREATE TABLE fk_chain.a (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+CREATE TABLE fk_chain.b (id INT NOT NULL PRIMARY KEY, x INT,
+                         FOREIGN KEY (x) REFERENCES fk_chain.a (id)) ENGINE={h.engine};
+CREATE TABLE fk_chain.c (id INT NOT NULL PRIMARY KEY, x INT, y INT,
+                         FOREIGN KEY (x) REFERENCES fk_chain.b (id),
+                         FOREIGN KEY (y) REFERENCES fk_chain.a (id)) ENGINE={h.engine};
+CREATE TABLE fk_chain.d (id INT NOT NULL PRIMARY KEY, x INT,
+                         FOREIGN KEY (x) REFERENCES fk_chain.c (id)) ENGINE={h.engine};
+INSERT INTO fk_chain.a VALUES (1);
+INSERT INTO fk_chain.b VALUES (1, 1);
+INSERT INTO fk_chain.c VALUES (1, 1, 1);
+INSERT INTO fk_chain.d VALUES (1, 1);
+""", use_db=False)
+    h.assert_err("a referenced parent alone is still refused",
+                 "DROP TABLE fk_chain.b", "1451")
+    h.assert_ok("the database drops", "DROP DATABASE fk_chain")
+    h.assert_scalar("and is gone", "SELECT COUNT(*) FROM information_schema.schemata "
+                    "WHERE schema_name = 'fk_chain'", "0")
+
     # Every spelling of a parent the clause reader takes, and refuses
     # rather than drop or misname: an FK it cannot read would leave the
     # table without the key.
