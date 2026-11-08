@@ -347,7 +347,9 @@ StoolapCursor* stoolap_cursor_new(void);
 #define STOOLAP_FIELD_VARCHAR   4
 /**
  * A CHAR, handed to the store callback as STORE is; its padding is no
- * part of its value (a write's check compares it without trailing spaces)
+ * part of its value (a write's check compares it without it). `length`
+ * is 0 for text stored as it is, else the bytes of the character set's
+ * space, given big-endian in `max_chars`, for text stored as hex.
  */
 #define STOOLAP_FIELD_CHAR      5
 

@@ -52,14 +52,14 @@ pub fn insert(
 }
 
 /// What a write's statement read of its row: `values` in `columns`, a CHAR
-/// (`pad`) without its padding. The row must still hold them when written:
-/// another transaction may have committed a change since, which the values
-/// MariaDB computed from the old ones would write over (MariaDB's own
-/// engines lock the row before they read it).
+/// without its padding (`pad`, `record::pad_unit`). The row must still hold
+/// them when written: another transaction may have committed a change
+/// since, which the values MariaDB computed from the old ones would write
+/// over (MariaDB's own engines lock the row before they read it).
 pub struct ReadCheck<'a> {
     pub columns: &'a [usize],
     pub values: &'a [Value],
-    pub pad: &'a [bool],
+    pub pad: &'a [Option<&'static str>],
 }
 
 impl ReadCheck<'_> {
@@ -69,12 +69,12 @@ impl ReadCheck<'_> {
             .iter()
             .zip(self.values)
             .zip(self.pad)
-            .any(|((&c, v), &pad)| {
-                row.get(c).is_none_or(|now| match (now, v) {
+            .any(|((&c, v), pad)| {
+                row.get(c).is_none_or(|now| match (now, v, pad) {
                     // MariaDB encodes a CHAR with or without its padding,
                     // as the session's sql_mode says (PAD_CHAR_TO_FULL_LENGTH)
-                    (Value::Text(a), Value::Text(b)) if pad => {
-                        a.as_str().trim_end_matches(' ') != b.as_str().trim_end_matches(' ')
+                    (Value::Text(a), Value::Text(b), Some(unit)) => {
+                        a.as_str().trim_end_matches(unit) != b.as_str().trim_end_matches(unit)
                     }
                     _ => now != v,
                 })
@@ -199,7 +199,7 @@ pub(crate) fn check_update(
 /// it still holds what was `read`, so the version checked is the one
 /// stoolap's conflict check holds to commit and no commit lands between
 /// the check and the write. The row as held, or None when it is gone.
-fn hold_unchanged(table: &mut dyn Table, row_id: i64, read: &ReadCheck) -> Result<Option<Row>> {
+pub fn hold_unchanged(table: &mut dyn Table, row_id: i64, read: &ReadCheck) -> Result<Option<Row>> {
     let mut held = None;
     let mut hold = |row: Row| -> Result<(Row, bool)> {
         if read.changed(&row) {

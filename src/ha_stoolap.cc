@@ -1199,12 +1199,26 @@ const std::vector<StoolapField>& ha_stoolap::refresh_checked_fields() {
         StoolapField d =
             stoolap_mariadb::record_field(table, i, static_cast<int32_t>(i));
         // A CHAR is encoded with or without its padding, as sql_mode
-        // says, so the check compares it without trailing spaces
+        // says, so the check compares it without it: spaces, or for a
+        // character set stored as hex, the bytes of its space
         const Field* f = table->field[i];
         if (d.kind == STOOLAP_FIELD_STORE &&
             f->real_type() == MYSQL_TYPE_STRING &&
-            f->charset() != &my_charset_bin)
-            d.kind = STOOLAP_FIELD_CHAR;
+            f->charset() != &my_charset_bin) {
+            int n = 0;
+            uchar sp[4];
+            if (stoolap_mariadb::field_enc(f) == stoolap_mariadb::Enc::HEX) {
+                const CHARSET_INFO* cs = f->charset();
+                n = cs->cset->wc_mb(cs, ' ', sp, sp + sizeof(sp));
+            }
+            if (n >= 0) {
+                d.kind = STOOLAP_FIELD_CHAR;
+                d.length = static_cast<uint32_t>(n);
+                d.max_chars = 0;
+                for (int b = 0; b < n; ++b)
+                    d.max_chars = d.max_chars << 8 | sp[b];
+            }
+        }
         checked_fields_.push_back(d);
     }
     checked_words_ = w;

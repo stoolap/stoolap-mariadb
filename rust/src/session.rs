@@ -239,12 +239,7 @@ impl Session {
         f: impl FnOnce(&mut dyn Table) -> Result<R>,
     ) -> Result<Option<R>> {
         let engine = self.exec.engine();
-        if self.in_transaction() {
-            self.statement_writes()?;
-        } else {
-            self.stmt_wrote.store(true, Ordering::Relaxed);
-        }
-        self.with_handle(&self.write_tables, table, false, |t| {
+        self.with_any_write_table(table, |t| {
             if !t.schema().foreign_keys.is_empty()
                 || !engine
                     .find_referencing_fks(&t.name().to_lowercase())
@@ -255,6 +250,21 @@ impl Session {
                 f(t).map(Some)
             }
         })
+    }
+
+    /// Runs `f` on the write handle on `table`, whatever keys name it: for
+    /// a write that must not run the executor's key checks or actions
+    pub fn with_any_write_table<R>(
+        &self,
+        table: &str,
+        f: impl FnOnce(&mut dyn Table) -> Result<R>,
+    ) -> Result<R> {
+        if self.in_transaction() {
+            self.statement_writes()?;
+        } else {
+            self.stmt_wrote.store(true, Ordering::Relaxed);
+        }
+        self.with_handle(&self.write_tables, table, false, f)
     }
 
     /// Whether a foreign key names `table` (as child or parent): its

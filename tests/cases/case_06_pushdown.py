@@ -939,17 +939,23 @@ INSERT INTO wdbl VALUES (1, 1, 1), (2, 2, 2);
                                 database=h.db, autocommit=True)
     cur = c.cursor()
     cur.execute("SET SESSION sql_mode = ''")
-    cur.execute(f"CREATE TABLE wpad (id INT PRIMARY KEY, n INT, c CHAR(4)) "
+    # A character set other than utf8 is stored as hex, its padding the
+    # hex of its own space (latin1 20, ucs2 0020)
+    cur.execute(f"CREATE TABLE wpad (id INT PRIMARY KEY, n INT, c CHAR(4), "
+                f"l CHAR(4) CHARACTER SET latin1, u CHAR(4) CHARACTER SET ucs2) "
                 f"ENGINE={h.engine}")
-    cur.execute("INSERT INTO wpad VALUES (1, 0, 'a')")
+    cur.execute("INSERT INTO wpad VALUES (1, 0, 'a', 'a', 'a')")
+    cur.execute("SET SESSION sql_mode = 'PAD_CHAR_TO_FULL_LENGTH'")
+    cur.execute("INSERT INTO wpad VALUES (2, 0, 'a', 'a', 'a')")
     got = []
     for mode in ["PAD_CHAR_TO_FULL_LENGTH", ""]:
         cur.execute(f"SET SESSION sql_mode = '{mode}'")
-        cur.execute("UPDATE wpad SET n = n + 1 WHERE id = 1 AND c = 'a' "
-                    "ORDER BY id LIMIT 1")
-        got.append(cur.rowcount)
+        for row in [1, 2]:
+            cur.execute(f"UPDATE wpad SET n = n + 1 WHERE id = {row} AND "
+                        "c = 'a' AND l = 'a' AND u = 'a' ORDER BY id LIMIT 1")
+            got.append(cur.rowcount)
     c.close()
-    h.assert_eq("both modes update the row", [1, 1], got)
+    h.assert_eq("both modes update the rows", [1, 1, 1, 1], got)
 
     h.section("Direct UPDATE checks several SET values, and clips outside strict mode")
     # Each checked value fails with its own overflow, which names the

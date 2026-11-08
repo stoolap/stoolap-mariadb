@@ -212,3 +212,48 @@ INSERT INTO mv VALUES (1, 0);
     m.join()
     h.assert_scalar("a moved row keeps every reported increment",
                     "SELECT SUM(v) FROM mv", str(sum(incs)))
+
+    # A row-pump DELETE of a row a FOREIGN KEY names goes through SQL,
+    # which finds its rows before it deletes them: the row is held first,
+    # so a k committed meanwhile is not deleted under the old one's test
+    h.exec_script(f"""
+CREATE TABLE dk (id INT NOT NULL PRIMARY KEY, k INT NOT NULL UNIQUE)
+    ENGINE={h.engine};
+CREATE TABLE dkc (id INT NOT NULL PRIMARY KEY, pk INT,
+                  FOREIGN KEY (pk) REFERENCES dk(k) ON DELETE CASCADE)
+    ENGINE={h.engine};
+""")
+    odd = 0
+    for _ in range(200):
+        h.exec_script("DELETE FROM dk; INSERT INTO dk VALUES (1, 0);")
+        stop[0] = False
+        bumps = [0]
+
+        def bumper():
+            c, cur = h.open_session()
+            while not stop[0]:
+                try:
+                    cur.execute("UPDATE dk SET k = k + 1 WHERE id = 1")
+                    if cur.rowcount == 0:
+                        break
+                    bumps[0] += 1
+                except Exception:
+                    pass
+            c.close()
+
+        b = threading.Thread(target=bumper)
+        b.start()
+        c, cur = h.open_session()
+        while True:
+            try:
+                cur.execute("DELETE FROM dk WHERE id = 1 AND k % 2 = 0 "
+                            "ORDER BY id LIMIT 1")
+                if cur.rowcount == 1:
+                    break
+            except Exception:
+                pass
+        stop[0] = True
+        b.join()
+        c.close()
+        odd += bumps[0] % 2
+    h.assert_eq("a DELETE never takes a row past its test", 0, odd)
