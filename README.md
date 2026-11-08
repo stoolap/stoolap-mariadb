@@ -437,27 +437,28 @@ To add a regression for a difference from InnoDB, add a scenario there.
 `benchmarks/bench.py` runs the same workload on STOOLAP and InnoDB under
 one server (10K rows; the shapes of Stoolap's own
 `examples/benchmark.rs`). One run on an Apple M5, MariaDB 11.4.13,
-in-memory DSN, Stoolap won 41 operations and InnoDB 1. Some of them:
+in-memory DSN: Stoolap won 44 operations, InnoDB none, the rest tied.
+Some of them:
 
 | Operation | STOOLAP | InnoDB | Ratio |
 | --- | ---: | ---: | ---: |
-| Nested subquery (3 levels) | 148 us | 8907 us | 60x |
-| Compare with subquery | 128 us | 3818 us | 30x |
-| Window ROW_NUMBER (PK) | 64 us | 1589 us | 25x |
-| NOT IN subquery | 141 us | 3122 us | 22x |
-| UNION ALL | 68 us | 1185 us | 17x |
-| INNER JOIN | 105 us | 1006 us | 9.6x |
-| Aggregation (GROUP BY) | 154 us | 1030 us | 6.7x |
-| Batch INSERT (100 rows) | 288 us | 513 us | 1.8x |
+| Nested subquery (3 levels) | 137 us | 9365 us | 68x |
+| Compare with subquery | 127 us | 3916 us | 31x |
+| Window ROW_NUMBER (PK) | 65 us | 1593 us | 25x |
+| NOT IN subquery | 141 us | 3374 us | 24x |
+| UNION ALL | 70 us | 1179 us | 17x |
+| INNER JOIN | 102 us | 985 us | 9.6x |
+| Aggregation (GROUP BY) | 153 us | 1071 us | 7.0x |
+| UPDATE complex (a range) | 137 us | 329 us | 2.4x |
+| DELETE by ID | 14 us | 20 us | 1.45x |
 | INSERT single | 16 us | 23 us | 1.4x |
-| UPDATE by ID | 20 us | 21 us | 1.1x |
-| SELECT by ID | 27 us | 25 us | 0.95x |
+| Batch INSERT (100 rows) | 290 us | 403 us | 1.4x |
+| UPDATE by ID | 19 us | 21 us | 1.15x |
+| SELECT by ID | 26 us | 25 us | 0.94x |
 
 Analytical shapes (joins, subqueries, window functions, aggregates) are
 where Stoolap's executor pulls ahead. Point lookups and writes are close
-to InnoDB: there MariaDB's own per-statement work dominates. InnoDB's one
-win is "UPDATE complex" (a range UPDATE of a random float balance,
-458 us against 308 us). See
+to InnoDB: there MariaDB's own per-statement work dominates. See
 `benchmarks/README.md` for the full dashboard and its baseline check.
 
 ## Licensing

@@ -1529,6 +1529,11 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
     if (!t || t->next_local || t->derived || t->nested_join || !t->table ||
         !t->table->s)
         return fail("modified table");
+    // One row named by its primary key: the row pump reads and writes it
+    // by its key, about twice as fast as a statement stoolap parses and
+    // plans (a point UPDATE 12.5 us against 26 us, a DELETE 14 against 16)
+    if (where && pk_equality(where, t->table))
+        return fail("one row by its primary key");
     const std::string name = quote_ident(stoolap_table_name(t->table->s));
     alias_[t] = name;
     std::string changes;  // UPDATE: a row's SET changes it
@@ -1592,7 +1597,6 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
     if (!changes.empty()) {
         count.sql = "SELECT COUNT(*) FROM " + name;
         if (!cond_sql.empty()) count.sql += " WHERE " + cond_sql;
-        count.one_row = where && pk_equality(where, t->table);
     }
     if (!changes.empty() && !cond_sql.empty()) {
         // The condition first: stoolap reads an AND left to right (a SET
@@ -1759,7 +1763,21 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
     }
     const size_t at = out.size();
     if (check.empty()) {
-        if (!expr(v)) return false;
+        if (real && literal_value && v->cmp_type() == DECIMAL_RESULT) {
+            // A DOUBLE stores a decimal literal as its double, whatever its
+            // digits (a client's float, 61231.04612887165, has 16 or 17):
+            // written as that double, stoolap stores the same. literal()
+            // refuses past 15 digits for comparisons, which MariaDB may
+            // make in DECIMAL.
+            const double d = v->val_real();
+            if (!std::isfinite(d)) return fail("non-finite literal");
+            char buf[40];
+            std::snprintf(buf, sizeof(buf), "%.17g", d);
+            out += buf;
+            if (!std::strpbrk(buf, ".eE")) out += ".0";
+        } else if (!expr(v)) {
+            return false;
+        }
         // A DOUBLE stores -0.0 as 0.0 (so it is no change from 0.0 either):
         // adding 0.0 does that (server_stores_zero_for_negative_zero)
         if (real) out += " + 0.0";
