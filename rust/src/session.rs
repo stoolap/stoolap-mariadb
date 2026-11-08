@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use rustc_hash::FxHashMap;
 
 use stoolap::api::{Database, ParamVec};
-use stoolap::core::{Error, IsolationLevel, Result, Row};
+use stoolap::core::{Error, ForeignKeyConstraint, IsolationLevel, Result, Row};
 use stoolap::executor::{CachedPlanRef, ExecutionContext, Executor};
 use stoolap::parser::ast::{RollbackStatement, Statement};
 use stoolap::storage::mvcc::registry::StatementView;
@@ -77,6 +77,19 @@ impl Session {
                     fk.referenced_column.clone(),
                 )
             })
+            .collect()
+    }
+
+    /// The foreign keys of other tables that name `parent`, each with its
+    /// table
+    pub fn referencing_keys(&self, parent: &str) -> Vec<(String, ForeignKeyConstraint)> {
+        let parent = parent.to_lowercase();
+        self.exec
+            .engine()
+            .find_referencing_fks(&parent)
+            .iter()
+            .filter(|(child, _)| *child != parent)
+            .cloned()
             .collect()
     }
 

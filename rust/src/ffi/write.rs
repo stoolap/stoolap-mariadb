@@ -428,8 +428,34 @@ pub unsafe extern "C" fn stoolap_update_record(
                     return Ok(0);
                 }
             }
+            let keys = field_slice(keys, nkeys)?;
+            if let [pk] = keys {
+                if has_row_id != 0 && changed.iter().any(|f| f.column == pk.column) {
+                    // The primary key moves
+                    let rest: Vec<StoolapField> = changed
+                        .iter()
+                        .filter(|f| f.column != pk.column)
+                        .copied()
+                        .collect();
+                    let set = named(session, name, &rest, &new)?;
+                    let key = named(session, name, keys, &old)?.remove(0);
+                    let width = columns(table_columns)?;
+                    let set_columns: Vec<usize> = rest.iter().map(|f| f.column as usize).collect();
+                    return sql_write::move_key(
+                        session,
+                        name,
+                        width,
+                        row_id,
+                        pk.column as usize,
+                        key,
+                        read_value(pk, &new)?,
+                        set,
+                        Some(&set_columns),
+                    );
+                }
+            }
             let set = named(session, name, &changed, &new)?;
-            let key = named(session, name, field_slice(keys, nkeys)?, &old)?;
+            let key = named(session, name, keys, &old)?;
             let columns: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
             let check = (has_row_id != 0).then_some((row_id, columns.as_slice()));
             sql_write::update(session, name, set, key, check)

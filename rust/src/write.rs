@@ -295,6 +295,23 @@ fn check_unique_batch(table: &dyn Table, rows: &[Row]) -> Result<()> {
     Ok(())
 }
 
+/// Whether a row of `table` holds `value` in `column`
+pub fn holds(table: &dyn Table, column: &str, value: &Value) -> Result<bool> {
+    let mut filter = ComparisonExpr::new(column, Operator::Eq, value.clone());
+    filter.prepare_for_schema(table.schema());
+    let plan = table.index_plan(&filter);
+    let access = match &plan {
+        Some(p) => ScanAccess::Index(p),
+        None => ScanAccess::Seq,
+    };
+    let mut scanner = table.scan_access(access, &[], None, Some(&filter))?;
+    let found = scanner.next();
+    match scanner.err() {
+        Some(e) => Err(e.clone()),
+        None => Ok(found),
+    }
+}
+
 /// Refuses `row`, the new state of row `row_id`, when a UNIQUE index over
 /// one of the `changed` columns holds its key for another row
 fn check_unique(table: &dyn Table, row_id: i64, row: &Row, changed: &[usize]) -> Result<()> {
