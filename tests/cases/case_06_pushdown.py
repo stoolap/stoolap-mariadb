@@ -917,10 +917,19 @@ INSERT INTO wdbl VALUES (1, 1, 1), (2, 2, 2);
     h.assert_eq("runs direct", 1, _direct_hits(h) - before)
     h.assert_scalar("stored as MariaDB stores it",
                     "SELECT v = 61231.04612887165 FROM wdbl WHERE id = 1", "1")
-    h.assert_err("a negative value into DOUBLE UNSIGNED",
+    # DOUBLE UNSIGNED: a negative literal goes to the row pump (1264); an
+    # expression stays direct, checked in the statement
+    h.assert_err("a negative literal into DOUBLE UNSIGNED",
                  "UPDATE wdbl SET u = -61231.04612887165 "
                  "WHERE id BETWEEN 2 AND 2", "1264")
-    h.assert_eq("on the row pump", 1, _direct_hits(h) - before)
+    h.assert_ok("an increment of DOUBLE UNSIGNED",
+                "UPDATE wdbl SET u = u + 1 WHERE id BETWEEN 2 AND 2")
+    h.assert_ok("a positive literal", "UPDATE wdbl SET u = 7.5 WHERE id BETWEEN 1 AND 1")
+    h.assert_eq("those run direct", 3, _direct_hits(h) - before)
+    h.assert_err("an expression below zero",
+                 "UPDATE wdbl SET u = u - 100 WHERE id BETWEEN 2 AND 2", "1264")
+    h.assert_scalar("the values", "SELECT GROUP_CONCAT(u ORDER BY id) FROM wdbl",
+                    "7.5,3")
 
     h.section("Direct UPDATE counts the rows it changes")
     # MariaDB reports the rows a SET changes, or with CLIENT_FOUND_ROWS

@@ -1703,13 +1703,22 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
             if (fl->real_type() != MYSQL_TYPE_DOUBLE ||
                 fl->decimals() < NOT_FIXED_DEC)
                 return fail("rounding float target");
-            // MariaDB refuses or clips a negative value there
-            if (fl->is_unsigned()) return fail("DOUBLE UNSIGNED target");
             // Before 11.4.11 MariaDB keeps -0.0, and compares its bytes
             // to 0.0's: that one leaves a DOUBLE to the row-pump
             if (!server_stores_zero_for_negative_zero())
                 return fail("DOUBLE target on a server keeping -0.0");
             real = true;
+            // A DOUBLE UNSIGNED refuses a negative value in strict mode
+            // (1264), as an integer column its range: a literal is checked
+            // here, an expression in the statement
+            if (fl->is_unsigned()) {
+                if (literal_value) {
+                    if (v->val_real() < 0) return fail("negative literal");
+                    break;
+                }
+                check = "CASE WHEN @ < 0 THEN ! ELSE @ + 0.0 END";
+                error = ER_WARN_DATA_OUT_OF_RANGE;
+            }
             break;
         case Cls::STR: {
             // utf8mb4 holds any stoolap TEXT; CHAR strips trailing spaces
