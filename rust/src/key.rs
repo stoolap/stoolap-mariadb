@@ -101,12 +101,17 @@ enum Pred {
 }
 
 /// `f op v` in MariaDB's index order, where NULL sorts before every value
-/// and a value past INT64_MAX after every stored one. (Against a value, an
-/// upper bound leaves the NULLs out, as stoolap compares: a range whose
-/// lower bound keeps them loses them.)
-fn compare(f: &StoolapField, op: i32, v: KeyValue) -> Pred {
+/// and a value past INT64_MAX after every stored one. Against a value, an
+/// upper bound leaves the NULLs out, as stoolap compares, unless
+/// `keep_null`: the range's lower bound takes them (`null_parts`).
+fn compare(f: &StoolapField, op: i32, v: KeyValue, keep_null: bool) -> Pred {
     let upper = matches!(op, STOOLAP_OP_LT | STOOLAP_OP_LE);
     match v {
+        KeyValue::Value(v) if upper && keep_null && f.null_mask != 0 => Pred::Nodes(vec![
+            cond(f, cond_op(op), v),
+            cond(f, CondOp::IsNull, Value::null_unknown()),
+            Node::Or(2),
+        ]),
         KeyValue::Value(v) => Pred::Nodes(vec![cond(f, cond_op(op), v)]),
         KeyValue::Null => match op {
             STOOLAP_OP_EQ | STOOLAP_OP_LE => {
@@ -126,15 +131,22 @@ fn compare(f: &StoolapField, op: i32, v: KeyValue) -> Pred {
     }
 }
 
-/// Appends `compare(f, op, v)` to `out`; false when it is never true
-fn compare_into(f: &StoolapField, op: i32, v: KeyValue, out: &mut Vec<Node>) -> bool {
+/// Appends `compare(f, op, v, keep_null)` to `out`; false when it is
+/// never true
+fn compare_into(
+    f: &StoolapField,
+    op: i32,
+    v: KeyValue,
+    keep_null: bool,
+    out: &mut Vec<Node>,
+) -> bool {
     match v {
         // The usual case, without the Vec a Pred holds
-        KeyValue::Value(v) => {
+        KeyValue::Value(v) if !keep_null => {
             out.push(cond(f, cond_op(op), v));
             true
         }
-        v => match compare(f, op, v) {
+        v => match compare(f, op, v, keep_null) {
             Pred::False => false,
             Pred::True => true,
             Pred::Nodes(mut nodes) => {
@@ -163,8 +175,69 @@ fn all(preds: Vec<Pred>) -> Option<(Vec<Node>, usize)> {
     Some((nodes, n))
 }
 
+/// The key parts (bit i) at which the range from `lower` to `upper` takes
+/// rows whose part is NULL below the upper bound's value: those whose
+/// lower bound, in MariaDB's index order (NULL first), is at or below the
+/// upper bound's leading values followed by NULL. A range without one
+/// starts below every row (MariaDB leaves it out for a NOT NULL first part,
+/// `a <= 1`, and gives `a > NULL` for a nullable one). A range's lower bound is
+/// below its upper one, so once the two differ at a part, it is below any
+/// such row (values equal in a collation but not in their bytes only keep
+/// a few more rows, which the caller filters); while they agree, it takes
+/// the NULL that it holds itself (`>=`, or `>` with parts after it). The
+/// upper bound keeps those rows (`compare`); elsewhere it leaves them out,
+/// which keeps the index for the usual `a < 2` (whose lower bound is
+/// `a > NULL`).
+///
+/// # Safety
+///
+/// Both bounds' records must be record buffers of the layout `parts`
+/// describe.
+pub unsafe fn null_parts(
+    parts: &[StoolapField],
+    lower: Option<&StoolapKeyBound>,
+    upper: &StoolapKeyBound,
+    src_of: impl Fn(&StoolapKeyBound) -> RecordIn,
+) -> Result<u32> {
+    let nu = (upper.nparts.max(0) as usize).min(parts.len()).min(32);
+    let u = src_of(upper);
+    let (nl, l, ge) = match lower {
+        Some(b) => (
+            (b.nparts.max(0) as usize).min(parts.len()),
+            Some(src_of(b)),
+            b.op == STOOLAP_OP_GE,
+        ),
+        None => (0, None, true),
+    };
+    let mut mask = 0;
+    let mut below = lower.is_none();
+    for (k, f) in parts[..nu].iter().enumerate() {
+        let lk = match &l {
+            Some(l) if k < nl => Some(key_value(f, l)?),
+            _ => None,
+        };
+        let uk = key_value(f, &u)?;
+        let takes = below
+            || match &lk {
+                None => ge,
+                Some(KeyValue::Null) => ge || nl > k + 1,
+                Some(_) => false,
+            };
+        if takes && f.null_mask != 0 && matches!(uk, KeyValue::Value(_)) {
+            mask |= 1 << k;
+        }
+        below |= match (lk, uk) {
+            (Some(KeyValue::Null), KeyValue::Null) | (None, _) => false,
+            (Some(KeyValue::Value(a)), KeyValue::Value(b)) => a != b,
+            _ => true,
+        };
+    }
+    Ok(mask)
+}
+
 /// Appends the conditions `bound` means over the key `parts`; false when
-/// no row can meet them
+/// no row can meet them. An upper bound against a value keeps the rows
+/// whose part is NULL at the parts `nulls` names (`null_parts`).
 ///
 /// # Safety
 ///
@@ -173,12 +246,14 @@ pub unsafe fn bound_nodes(
     parts: &[StoolapField],
     bound: &StoolapKeyBound,
     src: &RecordIn,
+    nulls: u32,
     out: &mut Vec<Node>,
 ) -> Result<bool> {
     let n = (bound.nparts.max(0) as usize).min(parts.len());
     if n == 0 {
         return Ok(true);
     }
+    let keep = |i: usize| i < 32 && nulls & (1 << i) != 0;
     if bound.mode == STOOLAP_BOUND_LEADING {
         let f = &parts[0];
         let upper = bound.op == STOOLAP_OP_LE;
@@ -216,7 +291,7 @@ pub unsafe fn bound_nodes(
                     } else {
                         bound.op
                     };
-                    compare(&parts[i], op, values[i].clone())
+                    compare(&parts[i], op, values[i].clone(), keep(i))
                 })
                 .collect();
             match all(preds) {
@@ -230,7 +305,7 @@ pub unsafe fn bound_nodes(
             return Ok(false);
         }
         let lead = if lower { STOOLAP_OP_GE } else { STOOLAP_OP_LE };
-        if let Pred::Nodes(mut nodes) = compare(&parts[0], lead, values[0].clone()) {
+        if let Pred::Nodes(mut nodes) = compare(&parts[0], lead, values[0].clone(), keep(0)) {
             out.append(&mut nodes);
         }
         let nlegs = legs.len();
@@ -260,7 +335,7 @@ pub unsafe fn bound_nodes(
             continue;
         }
         let op = if i == n - 1 { bound.op } else { STOOLAP_OP_EQ };
-        if !compare_into(f, op, key_value(f, src)?, out) {
+        if !compare_into(f, op, key_value(f, src)?, keep(i), out) {
             out.truncate(start);
             return Ok(false);
         }

@@ -19,7 +19,10 @@ use stoolap::core::{Error, Result};
 
 use super::types::{StoolapDB, StoolapRows};
 use super::{STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
-use crate::key::{bound_nodes, StoolapKeyBound};
+use crate::key::{
+    bound_nodes, null_parts, StoolapKeyBound, STOOLAP_BOUND_RANGE, STOOLAP_OP_GE, STOOLAP_OP_GT,
+    STOOLAP_OP_LE, STOOLAP_OP_LT,
+};
 use crate::read::{Cursor, ReadSpec};
 use crate::record::{write_record, EncodeFn, RecordIn, Sink, StoolapField, StoreFn};
 
@@ -165,14 +168,34 @@ pub unsafe extern "C" fn stoolap_read(
         let name = table_name(table)?;
         let order = positions(order, norder)?;
         let parts = slice(keys, nkeys)?;
+        let bounds = slice(bounds, nbounds)?;
+        let src_of = |bound: &StoolapKeyBound| RecordIn {
+            record: bound.record,
+            encode,
+            ctx,
+        };
+        // A range's upper bound keeps the NULLs its lower bound takes
+        let range = |lower: bool| {
+            bounds.iter().position(|b| {
+                b.mode == STOOLAP_BOUND_RANGE
+                    && if lower {
+                        matches!(b.op, STOOLAP_OP_GE | STOOLAP_OP_GT)
+                    } else {
+                        matches!(b.op, STOOLAP_OP_LE | STOOLAP_OP_LT)
+                    }
+            })
+        };
+        let (nulls_at, nulls) = match range(false) {
+            Some(u) => {
+                let lower = range(true).map(|l| &bounds[l]);
+                (u, null_parts(parts, lower, &bounds[u], src_of)?)
+            }
+            None => (usize::MAX, 0),
+        };
         let mut conds = Vec::new();
-        for bound in slice(bounds, nbounds)? {
-            let src = RecordIn {
-                record: bound.record,
-                encode,
-                ctx,
-            };
-            if !bound_nodes(parts, bound, &src, &mut conds)? {
+        for (i, bound) in bounds.iter().enumerate() {
+            let keep = if i == nulls_at { nulls } else { 0 };
+            if !bound_nodes(parts, bound, &src_of(bound), keep, &mut conds)? {
                 return Ok(None);
             }
         }
