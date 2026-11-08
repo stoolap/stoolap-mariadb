@@ -19,7 +19,10 @@ use stoolap::core::{Error, Result};
 
 use super::types::{StoolapDB, StoolapRows};
 use super::{STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW};
-use crate::key::{bound_nodes, nulls_below, StoolapKeyBound};
+use crate::key::{
+    bound_nodes, null_parts, StoolapKeyBound, STOOLAP_BOUND_RANGE, STOOLAP_OP_GE, STOOLAP_OP_GT,
+    STOOLAP_OP_LE, STOOLAP_OP_LT,
+};
 use crate::read::{Cursor, ReadSpec};
 use crate::record::{write_record, EncodeFn, RecordIn, Sink, StoolapField, StoreFn};
 
@@ -171,10 +174,25 @@ pub unsafe extern "C" fn stoolap_read(
             encode,
             ctx,
         };
-        let nulls = nulls_below(parts, bounds, src_of)?;
+        // A range's upper bound keeps the NULLs its lower bound takes
+        let range = |lower: bool| {
+            bounds.iter().position(|b| {
+                b.mode == STOOLAP_BOUND_RANGE
+                    && if lower {
+                        matches!(b.op, STOOLAP_OP_GE | STOOLAP_OP_GT)
+                    } else {
+                        matches!(b.op, STOOLAP_OP_LE | STOOLAP_OP_LT)
+                    }
+            })
+        };
+        let (nulls_at, nulls) = match (range(true), range(false)) {
+            (Some(l), Some(u)) => (u, null_parts(parts, &bounds[l], &bounds[u], src_of)?),
+            _ => (usize::MAX, 0),
+        };
         let mut conds = Vec::new();
-        for bound in bounds {
-            if !bound_nodes(parts, bound, &src_of(bound), nulls, &mut conds)? {
+        for (i, bound) in bounds.iter().enumerate() {
+            let keep = if i == nulls_at { nulls } else { 0 };
+            if !bound_nodes(parts, bound, &src_of(bound), keep, &mut conds)? {
                 return Ok(None);
             }
         }
