@@ -271,6 +271,7 @@ by its wording only where no value is kept) and raised as MariaDB's own:
 | Parent row or table still referenced | `ER_ROW_IS_REFERENCED_2` 1451 |
 | Write conflict, lock, schema change mid-statement | `ER_LOCK_DEADLOCK` 1213 |
 | Table exists / table not found | 1050 / 1146 |
+| Integer arithmetic past BIGINT (`+ - *`, negation, ABS) | `ER_DATA_OUT_OF_RANGE` 1690, naming the operands |
 | Anything else | 1296 with Stoolap's message |
 
 An error found at COMMIT is raised with the same class. A message no

@@ -104,6 +104,22 @@ INSERT INTO uq_upd VALUES (1, 10), (2, 20);
     _assert_errno(h, "UNIQUE violation via row-pump UPDATE",
                   "UPDATE uq_upd SET u = 10 WHERE id = 2 LIMIT 1", 1062)
 
+    h.section("Integer overflow -> ER_DATA_OUT_OF_RANGE (1690)")
+    # Stoolap evaluates a direct statement's arithmetic; past BIGINT it
+    # fails as MariaDB's would
+    h.exec_script(f"""
+CREATE TABLE ov_t (id INT NOT NULL PRIMARY KEY, b BIGINT) ENGINE={h.engine};
+INSERT INTO ov_t VALUES (1, 9223372036854775807), (2, -9223372036854775808);
+""")
+    _assert_errno(h, "overflow via direct UPDATE",
+                  "UPDATE ov_t SET b = b + 1 WHERE id BETWEEN 1 AND 1", 1690)
+    _assert_errno(h, "negation overflow via direct UPDATE",
+                  "UPDATE ov_t SET b = -b WHERE id BETWEEN 2 AND 2", 1690)
+    _assert_errno(h, "ABS overflow via direct UPDATE",
+                  "UPDATE ov_t SET b = ABS(b) WHERE id BETWEEN 2 AND 2", 1690)
+    _assert_errno(h, "overflow via direct DELETE",
+                  "DELETE FROM ov_t WHERE b * 2 > 0", 1690)
+
     h.section("Table lifecycle errors")
     _assert_errno(h, "CREATE TABLE on existing name -> 1050",
                   f"CREATE TABLE pk_t (x INT) ENGINE={h.engine}", 1050)

@@ -65,6 +65,8 @@ pub const STOOLAP_ERR_DEADLOCK: i32 = 5;
 pub const STOOLAP_ERR_TABLE_EXISTS: i32 = 6;
 pub const STOOLAP_ERR_NO_SUCH_TABLE: i32 = 7;
 pub const STOOLAP_ERR_UNSUPPORTED: i32 = 8;
+/// An integer expression past BIGINT's range
+pub const STOOLAP_ERR_OUT_OF_RANGE: i32 = 9;
 
 /// The key a duplicate names: none, the PRIMARY KEY, or the n-th
 /// table-level unique constraint of the CREATE TABLE
@@ -178,6 +180,11 @@ fn class_of_text(m: &str) -> (i32, i32) {
         STOOLAP_ERR_DEADLOCK
     } else if has("not supported") || has("unsupported") {
         STOOLAP_ERR_UNSUPPORTED
+    } else if starts("type error: Integer overflow in arithmetic operation: ")
+        || starts("type error: Integer overflow in ABS: ")
+    {
+        // As MariaDB's BIGINT arithmetic fails (a SUM is a DECIMAL there)
+        STOOLAP_ERR_OUT_OF_RANGE
     } else if [
         "parse error",
         "division by zero",
@@ -254,6 +261,18 @@ mod tests {
         assert_eq!(
             c("invalid argument: row-pump UPDATE/DELETE ... is unsupported.").0,
             STOOLAP_ERR_UNSUPPORTED
+        );
+        assert_eq!(
+            c("type error: Integer overflow in arithmetic operation: 9223372036854775807 and 1").0,
+            STOOLAP_ERR_OUT_OF_RANGE
+        );
+        assert_eq!(
+            c("type error: Integer overflow in ABS: -9223372036854775808").0,
+            STOOLAP_ERR_OUT_OF_RANGE
+        );
+        assert_eq!(
+            c("type error: Integer overflow in SUM: 1 is outside the INTEGER range").0,
+            STOOLAP_ERR_GENERIC
         );
         assert_eq!(c("something new").0, STOOLAP_ERR_UNKNOWN);
         assert_eq!(unique_ordinal("unique_a_1b_12"), 12);

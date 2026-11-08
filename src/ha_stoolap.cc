@@ -358,6 +358,14 @@ int report_stoolap_error(const StoolapErrorView& v) {
     const bool have_text = *msg;
 
     const int32_t cls = stoolap_error_class(msg, nullptr);
+    if (cls == STOOLAP_ERR_OUT_OF_RANGE) {
+        // MariaDB names the expression; stoolap's message gives its
+        // operands ("Integer overflow in arithmetic operation: x and y")
+        const char* what = std::strstr(msg, ": ");
+        what = what ? std::strstr(what + 2, ": ") : nullptr;
+        my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "BIGINT", what ? what + 2 : msg);
+        return HA_ERR_GENERIC;
+    }
     const int rc = ha_error_of(cls);
     if (cls == STOOLAP_ERR_UNKNOWN && have_text) {
         // Wording no pattern covers: stoolap drift, see case_18.
