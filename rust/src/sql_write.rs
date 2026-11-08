@@ -48,10 +48,19 @@ fn key_clause(key: &[(String, Value)], first: usize) -> Result<String> {
 
 /// `AND col IS NOT DISTINCT FROM $n ...` over `read`, numbering from
 /// `first`: the row must still hold what MariaDB read
+/// Text without its trailing spaces, as `write::changed_since` compares it
+/// (a CHAR is encoded with or without its padding, as sql_mode says).
 fn unchanged_clause(read: &[(String, Value)], first: usize) -> String {
     read.iter()
         .enumerate()
-        .map(|(i, (name, _))| format!(" AND {} IS NOT DISTINCT FROM ${}", quote(name), first + i))
+        .map(|(i, (name, v))| match v {
+            Value::Text(_) => format!(
+                " AND (({col} IS NULL AND ${n} IS NULL) OR RTRIM({col}) = RTRIM(${n}))",
+                col = quote(name),
+                n = first + i
+            ),
+            _ => format!(" AND {} IS NOT DISTINCT FROM ${}", quote(name), first + i),
+        })
         .collect()
 }
 
@@ -131,25 +140,32 @@ pub fn update(
 }
 
 /// Deletes the row `key` names
-/// Deletes the row `key` names, if it still holds `read`, as `update`
+/// Deletes the row `key` names, if it still holds `read`, as `update`.
+/// Stoolap's DELETE finds its rows before it deletes them, so the row is
+/// held first by an UPDATE that writes a read column unchanged, under the
+/// same check: no commit lands between the check and the delete.
 pub fn delete(
     session: &Session,
     table: &str,
     key: Vec<(String, Value)>,
     read: Vec<(String, Value)>,
 ) -> Result<i64> {
-    let sql = format!(
-        "DELETE FROM {} WHERE {}{}",
-        quote(table),
-        key_clause(&key, 1)?,
-        unchanged_clause(&read, key.len() + 1)
-    );
-    let checked = !read.is_empty();
-    let n = session
-        .run_write(&sql, params(key.into_iter().chain(read).map(|(_, v)| v)))?
-        .rows_affected();
-    if n == 0 && checked {
-        return Err(changed_row(table));
+    let key_sql = key_clause(&key, 1)?;
+    if let Some((col, _)) = read.iter().find(|(n, _)| !key.iter().any(|(k, _)| k == n)) {
+        let hold = format!(
+            "UPDATE {} SET {c} = {c} WHERE {}{}",
+            quote(table),
+            key_sql,
+            unchanged_clause(&read, key.len() + 1),
+            c = quote(col)
+        );
+        let values = key.iter().chain(&read).map(|(_, v)| v.clone());
+        if session.run_write(&hold, params(values))?.rows_affected() == 0 {
+            return Err(changed_row(table));
+        }
     }
-    Ok(n)
+    let sql = format!("DELETE FROM {} WHERE {}", quote(table), key_sql);
+    Ok(session
+        .run_write(&sql, params(key.into_iter().map(|(_, v)| v)))?
+        .rows_affected())
 }

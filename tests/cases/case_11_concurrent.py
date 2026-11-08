@@ -152,3 +152,48 @@ INSERT INTO cntc VALUES (1, 0, 1);
         h.assert_scalar(f"{label}: every reported change kept",
                         f"SELECT v FROM {table} WHERE id = {row}",
                         str(sum(changed)))
+
+    # A row-pump UPDATE that moves a row to a new primary key deletes and
+    # inserts it: the version it checked is held through the move, so an
+    # increment committed meanwhile is not lost with the old copy
+    h.exec_script(f"""
+CREATE TABLE mv (id INT NOT NULL PRIMARY KEY, v INT NOT NULL) ENGINE={h.engine};
+INSERT INTO mv VALUES (1, 0);
+""")
+    stop = [False]
+    incs = []
+
+    def mover():
+        c, cur = h.open_session()
+        while not stop[0]:
+            try:
+                cur.execute("UPDATE mv SET id = 3 - id WHERE id IN (1, 2) "
+                            "ORDER BY id LIMIT 1")
+            except Exception:
+                pass
+        c.close()
+
+    def incrementer():
+        c, cur = h.open_session()
+        n = 0
+        for _ in range(400):
+            try:
+                cur.execute("UPDATE mv SET v = v + 1 WHERE id IN (1, 2)")
+                n += cur.rowcount
+            except Exception:
+                pass
+        c.close()
+        with lock:
+            incs.append(n)
+
+    m = threading.Thread(target=mover)
+    m.start()
+    workers = [threading.Thread(target=incrementer) for _ in range(3)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    stop[0] = True
+    m.join()
+    h.assert_scalar("a moved row keeps every reported increment",
+                    "SELECT SUM(v) FROM mv", str(sum(incs)))

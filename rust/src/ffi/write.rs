@@ -439,10 +439,7 @@ pub unsafe extern "C" fn stoolap_delete_record(
         affected,
         "stoolap_delete_record",
         has_row_id == 0,
-        |t| {
-            write::check_unchanged(t, row_id, &read_columns, &read_values(read, &src)?)?;
-            write::delete(t, row_id)
-        },
+        |t| write::delete(t, row_id, &read_columns, &read_values(read, &src)?),
         |session, name| {
             let key = named(session, name, field_slice(keys, nkeys)?, &src)?;
             let was = named(session, name, read, &src)?;
