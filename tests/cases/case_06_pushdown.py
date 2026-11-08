@@ -931,6 +931,44 @@ INSERT INTO wdbl VALUES (1, 1, 1), (2, 2, 2);
     h.assert_scalar("the values", "SELECT GROUP_CONCAT(u ORDER BY id) FROM wdbl",
                     "7.5,3")
 
+    h.section("Direct UPDATE checks several SET values, and clips outside strict mode")
+    # Each checked value fails with its own overflow, which names the
+    # column; outside strict mode MariaDB clips the value to its column,
+    # and so does the statement. All of them stay direct, where a
+    # concurrent update fails with 1213 rather than being written over.
+    h.exec_script(f"""
+CREATE TABLE wmul (id INT PRIMARY KEY, u DOUBLE UNSIGNED, n TINYINT,
+                   s VARCHAR(4) COLLATE utf8mb4_bin, b BIGINT) ENGINE={h.engine};
+INSERT INTO wmul VALUES (1, 1, 120, 'ab', 9007199254740993),
+                        (2, 9007199254740992, -120, 'abcd', 9007199254740993);
+""")
+    before = _direct_hits(h)
+    h.assert_ok("three checked values", "UPDATE wmul SET u = u + 1, n = n + 1, "
+                "s = CONCAT(s, 'x') WHERE id = 1")
+    h.assert_eq("run direct", 1, _direct_hits(h) - before)
+    h.assert_err("the second one past its range names it",
+                 "UPDATE wmul SET u = u + 1, n = n + 10 WHERE id = 1",
+                 "1264.*'n'")
+    h.assert_err("the first one names it",
+                 "UPDATE wmul SET u = u - 100, n = n - 1 WHERE id = 1",
+                 "1264.*'u'")
+    c = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=True)
+    cur = c.cursor()
+    cur.execute("UPDATE wmul SET u = b WHERE id = 2")
+    h.assert_eq("a BIGINT into a DOUBLE it rounds to is no change", 0,
+                cur.rowcount)
+    cur.execute("SET SESSION sql_mode = ''")
+    before = _direct_hits(h)
+    cur.execute("UPDATE wmul SET u = u - 100, n = n + 100, "
+                "s = CONCAT(s, 'yz') WHERE id = 1")
+    h.assert_eq("clipped outside strict mode, direct", 1,
+                _direct_hits(h) - before)
+    c.close()
+    h.assert_scalar("clipped values",
+                    "SELECT CONCAT_WS(':', u, n, s) FROM wmul WHERE id = 1",
+                    "0:127:abxy")
+
     h.section("Direct UPDATE counts the rows it changes")
     # MariaDB reports the rows a SET changes, or with CLIENT_FOUND_ROWS
     # the rows it finds; a row left as it was is not written.

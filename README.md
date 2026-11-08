@@ -159,7 +159,9 @@ transaction. It keeps what MariaDB does around each row:
   condition found (a client with `CLIENT_FOUND_ROWS` gets those as its
   affected rows).
 - **Strict mode.** A value too large or too long for its column fails
-  with 1264 / 1406, as MariaDB's would, and NULL into NOT NULL with 1048.
+  with 1264 / 1406 naming the column, as MariaDB's would, and NULL into
+  NOT NULL with 1048. Outside strict mode the value is clipped to the
+  column, as MariaDB stores it (without MariaDB's warning).
 
 What it cannot do the same way stays on MariaDB's row-by-row path (the
 row pump), which applies MariaDB's own rules: a table with CHECK
@@ -167,8 +169,8 @@ constraints or `ON UPDATE CURRENT_TIMESTAMP` columns, an UPDATE of a
 PRIMARY KEY or UNIQUE column (MariaDB checks each row's keys as it
 writes it, and fails the statement, not the COMMIT), a value that needs
 conversion to its column's type, a target MariaDB rounds or checks
-specially (FLOAT, `DOUBLE(M,D)`, YEAR, CHAR, dates and times), any value
-that may not fit outside strict mode, a SET value reading a column the
+specially (FLOAT, `DOUBLE(M,D)`, YEAR, CHAR, dates and times), a SET
+value reading a column the
 same SET assigned before it (MariaDB reads the new value, Stoolap the old
 row), `DELETE IGNORE`, ORDER BY / LIMIT, multi-table statements, triggers
 and row-based binary logging.
