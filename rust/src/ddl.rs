@@ -178,7 +178,8 @@ pub fn create_table(
 /// Drops `table` if it is there. A parent other tables' foreign keys name
 /// is refused, as InnoDB refuses it, unless `check_fks` is false; the
 /// children among `dropping` (DROP DATABASE: the database's tables) go
-/// with it, dropped first.
+/// with it, dropped first, each with its own children among them: Stoolap
+/// refuses to drop a table whose rows another table's rows reference.
 pub fn drop_table(
     session: &Session,
     table: &str,
@@ -186,12 +187,25 @@ pub fn drop_table(
     dropping: &[String],
 ) -> Result<()> {
     let dropping: Vec<String> = dropping.iter().map(|t| t.to_lowercase()).collect();
+    drop_tree(session, table, check_fks, &dropping, &mut Vec::new())
+}
+
+/// `drop_table` of `table`, `dropped` the tables on its way down (a chain
+/// of keys may come back to one of them)
+fn drop_tree(
+    session: &Session,
+    table: &str,
+    check_fks: bool,
+    dropping: &[String],
+    dropped: &mut Vec<String>,
+) -> Result<()> {
+    dropped.push(table.to_lowercase());
     for (child, column, parent_column) in session.referencing_tables(table) {
+        if dropped.contains(&child) {
+            continue;
+        }
         if dropping.contains(&child) {
-            session.run(
-                &format!("DROP TABLE IF EXISTS {}", quote(&child)),
-                ParamVec::new(),
-            )?;
+            drop_tree(session, &child, check_fks, dropping, dropped)?;
         } else if check_fks {
             return Err(Error::foreign_key_violation(
                 &child,
