@@ -122,10 +122,12 @@ fn columns(table_columns: i32) -> Result<usize> {
 }
 
 /// Holds row `row_id` for a write through SQL as `write::hold_unchanged`
-/// does, failing it when the row no longer holds what was read. Through the
-/// storage handle, in the statement's transaction: an UPDATE would run the
-/// actions of the foreign keys that name the column it writes, and a
-/// DELETE finds its rows before it deletes them, with no second look.
+/// does, failing it when the row no longer holds what was read; false when
+/// the row is gone, which the write must not go on to (a row inserted since
+/// under its key is another one). Through the storage handle, in the
+/// statement's transaction: an UPDATE would run the actions of the foreign
+/// keys that name the column it writes, and a DELETE finds its rows before
+/// it deletes them, with no second look.
 fn hold_read(
     session: &Session,
     table: &str,
@@ -133,17 +135,15 @@ fn hold_read(
     columns: &[usize],
     values: &[Value],
     pad: &[Option<&'static str>],
-) -> Result<()> {
-    if columns.is_empty() {
-        return Ok(());
-    }
+) -> Result<bool> {
     let read = ReadCheck {
         columns,
         values,
         pad,
     };
-    session.with_any_write_table(table, |t| write::hold_unchanged(t, row_id, &read))?;
-    Ok(())
+    Ok(session
+        .with_any_write_table(table, |t| write::hold_unchanged(t, row_id, &read))?
+        .is_some())
 }
 
 /// 1 when a foreign key names `table` (as child or parent), so its writes
@@ -424,7 +424,9 @@ pub unsafe extern "C" fn stoolap_update_record(
         |session, name| {
             if has_row_id != 0 {
                 let was = read_values(read, &old)?;
-                hold_read(session, name, row_id, &read_columns, &was, &pad)?;
+                if !hold_read(session, name, row_id, &read_columns, &was, &pad)? {
+                    return Ok(0);
+                }
             }
             let set = named(session, name, &changed, &new)?;
             let key = named(session, name, field_slice(keys, nkeys)?, &old)?;
@@ -485,7 +487,9 @@ pub unsafe extern "C" fn stoolap_delete_record(
         |session, name| {
             if has_row_id != 0 {
                 let was = read_values(read, &src)?;
-                hold_read(session, name, row_id, &read_columns, &was, &pad)?;
+                if !hold_read(session, name, row_id, &read_columns, &was, &pad)? {
+                    return Ok(0);
+                }
             }
             let key = named(session, name, field_slice(keys, nkeys)?, &src)?;
             sql_write::delete(session, name, key)
