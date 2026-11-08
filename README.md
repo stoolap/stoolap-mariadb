@@ -301,6 +301,13 @@ Also:
   Affected rows are exact.
 - **A strict-mode range or length error** from a direct UPDATE names row
   1, since the failing row is not known.
+- **An UPDATE on the row pump can lose a concurrent update.** MariaDB
+  reads the row, computes the new values and hands them to the handler;
+  a commit in between is written over (`SET v = v + 1` from several
+  sessions can lose increments). Direct UPDATEs are not affected: a
+  conflict there fails with 1213. The row pump runs UPDATEs with ORDER BY
+  / LIMIT, IGNORE, multi-table UPDATEs and those the generator cannot
+  translate.
 - **Tables a FOREIGN KEY names** are written through SQL, so Stoolap's
   executor checks the keys: slower than the direct write path.
 - **`ALTER TABLE` on `file://` storage** loses the table's rows at the
@@ -437,28 +444,31 @@ To add a regression for a difference from InnoDB, add a scenario there.
 `benchmarks/bench.py` runs the same workload on STOOLAP and InnoDB under
 one server (10K rows; the shapes of Stoolap's own
 `examples/benchmark.rs`). One run on an Apple M5, MariaDB 11.4.13,
-in-memory DSN: Stoolap won 44 operations, InnoDB none, the rest tied.
+in-memory DSN: Stoolap won 43 operations and InnoDB 1, the rest tied.
 Some of them:
 
 | Operation | STOOLAP | InnoDB | Ratio |
 | --- | ---: | ---: | ---: |
-| Nested subquery (3 levels) | 137 us | 9365 us | 68x |
-| Compare with subquery | 127 us | 3916 us | 31x |
-| Window ROW_NUMBER (PK) | 65 us | 1593 us | 25x |
-| NOT IN subquery | 141 us | 3374 us | 24x |
-| UNION ALL | 70 us | 1179 us | 17x |
-| INNER JOIN | 102 us | 985 us | 9.6x |
-| Aggregation (GROUP BY) | 153 us | 1071 us | 7.0x |
-| UPDATE complex (a range) | 137 us | 329 us | 2.4x |
-| DELETE by ID | 14 us | 20 us | 1.45x |
-| INSERT single | 16 us | 23 us | 1.4x |
-| Batch INSERT (100 rows) | 290 us | 403 us | 1.4x |
-| UPDATE by ID | 19 us | 21 us | 1.15x |
-| SELECT by ID | 26 us | 25 us | 0.94x |
+| Nested subquery (3 levels) | 145 us | 9106 us | 63x |
+| Compare with subquery | 128 us | 3702 us | 29x |
+| Window ROW_NUMBER (PK) | 65 us | 1601 us | 25x |
+| NOT IN subquery | 142 us | 3131 us | 22x |
+| UNION ALL | 69 us | 1174 us | 17x |
+| INNER JOIN | 106 us | 995 us | 9.4x |
+| Aggregation (GROUP BY) | 152 us | 1015 us | 6.7x |
+| UPDATE complex (a range) | 137 us | 337 us | 2.5x |
+| Batch INSERT (100 rows) | 290 us | 508 us | 1.8x |
+| INSERT single | 16 us | 20 us | 1.25x |
+| DELETE by ID | 17 us | 19 us | 1.1x |
+| SELECT by ID | 23 us | 23 us | 0.99x |
+| UPDATE by ID | 27 us | 20 us | 0.74x |
 
 Analytical shapes (joins, subqueries, window functions, aggregates) are
 where Stoolap's executor pulls ahead. Point lookups and writes are close
-to InnoDB: there MariaDB's own per-statement work dominates. See
+to InnoDB: there MariaDB's own per-statement work dominates. InnoDB's one
+win is UPDATE by ID, a direct UPDATE whose statement Stoolap parses and
+plans for one row; the row pump would be faster there but can lose a
+concurrent update (see [Known differences](#known-differences)). See
 `benchmarks/README.md` for the full dashboard and its baseline check.
 
 ## Licensing

@@ -1529,11 +1529,6 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
     if (!t || t->next_local || t->derived || t->nested_join || !t->table ||
         !t->table->s)
         return fail("modified table");
-    // One row named by its primary key: the row pump reads and writes it
-    // by its key, about twice as fast as a statement stoolap parses and
-    // plans (a point UPDATE 12.5 us against 26 us, a DELETE 14 against 16)
-    if (where && pk_equality(where, t->table))
-        return fail("one row by its primary key");
     const std::string name = quote_ident(stoolap_table_name(t->table->s));
     alias_[t] = name;
     std::string changes;  // UPDATE: a row's SET changes it
@@ -1597,6 +1592,7 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
     if (!changes.empty()) {
         count.sql = "SELECT COUNT(*) FROM " + name;
         if (!cond_sql.empty()) count.sql += " WHERE " + cond_sql;
+        count.one_row = where && pk_equality(where, t->table);
     }
     if (!changes.empty() && !cond_sql.empty()) {
         // The condition first: stoolap reads an AND left to right (a SET
@@ -1707,6 +1703,8 @@ bool Gen::assignment(Item* target, const Field* fl, Item* v,
             if (fl->real_type() != MYSQL_TYPE_DOUBLE ||
                 fl->decimals() < NOT_FIXED_DEC)
                 return fail("rounding float target");
+            // MariaDB refuses or clips a negative value there
+            if (fl->is_unsigned()) return fail("DOUBLE UNSIGNED target");
             // Before 11.4.11 MariaDB keeps -0.0, and compares its bytes
             // to 0.0's: that one leaves a DOUBLE to the row-pump
             if (!server_stores_zero_for_negative_zero())

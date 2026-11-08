@@ -336,7 +336,7 @@ CREATE TABLE pda (id INT NOT NULL PRIMARY KEY, n INT NOT NULL) ENGINE={h.engine}
 INSERT INTO pda VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
 """)
     before = _direct_hits(h)
-    h.run_client(f"USE {h.db}; UPDATE pda SET n = 999 WHERE id BETWEEN 1 AND 1 ORDER BY id LIMIT 1",
+    h.run_client(f"USE {h.db}; UPDATE pda SET n = 999 WHERE id = 1 ORDER BY id LIMIT 1",
                  use_db=False)
     after = _direct_hits(h)
     if after == before:
@@ -353,9 +353,9 @@ CREATE TABLE pdc (id INT NOT NULL PRIMARY KEY, n INT NOT NULL) ENGINE={h.engine}
 INSERT INTO pdc VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
 """)
     before = _direct_hits(h)
-    h.run_client(f"USE {h.db}; UPDATE pdc SET n = 99 WHERE id BETWEEN 1 AND 1", use_db=False)
+    h.run_client(f"USE {h.db}; UPDATE pdc SET n = 99 WHERE id = 1", use_db=False)
     h.run_client(f"USE {h.db}; UPDATE pdc SET n = n + 100 WHERE n > 2", use_db=False)
-    h.run_client(f"USE {h.db}; DELETE FROM pdc WHERE id BETWEEN 5 AND 5", use_db=False)
+    h.run_client(f"USE {h.db}; DELETE FROM pdc WHERE id = 5", use_db=False)
     after = _direct_hits(h)
     delta = after - before
     if delta >= 3:
@@ -375,7 +375,7 @@ CREATE TABLE shadow (id INT NOT NULL PRIMARY KEY, shadow INT NOT NULL) ENGINE={h
 INSERT INTO shadow VALUES (1, 100), (2, 200), (3, 300);
 """)
     before = _direct_hits(h)
-    h.run_client(f"USE {h.db}; UPDATE shadow SET shadow = 999 WHERE id BETWEEN 1 AND 1", use_db=False)
+    h.run_client(f"USE {h.db}; UPDATE shadow SET shadow = 999 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
     h.assert_eq("UPDATE column-name=table-name ran direct", 1, after - before)
     h.assert_scalar("UPDATE column=table applied",
@@ -388,7 +388,7 @@ CREATE TABLE shdw (id INT NOT NULL PRIMARY KEY, SHDW INT NOT NULL) ENGINE={h.eng
 INSERT INTO shdw VALUES (1, 11), (2, 22);
 """)
     before = _direct_hits(h)
-    h.run_client(f"USE {h.db}; UPDATE shdw SET SHDW = 77 WHERE id BETWEEN 1 AND 1", use_db=False)
+    h.run_client(f"USE {h.db}; UPDATE shdw SET SHDW = 77 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
     h.assert_eq("case-insensitive column=table ran direct", 1,
                 after - before)
@@ -400,7 +400,7 @@ CREATE TABLE clean (id INT NOT NULL PRIMARY KEY, n INT NOT NULL) ENGINE={h.engin
 INSERT INTO clean VALUES (1, 10), (2, 20);
 """)
     before = _direct_hits(h)
-    h.run_client(f"USE {h.db}; UPDATE clean SET n = 99 WHERE id BETWEEN 1 AND 1", use_db=False)
+    h.run_client(f"USE {h.db}; UPDATE clean SET n = 99 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
     if after > before:
         h._pass(f"clean schema still takes direct path (delta={after - before})")
@@ -464,10 +464,10 @@ INSERT INTO mixq_other.q VALUES (1, 0);
 """)
     other = h.run_async(f"""
 USE {h.db};
-UPDATE mixq_other.q       SET n = 1 WHERE id BETWEEN 1 AND 1;
-UPDATE `mixq_other`.q     SET n = 2 WHERE id BETWEEN 1 AND 1;
-UPDATE mixq_other.`q`     SET n = 3 WHERE id BETWEEN 1 AND 1;
-UPDATE `mixq_other`.`q`   SET n = 4 WHERE id BETWEEN 1 AND 1;
+UPDATE mixq_other.q       SET n = 1 WHERE id = 1;
+UPDATE `mixq_other`.q     SET n = 2 WHERE id = 1;
+UPDATE mixq_other.`q`     SET n = 3 WHERE id = 1;
+UPDATE `mixq_other`.`q`   SET n = 4 WHERE id = 1;
 SELECT n FROM mixq_other.q;
 """, use_db=False)
     out = other.wait()
@@ -498,14 +498,14 @@ SELECT n FROM mixq_other.q;
             cur.execute(stmt)
         before = _direct_hits(h)
         for stmt in [
-            "DELETE FROM pQ WHERE id BETWEEN 1 AND 1",
-            "DELETE FROM DmlCase.pQ WHERE id BETWEEN 2 AND 2",
-            "UPDATE `pQ` SET v = 7 WHERE id BETWEEN 3 AND 3",
-            "DELETE FROM `my-db`.`P\u00e9` WHERE id BETWEEN 1 AND 1",
-            "UPDATE `my-db`.`P\u00e9` SET v = 5 WHERE id BETWEEN 2 AND 2",
+            "DELETE FROM pQ WHERE id = 1",
+            "DELETE FROM DmlCase.pQ WHERE id = 2",
+            "UPDATE `pQ` SET v = 7 WHERE id = 3",
+            "DELETE FROM `my-db`.`P\u00e9` WHERE id = 1",
+            "UPDATE `my-db`.`P\u00e9` SET v = 5 WHERE id = 2",
             "USE `my-db`",
-            "DELETE FROM `P\u00e9` WHERE id BETWEEN 3 AND 3",
-            "DELETE FROM t$1 WHERE id BETWEEN 1 AND 1",
+            "DELETE FROM `P\u00e9` WHERE id = 3",
+            "DELETE FROM t$1 WHERE id = 1",
         ]:
             cur.execute(stmt)
         hits = _direct_hits(h) - before
@@ -533,16 +533,16 @@ SELECT n FROM mixq_other.q;
             cur.execute(stmt)
         before = _direct_hits(h)
         for stmt in [
-            "UPDATE `set` SET v = 1 WHERE id BETWEEN 1 AND 1",
-            "UPDATE `set` set v = 2 WHERE id BETWEEN 2 AND 2",
-            "UPDATE concat SET v = concat('1', '2') WHERE id BETWEEN 1 AND 1",
+            "UPDATE `set` SET v = 1 WHERE id = 1",
+            "UPDATE `set` set v = 2 WHERE id = 2",
+            "UPDATE concat SET v = concat('1', '2') WHERE id = 1",
             # A comment between the call's name and its `(`
-            "UPDATE `abs` SET v = ABS/**/(-id) WHERE id BETWEEN 1 AND 1",
-            "UPDATE `abs` SET v = abs -- x\n (-id) WHERE id BETWEEN 2 AND 2",
-            "UPDATE `abs` SET v = abs /*! (-id) */ WHERE id BETWEEN 3 AND 3",
-            "UPDATE `abs` SET v = `ABS`(-id) WHERE id BETWEEN 4 AND 4",
+            "UPDATE `abs` SET v = ABS/**/(-id) WHERE id = 1",
+            "UPDATE `abs` SET v = abs -- x\n (-id) WHERE id = 2",
+            "UPDATE `abs` SET v = abs /*! (-id) */ WHERE id = 3",
+            "UPDATE `abs` SET v = `ABS`(-id) WHERE id = 4",
             # MariaDB takes -- before a control character as a comment
-            "UPDATE `abs` SET v = abs--\x01 x\n(-id) WHERE id BETWEEN 5 AND 5",
+            "UPDATE `abs` SET v = abs--\x01 x\n(-id) WHERE id = 5",
         ]:
             cur.execute(stmt)
         # concat's string into an INT converts: the row-pump
@@ -577,14 +577,14 @@ SELECT n FROM mixq_other.q;
             cur.execute(stmt)
         before = _direct_hits(h)
         for stmt in [
-            "DELETE QUICK FROM t WHERE id BETWEEN 1 AND 1",
-            "DELETE LOW_PRIORITY FROM t WHERE id BETWEEN 2 AND 2",
-            "DELETE IGNORE FROM t WHERE id BETWEEN 3 AND 3",
-            "UPDATE LOW_PRIORITY t SET v = 1 WHERE id BETWEEN 4 AND 4",
-            "UPDATE dml_opt . t SET v = 2 WHERE id BETWEEN 5 AND 5",
-            "DELETE FROM dml_opt/**/.t WHERE id BETWEEN 6 AND 6",
+            "DELETE QUICK FROM t WHERE id = 1",
+            "DELETE LOW_PRIORITY FROM t WHERE id = 2",
+            "DELETE IGNORE FROM t WHERE id = 3",
+            "UPDATE LOW_PRIORITY t SET v = 1 WHERE id = 4",
+            "UPDATE dml_opt . t SET v = 2 WHERE id = 5",
+            "DELETE FROM dml_opt/**/.t WHERE id = 6",
             "SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')",
-            'UPDATE "t" SET v = 3 WHERE id BETWEEN 7 AND 7',
+            'UPDATE "t" SET v = 3 WHERE id = 7',
             "SET SESSION sql_mode = DEFAULT",
         ]:
             cur.execute(stmt)
@@ -605,10 +605,10 @@ SELECT n FROM mixq_other.q;
             "INSERT INTO tx VALUES (2), (9)",
             f"CREATE TABLE `a``b` (id INT PRIMARY KEY) ENGINE={h.engine}",
             "INSERT INTO `a``b` VALUES (1), (2)",
-            "DELETE /* it's fine */ FROM t WHERE id BETWEEN 1 AND 1",
+            "DELETE /* it's fine */ FROM t WHERE id = 1",
             "DELETE FROM `dml_opt`.tx WHERE id IN "
             "(SELECT id FROM `dml_opt`.t)",
-            "DELETE FROM `a``b` WHERE id BETWEEN 1 AND 1",
+            "DELETE FROM `a``b` WHERE id = 1",
         ]:
             cur.execute(stmt)
         cur.execute("SELECT id FROM t ORDER BY id")
@@ -627,9 +627,9 @@ SELECT n FROM mixq_other.q;
         before = _direct_hits(h)
         for stmt in [
             "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0)",
-            "UPDATE t SET v = 1 /*!WHERE id BETWEEN 1 AND 1 */",
-            "DELETE FROM t /*M!100000 WHERE id BETWEEN 2 AND 2 */",
-            "DELETE /*! FROM */ t WHERE id BETWEEN 3 AND 3",
+            "UPDATE t SET v = 1 /*!WHERE id = 1 */",
+            "DELETE FROM t /*M!100000 WHERE id = 2 */",
+            "DELETE /*! FROM */ t WHERE id = 3",
         ]:
             cur.execute(stmt)
         cur.execute("SELECT id, v FROM t ORDER BY id")
@@ -681,7 +681,7 @@ CREATE TABLE setg_d (id INT NOT NULL PRIMARY KEY, v DECIMAL(10,2)) ENGINE={h.eng
 INSERT INTO setg_d VALUES (1, 3.14);
 """)
     before = _direct_hits(h)
-    h.run_client(f"USE {h.db}; UPDATE setg_d SET v = v + 1 WHERE id BETWEEN 1 AND 1", use_db=False)
+    h.run_client(f"USE {h.db}; UPDATE setg_d SET v = v + 1 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
     if after == before:
         h._pass("DECIMAL SET expression avoided direct path")
@@ -694,7 +694,7 @@ CREATE TABLE setg_clean (id INT NOT NULL PRIMARY KEY, n INT NOT NULL) ENGINE={h.
 INSERT INTO setg_clean VALUES (1, 10);
 """)
     before = _direct_hits(h)
-    h.run_client(f"USE {h.db}; UPDATE setg_clean SET n = n * 2 WHERE id BETWEEN 1 AND 1", use_db=False)
+    h.run_client(f"USE {h.db}; UPDATE setg_clean SET n = n * 2 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
     if after > before:
         h._pass(f"numeric SET still takes direct (delta={after - before})")
@@ -709,7 +709,7 @@ CREATE TABLE dt (id INT NOT NULL PRIMARY KEY, v DECIMAL(38,10),
 INSERT INTO dt VALUES (1, 0, 0);
 """)
     before = _direct_hits(h)
-    h.run_client(f"USE {h.db}; UPDATE dt SET v = 1234567890123456789.1234567890 WHERE id BETWEEN 1 AND 1",
+    h.run_client(f"USE {h.db}; UPDATE dt SET v = 1234567890123456789.1234567890 WHERE id = 1",
                  use_db=False)
     after = _direct_hits(h)
     if after == before:
@@ -720,7 +720,7 @@ INSERT INTO dt VALUES (1, 0, 0);
                     "SELECT v FROM dt WHERE id = 1", "1234567890123456789.1234567890")
 
     before = _direct_hits(h)
-    h.run_client(f"USE {h.db}; UPDATE dt SET n = 99 WHERE id BETWEEN 1 AND 1", use_db=False)
+    h.run_client(f"USE {h.db}; UPDATE dt SET n = 99 WHERE id = 1", use_db=False)
     after = _direct_hits(h)
     if after > before:
         h._pass("non-DECIMAL target on same table still direct")
@@ -786,11 +786,11 @@ INSERT INTO set_ord VALUES (1, 1, 0), (2, 5, 9), (3, 1, 1);
 """)
     before = _direct_hits(h)
     h.assert_ok("SET a then b = a",
-                "UPDATE set_ord SET a = a + 1, b = a WHERE id BETWEEN 1 AND 1")
-    h.assert_ok("SET a = b, b = a", "UPDATE set_ord SET a = b, b = a WHERE id BETWEEN 2 AND 2")
+                "UPDATE set_ord SET a = a + 1, b = a WHERE id = 1")
+    h.assert_ok("SET a = b, b = a", "UPDATE set_ord SET a = b, b = a WHERE id = 2")
     h.assert_eq("both on the row-pump", 0, _direct_hits(h) - before)
     h.assert_ok("SET b = a, a = 7 reads only the old row",
-                "UPDATE set_ord SET b = a + 1, a = 7 WHERE id BETWEEN 3 AND 3")
+                "UPDATE set_ord SET b = a + 1, a = 7 WHERE id = 3")
     h.assert_eq("and runs direct", 1, _direct_hits(h) - before)
     h.assert_scalar("SET values", "SELECT GROUP_CONCAT(a, ':', b ORDER BY id) "
                     "FROM set_ord", "2:2,9:9,7:2")
@@ -806,22 +806,22 @@ INSERT INTO set_cv VALUES (1, 'a', 0, 0), (2, 'a', 0, 0), (3, 'a', 0, 0);
 """)
     before = _direct_hits(h)
     rc, out = h.run_client("""
-PREPARE s FROM 'UPDATE set_cv SET v = ? WHERE id BETWEEN 1 AND 1';
+PREPARE s FROM 'UPDATE set_cv SET v = ? WHERE id = 1';
 SET @p = CAST(1.20 AS DECIMAL(3,2));
 EXECUTE s USING @p;
-UPDATE set_cv SET v = 1.50, n = 2.7 WHERE id BETWEEN 2 AND 2;
+UPDATE set_cv SET v = 1.50, n = 2.7 WHERE id = 2;
 """)
     h.assert_eq("conversions on the row-pump", 0, _direct_hits(h) - before)
     h.assert_ok("an integer into a float, a NULL",
-                "UPDATE set_cv SET f = 3, n = NULL WHERE id BETWEEN 3 AND 3")
+                "UPDATE set_cv SET f = 3, n = NULL WHERE id = 3")
     h.assert_eq("run direct", 1, _direct_hits(h) - before)
     h.assert_ok("a constant expression is not evaluated with no row",
                 "UPDATE set_cv SET f = EXP(1000) WHERE n = 9")
     rc, out = h.run_client("""
 ALTER TABLE set_cv ADD COLUMN m INT DEFAULT 5;
-PREPARE d FROM 'UPDATE set_cv SET n = ?, m = ? WHERE id BETWEEN 3 AND 3';
+PREPARE d FROM 'UPDATE set_cv SET n = ?, m = ? WHERE id = 3';
 EXECUTE d USING DEFAULT, DEFAULT;
-PREPARE i FROM 'UPDATE set_cv SET m = ? WHERE id BETWEEN 2 AND 2';
+PREPARE i FROM 'UPDATE set_cv SET m = ? WHERE id = 2';
 EXECUTE i USING IGNORE;
 """)
     h.assert_eq("DEFAULT and IGNORE parameters run", 0, rc)
@@ -846,7 +846,7 @@ CREATE TABLE wts (id INT PRIMARY KEY, a INT, ts TIMESTAMP NULL DEFAULT NULL
                   ON UPDATE CURRENT_TIMESTAMP) ENGINE={h.engine};
 INSERT INTO wts VALUES (1, 1, '2000-01-01 00:00:00');
 """)
-    h.assert_err("CHECK constraint", "UPDATE wck SET c = -1 WHERE id BETWEEN 1 AND 1",
+    h.assert_err("CHECK constraint", "UPDATE wck SET c = -1 WHERE id = 1",
                  "4025")
     h.assert_ok("ON UPDATE CURRENT_TIMESTAMP", "UPDATE wts SET a = 2")
     h.assert_scalar("ON UPDATE column set",
@@ -854,20 +854,20 @@ INSERT INTO wts VALUES (1, 1, '2000-01-01 00:00:00');
     h.exec_script("ALTER TABLE wck DROP CONSTRAINT IF EXISTS c")
     h.exec_script("ALTER TABLE wck MODIFY c INT")
     before = _direct_hits(h)
-    h.assert_ok("a counter that fits", "UPDATE wck SET n = n + 1 WHERE id BETWEEN 1 AND 1")
-    h.assert_ok("an INT that fits", "UPDATE wck SET v = v + 1 WHERE id BETWEEN 1 AND 1")
+    h.assert_ok("a counter that fits", "UPDATE wck SET n = n + 1 WHERE id = 1")
+    h.assert_ok("an INT that fits", "UPDATE wck SET v = v + 1 WHERE id = 1")
     h.assert_ok("a string that fits", "UPDATE wck SET s = '\u00e9\u00e9\u00e9\u00e9' "
-                "WHERE id BETWEEN 1 AND 1")
+                "WHERE id = 1")
     h.assert_eq("run direct", 3, _direct_hits(h) - before)
-    h.assert_err("a TINYINT past its range", "UPDATE wck SET n = n + 10 WHERE id BETWEEN 1 AND 1",
+    h.assert_err("a TINYINT past its range", "UPDATE wck SET n = n + 10 WHERE id = 1",
                  "1264")
-    h.assert_err("an INT past its range", "UPDATE wck SET v = v + 1 WHERE id BETWEEN 1 AND 1",
+    h.assert_err("an INT past its range", "UPDATE wck SET v = v + 1 WHERE id = 1",
                  "1264")
-    h.assert_err("a literal past its range", "UPDATE wck SET n = 300 WHERE id BETWEEN 1 AND 1",
+    h.assert_err("a literal past its range", "UPDATE wck SET n = 300 WHERE id = 1",
                  "1264")
-    h.assert_err("a literal too long", "UPDATE wck SET s = 'abcde' WHERE id BETWEEN 1 AND 1",
+    h.assert_err("a literal too long", "UPDATE wck SET s = 'abcde' WHERE id = 1",
                  "1406")
-    h.assert_err("NULL into NOT NULL", "UPDATE wck SET n = NULL WHERE id BETWEEN 1 AND 1",
+    h.assert_err("NULL into NOT NULL", "UPDATE wck SET n = NULL WHERE id = 1",
                  "1048")
     h.assert_scalar("the row kept its values",
                     "SELECT CONCAT_WS(':', n, s, v) FROM wck",
@@ -875,10 +875,10 @@ INSERT INTO wts VALUES (1, 1, '2000-01-01 00:00:00');
     # Past the column MariaDB cuts ASCII white space and fails on the rest
     before = _direct_hits(h)
     h.assert_ok("trailing white space past the column is cut",
-                "UPDATE wck SET s = CONCAT(s, ' \\t ') WHERE id BETWEEN 1 AND 1")
+                "UPDATE wck SET s = CONCAT(s, ' \\t ') WHERE id = 1")
     h.assert_eq("in the statement's check", 1, _direct_hits(h) - before)
     h.assert_err("anything else past it fails",
-                 "UPDATE wck SET s = CONCAT(s, ' x') WHERE id BETWEEN 1 AND 1", "1406")
+                 "UPDATE wck SET s = CONCAT(s, ' x') WHERE id = 1", "1406")
     h.assert_scalar("cut to the column", "SELECT HEX(s) FROM wck",
                     "C3A9C3A9C3A9C3A9")
     # A value that may pass stoolap's 10 MiB REPLACE limit is not checked
@@ -890,9 +890,9 @@ CREATE TABLE wbig (id INT PRIMARY KEY, dst VARCHAR(4) COLLATE utf8mb4_bin,
 INSERT INTO wbig VALUES (1, 'x', 'abcd  ', 'wxyz  ');
 """)
     before = _direct_hits(h)
-    h.assert_ok("a TEXT source", "UPDATE wbig SET dst = tx WHERE id BETWEEN 1 AND 1")
+    h.assert_ok("a TEXT source", "UPDATE wbig SET dst = tx WHERE id = 1")
     h.assert_eq("checked in the statement", 1, _direct_hits(h) - before)
-    h.assert_ok("a MEDIUMTEXT source", "UPDATE wbig SET dst = mt WHERE id BETWEEN 1 AND 1")
+    h.assert_ok("a MEDIUMTEXT source", "UPDATE wbig SET dst = mt WHERE id = 1")
     h.assert_eq("on the row-pump", 1, _direct_hits(h) - before)
     h.assert_scalar("cut to the column", "SELECT dst FROM wbig", "wxyz")
     # The check's overflow is told from a duplicate naming such a value
@@ -902,25 +902,25 @@ CREATE TABLE wdup (id INT PRIMARY KEY,
 INSERT INTO wdup VALUES (1, 'Integer overflow'), (2, 'Integer ');
 """)
     h.assert_err("a duplicate naming the overflow's words",
-                 "UPDATE wdup SET s = CONCAT(s, 'overflow') WHERE id BETWEEN 2 AND 2",
+                 "UPDATE wdup SET s = CONCAT(s, 'overflow') WHERE id = 2",
                  "1062")
 
-    h.section("One row by its primary key runs on the row pump")
-    # The row pump reads and writes it by its key, about twice as fast as a
-    # statement stoolap parses and plans
+    h.section("Direct UPDATE writes a client's float into a DOUBLE")
+    # A float parameter comes as a decimal literal of 16 or 17 digits; a
+    # DOUBLE stores it as its double, which the statement writes as such
     h.exec_script(f"""
-CREATE TABLE wpk (id INT PRIMARY KEY, v DOUBLE) ENGINE={h.engine};
-INSERT INTO wpk VALUES (1, 1), (2, 2), (3, 3);
+CREATE TABLE wdbl (id INT PRIMARY KEY, v DOUBLE, u DOUBLE UNSIGNED) ENGINE={h.engine};
+INSERT INTO wdbl VALUES (1, 1, 1), (2, 2, 2);
 """)
     before = _direct_hits(h)
-    h.assert_ok("UPDATE by the key", "UPDATE wpk SET v = 61231.04612887165 WHERE id = 1")
-    h.assert_ok("DELETE by the key", "DELETE FROM wpk WHERE id = 2")
-    h.assert_eq("on the row pump", 0, _direct_hits(h) - before)
-    h.assert_ok("a range of the key", "UPDATE wpk SET v = 61231.04612887165 "
-                "WHERE id BETWEEN 3 AND 3")
+    h.assert_ok("a 17-digit float", "UPDATE wdbl SET v = 61231.04612887165 WHERE id = 1")
     h.assert_eq("runs direct", 1, _direct_hits(h) - before)
-    h.assert_scalar("values", "SELECT GROUP_CONCAT(id, ':', v ORDER BY id) "
-                    "FROM wpk", "1:61231.04612887165,3:61231.04612887165")
+    h.assert_scalar("stored as MariaDB stores it",
+                    "SELECT v = 61231.04612887165 FROM wdbl WHERE id = 1", "1")
+    h.assert_err("a negative value into DOUBLE UNSIGNED",
+                 "UPDATE wdbl SET u = -61231.04612887165 "
+                 "WHERE id BETWEEN 2 AND 2", "1264")
+    h.assert_eq("on the row pump", 1, _direct_hits(h) - before)
 
     h.section("Direct UPDATE counts the rows it changes")
     # MariaDB reports the rows a SET changes, or with CLIENT_FOUND_ROWS
@@ -941,9 +941,9 @@ INSERT INTO wcnt VALUES (1, 1, 'abcd'), (2, 2, 'ab'), (3, 3, NULL);
         before = _direct_hits(h)
         for stmt in ["UPDATE wcnt SET v = v",
                      "UPDATE wcnt SET v = 2 WHERE id > 0",
-                     "UPDATE wcnt SET v = v + 1 WHERE id BETWEEN 1 AND 1",
+                     "UPDATE wcnt SET v = v + 1 WHERE id = 1",
                      # Cut to 'abcd': unchanged
-                     "UPDATE wcnt SET s = CONCAT(s, '  ') WHERE id BETWEEN 1 AND 1"]:
+                     "UPDATE wcnt SET s = CONCAT(s, '  ') WHERE id = 1"]:
             cur.execute(stmt)
             got.append(cur.rowcount)
         h.assert_eq(f"rows {label}", want, got)
@@ -955,8 +955,8 @@ INSERT INTO wcnt VALUES (1, 1, 'abcd'), (2, 2, 'ab'), (3, 3, NULL);
     proc = subprocess.run(
         [h.mariadb, "--no-defaults", "-S", h.socket, "-uroot", "-vvv", h.db],
         input="UPDATE wcnt SET v = v;\nUPDATE wcnt SET v = 2 WHERE id > 0;\n"
-              "UPDATE wcnt SET v = v WHERE id BETWEEN 1 AND 1;\n"
-              "UPDATE wcnt SET v = v WHERE id BETWEEN 9 AND 9;\n",
+              "UPDATE wcnt SET v = v WHERE id = 1;\n"
+              "UPDATE wcnt SET v = v WHERE id = 9;\n",
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     h.assert_eq("rows matched and changed",
                 ["Rows matched: 3  Changed: 0", "Rows matched: 3  Changed: 1",
