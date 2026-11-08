@@ -729,6 +729,8 @@ int32_t stoolap_rename_table(StoolapDB* db, const char* from, const char* to);
 #define STOOLAP_ERR_TABLE_EXISTS        6
 #define STOOLAP_ERR_NO_SUCH_TABLE       7
 #define STOOLAP_ERR_UNSUPPORTED         8
+/** An integer expression past BIGINT's range. */
+#define STOOLAP_ERR_OUT_OF_RANGE        9
 
 /** The key a duplicate names: none, or the PRIMARY KEY. */
 #define STOOLAP_KEY_NONE               -1

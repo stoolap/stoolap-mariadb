@@ -1004,7 +1004,7 @@ INSERT INTO wmul VALUES (1, 1, 120, 'ab', 9007199254740993),
                   "ADD COLUMN y BIGINT DEFAULT -9223372036854775808")
     h.assert_err("an overflow of an unchecked value",
                  "UPDATE wmul SET n = n + 1, x = x - y WHERE id BETWEEN 1 AND 1",
-                 "^(?!.*'n').*(1296|1690)")
+                 "^(?!.*'n').*1690")
     c = mysql.connector.connect(user="root", unix_socket=h.socket,
                                 database=h.db, autocommit=True)
     cur = c.cursor()
