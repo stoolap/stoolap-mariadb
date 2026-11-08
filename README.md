@@ -173,7 +173,9 @@ specially (FLOAT, `DOUBLE(M,D)`, YEAR, CHAR, dates and times), a SET
 value reading a column the
 same SET assigned before it (MariaDB reads the new value, Stoolap the old
 row), `DELETE IGNORE`, ORDER BY / LIMIT, multi-table statements, triggers
-and row-based binary logging.
+and row-based binary logging. So does one row named by its primary key
+(`WHERE id = 5`): the row pump reads and writes it by its key, faster
+than a statement Stoolap parses and plans for one row.
 
 DELETE without WHERE is such a statement too: inside the transaction,
 with the foreign keys' ON DELETE actions. `TRUNCATE TABLE` runs Stoolap's
@@ -439,30 +441,28 @@ To add a regression for a difference from InnoDB, add a scenario there.
 `benchmarks/bench.py` runs the same workload on STOOLAP and InnoDB under
 one server (10K rows; the shapes of Stoolap's own
 `examples/benchmark.rs`). One run on an Apple M5, MariaDB 11.4.13,
-in-memory DSN: Stoolap won 43 operations and InnoDB 1, the rest tied.
+in-memory DSN: Stoolap won 44 operations and InnoDB none, the rest tied.
 Some of them:
 
 | Operation | STOOLAP | InnoDB | Ratio |
 | --- | ---: | ---: | ---: |
-| Nested subquery (3 levels) | 145 us | 9106 us | 63x |
-| Compare with subquery | 128 us | 3702 us | 29x |
-| Window ROW_NUMBER (PK) | 65 us | 1601 us | 25x |
-| NOT IN subquery | 142 us | 3131 us | 22x |
-| UNION ALL | 69 us | 1174 us | 17x |
-| INNER JOIN | 106 us | 995 us | 9.4x |
-| Aggregation (GROUP BY) | 152 us | 1015 us | 6.7x |
-| UPDATE complex (a range) | 137 us | 337 us | 2.5x |
-| Batch INSERT (100 rows) | 290 us | 508 us | 1.8x |
-| INSERT single | 16 us | 20 us | 1.25x |
-| DELETE by ID | 17 us | 19 us | 1.1x |
-| SELECT by ID | 23 us | 23 us | 0.99x |
-| UPDATE by ID | 27 us | 20 us | 0.74x |
+| Nested subquery (3 levels) | 150 us | 9886 us | 66x |
+| Compare with subquery | 134 us | 4335 us | 32x |
+| Window ROW_NUMBER (PK) | 58 us | 1687 us | 29x |
+| NOT IN subquery | 147 us | 3318 us | 23x |
+| UNION ALL | 66 us | 1311 us | 20x |
+| INNER JOIN | 104 us | 1038 us | 10x |
+| Aggregation (GROUP BY) | 153 us | 1055 us | 6.9x |
+| UPDATE complex (a range) | 141 us | 307 us | 2.2x |
+| Batch INSERT (100 rows) | 300 us | 383 us | 1.3x |
+| INSERT single | 17 us | 20 us | 1.2x |
+| UPDATE by ID | 19 us | 22 us | 1.15x |
+| DELETE by ID | 16 us | 18 us | 1.15x |
+| SELECT by ID | 26 us | 24 us | 0.95x |
 
 Analytical shapes (joins, subqueries, window functions, aggregates) are
 where Stoolap's executor pulls ahead. Point lookups and writes are close
-to InnoDB: there MariaDB's own per-statement work dominates. InnoDB's one
-win is UPDATE by ID, a direct UPDATE whose statement Stoolap parses and
-plans for one row. See
+to InnoDB: there MariaDB's own per-statement work dominates. See
 `benchmarks/README.md` for the full dashboard and its baseline check.
 
 ## Licensing

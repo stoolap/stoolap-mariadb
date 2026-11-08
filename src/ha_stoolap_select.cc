@@ -289,7 +289,7 @@ int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
     StoolapTx* tx = ctx->has_tx() ? ctx->tx() : nullptr;
     uint64_t found_n = 0;
     bool have_found = false;
-    if (!count.sql.empty() && !count.one_row)
+    if (!count.sql.empty())
         have_found = count_rows(db, tx, count.sql, &found_n);
 
     // A prepared statement's parameters are literals in the generated
@@ -348,12 +348,6 @@ int try_direct_modify(THD* thd, const Item* where, ha_rows* affected,
         return mapped;
     }
     if (affected) *affected = static_cast<ha_rows>(rows_aff);
-    // At most one row qualifies: one changed is one found; none changed,
-    // and the row (if any) is as it was, so the count reads it the same
-    if (!count.sql.empty() && count.one_row) {
-        found_n = static_cast<uint64_t>(rows_aff);
-        have_found = rows_aff > 0 || count_rows(db, tx, count.sql, &found_n);
-    }
     if (found)
         *found = have_found ? static_cast<ha_rows>(found_n)
                             : static_cast<ha_rows>(rows_aff);

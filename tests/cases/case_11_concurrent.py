@@ -112,7 +112,7 @@ DROP TABLE concddl_{i};
     # must be in the final value.
     h.exec_script(f"""
 CREATE TABLE cnt (id INT NOT NULL PRIMARY KEY, v INT NOT NULL) ENGINE={h.engine};
-INSERT INTO cnt VALUES (1, 0), (2, 0);
+INSERT INTO cnt VALUES (1, 0), (2, 0), (3, 0);
 CREATE TABLE cntp (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
 INSERT INTO cntp VALUES (1);
 CREATE TABLE cntc (id INT NOT NULL PRIMARY KEY, v INT NOT NULL, pid INT,
@@ -135,6 +135,9 @@ INSERT INTO cntsc VALUES (1, '', 1);
              "SELECT v FROM cnt WHERE id = 1"),
             ("IGNORE", "UPDATE IGNORE cnt SET v = v + 1 WHERE id = 2",
              "SELECT v FROM cnt WHERE id = 2"),
+            ("one row by its primary key",
+             "UPDATE cnt SET v = v + 1 WHERE id = 3",
+             "SELECT v FROM cnt WHERE id = 3"),
             ("a table a FOREIGN KEY names (through SQL)",
              "UPDATE cntc SET v = v + 1 WHERE id = 1 ORDER BY id LIMIT 1",
              "SELECT v FROM cntc WHERE id = 1"),

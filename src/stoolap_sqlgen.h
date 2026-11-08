@@ -80,12 +80,10 @@ struct ModifyGuard {
 
 // The rows an UPDATE that writes only the rows it changes finds, which
 // MariaDB reports apart ("Rows matched"): `sql` counts them, empty when
-// the UPDATE's count is already the rows found. Run before the UPDATE
-// (which may change what the condition takes), unless `one_row`: at most
-// one row qualifies, so an UPDATE that changed one found one.
+// the UPDATE's count is already the rows found. Run before the UPDATE,
+// which may change what the condition takes.
 struct ModifyCount {
     std::string sql;
-    bool one_row = false;
 };
 
 // The single-table UPDATE or DELETE whose SELECT_LEX is `sel`, as the
