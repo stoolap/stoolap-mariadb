@@ -295,10 +295,15 @@ fn check_unique_batch(table: &dyn Table, rows: &[Row]) -> Result<()> {
     Ok(())
 }
 
-/// Whether a row of `table` holds `value` in `column`
-pub fn holds(table: &dyn Table, column: &str, value: &Value) -> Result<bool> {
-    let mut filter = ComparisonExpr::new(column, Operator::Eq, value.clone());
-    filter.prepare_for_schema(table.schema());
+/// Whether a row of `table` holds `value` in its `column`-th column
+pub fn holds(table: &dyn Table, column: usize, value: &Value) -> Result<bool> {
+    let schema = table.schema();
+    let mut filter = ComparisonExpr::new(
+        schema.columns[column].name.as_str(),
+        Operator::Eq,
+        value.clone(),
+    );
+    filter.prepare_for_schema(schema);
     let plan = table.index_plan(&filter);
     let access = match &plan {
         Some(p) => ScanAccess::Index(p),

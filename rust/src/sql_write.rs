@@ -103,15 +103,21 @@ pub fn update(
     Ok(session.run_write(&sql, params(values))?.rows_affected())
 }
 
-/// Moves row `row_id`, which `key` names by its primary key, to the key
-/// `to`, setting `rest` (the other columns, `check` as `update`'s) too.
-/// Stoolap's UPDATE refuses its primary key, which is the row id, so the
-/// row moves on the storage handle, in the statement's transaction, as a
-/// direct write moves it; the caller holds it first. What the executor
-/// would do around the key is done here: a row a foreign key names refuses
-/// the move (RESTRICT, NO ACTION) or takes its rows along (CASCADE, SET
-/// NULL), and a key that is itself a foreign key needs its parent. The
-/// rest goes through SQL first, where the executor checks its keys.
+/// How deep a key's move takes the rows that name it along, as stoolap's
+/// executor cascades
+const MAX_CASCADE_DEPTH: usize = 16;
+
+/// Moves row `row_id`, which `key` names by its primary key (the `pk`-th
+/// of `table_columns` columns), to the key `to`, setting `rest` (the other
+/// columns, `check` as `update`'s) too. Stoolap's UPDATE refuses its
+/// primary key, which is the row id, so the row moves on the storage
+/// handle, in the statement's transaction, as a direct write moves it; the
+/// caller holds it first. What the executor would do around the key is
+/// done here: a row a foreign key names refuses the move (RESTRICT, NO
+/// ACTION) or takes its rows along (CASCADE, SET NULL), and a key that is
+/// itself a foreign key needs its parent. The rest goes through SQL, where
+/// the executor checks its keys. All of it under a savepoint: a row that
+/// fails leaves nothing written, as MariaDB's IGNORE expects.
 #[allow(clippy::too_many_arguments)]
 pub fn move_key(
     session: &Session,
@@ -124,42 +130,58 @@ pub fn move_key(
     rest: Vec<(String, Value)>,
     check: Option<&[usize]>,
 ) -> Result<i64> {
+    session.atomically(|| {
+        move_row(
+            session,
+            table,
+            table_columns,
+            row_id,
+            pk,
+            key,
+            to,
+            rest,
+            check,
+            0,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_row(
+    session: &Session,
+    table: &str,
+    table_columns: usize,
+    row_id: i64,
+    pk: usize,
+    key: (String, Value),
+    to: Value,
+    rest: Vec<(String, Value)>,
+    check: Option<&[usize]>,
+    depth: usize,
+) -> Result<i64> {
+    if depth > MAX_CASCADE_DEPTH {
+        return Err(Error::internal(format!(
+            "foreign key cascade of '{}' deeper than {} tables",
+            table, MAX_CASCADE_DEPTH
+        )));
+    }
     let (name, from) = key;
-    let mut actions = Vec::new();
-    for (child, fk) in session.referencing_keys(table) {
-        if !fk.referenced_column.eq_ignore_ascii_case(&name)
-            || !session.with_table(&child, |t| write::holds(t, &fk.column_name, &from))?
-        {
+    // Keys are matched by the columns they resolve to (their names are in
+    // lower case), and rows read through write handles, which take no
+    // statement view: a row committed since the statement began counts
+    let schema = session.with_any_write_table(table, |t| Ok(t.schema().clone()))?;
+    for fk in &schema.foreign_keys {
+        if schema.get_column_index(&fk.column_name) != Some(pk) || to.is_null() {
             continue;
         }
-        match fk.on_update {
-            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
-                return Err(Error::foreign_key_violation(
-                    &child,
-                    &fk.column_name,
-                    table,
-                    &fk.referenced_column,
-                    format!(
-                        "cannot update row with {} = {} \u{2014} still referenced by table '{}'",
-                        fk.referenced_column, from, child
-                    ),
-                ));
-            }
-            ForeignKeyAction::Cascade => actions.push((child, fk.column_name, to.clone())),
-            ForeignKeyAction::SetNull => {
-                actions.push((child, fk.column_name, Value::null_unknown()))
-            }
-        }
-    }
-    let own: Vec<_> = session.with_table(table, |t| Ok(t.schema().foreign_keys.clone()))?;
-    for fk in own
-        .iter()
-        .filter(|fk| fk.column_name.eq_ignore_ascii_case(&name))
-    {
         let parent = &fk.referenced_table;
-        if !to.is_null()
-            && !session.with_table(parent, |t| write::holds(t, &fk.referenced_column, &to))?
-        {
+        let found = session.with_any_write_table(parent, |t| {
+            match t.schema().get_column_index(&fk.referenced_column) {
+                Some(i) => write::holds(t, i, &to),
+                None => Ok(false),
+            }
+        })?;
+        if !found {
             return Err(Error::foreign_key_violation(
                 table,
                 &fk.column_name,
@@ -172,12 +194,47 @@ pub fn move_key(
             ));
         }
     }
+    let mut follow: Vec<(String, Vec<(usize, Value)>)> = Vec::new();
+    for (child, fk) in session.referencing_keys(table) {
+        if schema.get_column_index(&fk.referenced_column) != Some(pk) {
+            continue;
+        }
+        let column = session.with_any_write_table(&child, |t| {
+            match t.schema().get_column_index(&fk.column_name) {
+                Some(i) => Ok(write::holds(t, i, &from)?.then_some(i)),
+                None => Ok(None),
+            }
+        })?;
+        let Some(column) = column else {
+            continue;
+        };
+        let value = match fk.on_update {
+            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
+                return Err(Error::foreign_key_violation(
+                    &child,
+                    &fk.column_name,
+                    table,
+                    &fk.referenced_column,
+                    format!(
+                        "cannot update row with {} = {} \u{2014} still referenced by table '{}'",
+                        fk.referenced_column, from, child
+                    ),
+                ));
+            }
+            ForeignKeyAction::Cascade => to.clone(),
+            ForeignKeyAction::SetNull => Value::null_unknown(),
+        };
+        match follow.iter_mut().find(|(c, _)| *c == child) {
+            Some((_, columns)) => columns.push((column, value)),
+            None => follow.push((child, vec![(column, value)])),
+        }
+    }
     if !rest.is_empty() {
         update(
             session,
             table,
             rest,
-            vec![(name.clone(), from.clone())],
+            vec![(name, from.clone())],
             check.map(|c| (row_id, c)),
         )?;
     }
@@ -196,15 +253,71 @@ pub fn move_key(
             &unchecked,
         )
     })?;
-    for (child, column, value) in actions {
-        let sql = format!(
-            "UPDATE {} SET {c} = $1 WHERE {c} = $2",
-            quote(&child),
-            c = quote(&column)
-        );
-        session.run_write(&sql, params([value, from.clone()]))?;
+    for (child, columns) in follow {
+        follow_key(session, &child, columns, &from, depth)?;
     }
     Ok(n)
+}
+
+/// Takes the rows of `child` that hold the moved key `from` in `columns`
+/// to the columns' new values. A column that is the child's own primary key
+/// moves its row as the key moved; the rest change in one UPDATE, so the
+/// executor checks each row with all its keys moved.
+fn follow_key(
+    session: &Session,
+    child: &str,
+    columns: Vec<(usize, Value)>,
+    from: &Value,
+    depth: usize,
+) -> Result<()> {
+    let schema = session.with_any_write_table(child, |t| Ok(t.schema().clone()))?;
+    let mut set = Vec::new();
+    for (column, value) in columns {
+        let name = schema.columns[column].name.clone();
+        match from {
+            // An INTEGER primary key is the row id
+            Value::Integer(id) if schema.pk_column_index() == Some(column) => {
+                move_row(
+                    session,
+                    child,
+                    schema.columns.len(),
+                    *id,
+                    column,
+                    (name, from.clone()),
+                    value,
+                    Vec::new(),
+                    None,
+                    depth + 1,
+                )?;
+            }
+            _ => set.push((name, value)),
+        }
+    }
+    if set.is_empty() {
+        return Ok(());
+    }
+    let mut values = vec![from.clone()];
+    let mut assign = Vec::new();
+    for (name, value) in &set {
+        values.push(value.clone());
+        assign.push(format!(
+            "{c} = CASE WHEN {c} = $1 THEN ${n} ELSE {c} END",
+            c = quote(name),
+            n = values.len()
+        ));
+    }
+    let found: Vec<String> = set
+        .iter()
+        .map(|(c, _)| format!("{} = $1", quote(c)))
+        .collect();
+    let sql = format!(
+        "UPDATE {} SET {} WHERE {}",
+        quote(child),
+        assign.join(", "),
+        found.join(" OR ")
+    );
+    session.run_write(&sql, params(values))?;
+    Ok(())
 }
 
 /// Deletes the row `key` names
