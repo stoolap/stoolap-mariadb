@@ -17,6 +17,7 @@
 
 class THD;
 class Item;
+struct TABLE;
 class st_select_lex;
 class st_select_lex_unit;
 
@@ -85,6 +86,14 @@ struct ModifyGuard {
 struct ModifyCount {
     std::string sql;
 };
+
+// Whether `where` takes at most one row of `table`: an equality of its
+// single-column primary key with a constant, alone or in an AND. Such an
+// UPDATE or DELETE stays on the row pump, which reads and writes the row by
+// its key faster than a statement stoolap parses and plans (a point UPDATE
+// 13-16 us against 20-28 us, a DELETE 14 against 16) and checks it as the
+// statement would (a concurrent change is 1213).
+bool one_row_by_key(Item* where, TABLE* table);
 
 // The single-table UPDATE or DELETE whose SELECT_LEX is `sel`, as the
 // direct DML hooks run it: `where` is the condition MariaDB pushed (null
