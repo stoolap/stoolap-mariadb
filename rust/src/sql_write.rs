@@ -13,10 +13,10 @@
 //! not at all.
 
 use stoolap::api::ParamVec;
-use stoolap::core::{Error, ForeignKeyAction, Result, Row, Value};
+use stoolap::core::{Error, Result, Row, Value};
 
 use crate::session::Session;
-use crate::write::{self, ReadCheck};
+use crate::write;
 
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -101,127 +101,6 @@ pub fn update(
     );
     let values = set.into_iter().chain(key).map(|(_, v)| v);
     Ok(session.run_write(&sql, params(values))?.rows_affected())
-}
-
-/// Moves row `row_id`, which `key` names by its primary key (the `pk`-th
-/// of `table_columns` columns), to the key `to`, setting `rest` (the other
-/// columns, `check` as `update`'s) too. Stoolap's UPDATE refuses its
-/// primary key, which is the row id, so the row moves on the storage
-/// handle, in the statement's transaction, as a direct write moves it; the
-/// caller holds it first. What the executor would check around the key is
-/// checked here: a row a foreign key names refuses the move (RESTRICT, NO
-/// ACTION), and a key that is itself a foreign key needs its parent. A row
-/// whose children would follow the move (CASCADE, SET NULL) is refused
-/// until stoolap's UPDATE moves a key itself (stoolap#952). The rest goes
-/// through SQL, where the executor checks its keys. All of it under a
-/// savepoint: a row that fails leaves nothing written, as MariaDB's IGNORE
-/// expects.
-#[allow(clippy::too_many_arguments)]
-pub fn move_key(
-    session: &Session,
-    table: &str,
-    table_columns: usize,
-    row_id: i64,
-    pk: usize,
-    key: (String, Value),
-    to: Value,
-    rest: Vec<(String, Value)>,
-    check: Option<&[usize]>,
-) -> Result<i64> {
-    let (name, from) = key;
-    session.atomically(|| {
-        // Keys are matched by the columns they resolve to (their names are
-        // in lower case), and rows read through write handles, which take
-        // no statement view: a row committed since the statement began
-        // counts
-        let schema = session.with_any_write_table(table, |t| Ok(t.schema().clone()))?;
-        for fk in &schema.foreign_keys {
-            if schema.get_column_index(&fk.column_name) != Some(pk) || to.is_null() {
-                continue;
-            }
-            let parent = &fk.referenced_table;
-            let found = session.with_any_write_table(parent, |t| {
-                match t.schema().get_column_index(&fk.referenced_column) {
-                    Some(i) => write::holds(t, i, &to),
-                    None => Ok(false),
-                }
-            })?;
-            if !found {
-                return Err(Error::foreign_key_violation(
-                    table,
-                    &fk.column_name,
-                    parent,
-                    &fk.referenced_column,
-                    format!(
-                        "referenced row with {} = {} does not exist",
-                        fk.referenced_column, to
-                    ),
-                ));
-            }
-        }
-        for (child, fk) in session.referencing_keys(table) {
-            if schema.get_column_index(&fk.referenced_column) != Some(pk) {
-                continue;
-            }
-            let named = session.with_any_write_table(&child, |t| {
-                match t.schema().get_column_index(&fk.column_name) {
-                    Some(i) => write::holds(t, i, &from),
-                    None => Ok(false),
-                }
-            })?;
-            if !named {
-                continue;
-            }
-            if matches!(
-                fk.on_update,
-                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction
-            ) {
-                return Err(Error::foreign_key_violation(
-                    &child,
-                    &fk.column_name,
-                    table,
-                    &fk.referenced_column,
-                    format!(
-                        "cannot update row with {} = {} \u{2014} still referenced by table '{}'",
-                        fk.referenced_column, from, child
-                    ),
-                ));
-            }
-            let action = if fk.on_update == ForeignKeyAction::Cascade {
-                "CASCADE"
-            } else {
-                "SET NULL"
-            };
-            return Err(Error::NotSupported(format!(
-                "moving a primary key that a FOREIGN KEY with ON UPDATE {action} \
-                 names: stoolap's UPDATE cannot move a primary key yet (stoolap#952)"
-            )));
-        }
-        if !rest.is_empty() {
-            update(
-                session,
-                table,
-                rest,
-                vec![(name.clone(), from.clone())],
-                check.map(|c| (row_id, c)),
-            )?;
-        }
-        let unchecked = ReadCheck {
-            columns: &[],
-            values: &[],
-            pad: &[],
-        };
-        session.with_any_write_table(table, |t| {
-            write::update(
-                t,
-                table_columns,
-                row_id,
-                &[pk],
-                vec![to.clone()],
-                &unchecked,
-            )
-        })
-    })
 }
 
 /// Deletes the row `key` names

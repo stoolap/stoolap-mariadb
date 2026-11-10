@@ -1,4 +1,3 @@
--- known-diff-file: a primary key move whose children follow it (ON UPDATE CASCADE / SET NULL) is refused until stoolap's UPDATE moves a key (stoolap#952)
 CREATE TABLE p (id INT NOT NULL PRIMARY KEY) ENGINE={E};
 CREATE TABLE cc (id INT NOT NULL PRIMARY KEY, pid INT,
                  FOREIGN KEY (pid) REFERENCES p (id) ON UPDATE CASCADE) ENGINE={E};
@@ -18,6 +17,8 @@ CREATE TABLE r2 (id INT NOT NULL PRIMARY KEY, a INT, b INT,
 INSERT INTO rx VALUES (3);
 INSERT INTO r2 VALUES (10, 3, 3), (11, 3, NULL);
 UPDATE p SET id = 300 WHERE id = 3;
+-- several rows in one statement, each with children that follow it
+UPDATE p SET id = id + 1000 WHERE id >= 10;
 SELECT id FROM p ORDER BY id;
 SELECT id, pid FROM cc ORDER BY id;
 SELECT id, pid FROM cn ORDER BY id;
