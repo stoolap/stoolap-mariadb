@@ -122,18 +122,10 @@ def run(h):
         srv.start()
         c = _connect(srv)
         cur = c.cursor()
-        # Known: stoolap#941 replays the ALTER's renames of a table already
-        # on disk wrongly, and the table comes back empty. Reported, not
-        # failed; it fails once the rows survive, so the note gets removed.
-        survived = _rows(cur, f"SELECT id, w FROM t WHERE id <= {new_id} "
-                              "ORDER BY id")
-        if survived == [(2, 7), (3, 3), (new_id, 4)]:
-            h._fail("ALTER and its writes survive a restart",
-                    "stoolap#941 no longer loses them: remove the known note")
-        else:
-            h.skipped += 1
-            print("  KNOWN ALTER and its writes survive a restart: "
-                  f"stoolap#941 (rows after restart: {survived})")
+        h.assert_eq("ALTER and its writes survive a restart",
+                    [(2, 7), (3, 3), (new_id, 4)],
+                    _rows(cur, f"SELECT id, w FROM t WHERE id <= {new_id} "
+                               "ORDER BY id"))
         cur.execute(f"DROP DATABASE {DB}")
         c.close()
     finally:

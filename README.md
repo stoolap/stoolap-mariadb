@@ -317,11 +317,6 @@ Also:
   commit, leaving the child without its parent (InnoDB makes the INSERT
   wait on the parent's lock)
   ([stoolap#953](https://github.com/stoolap/stoolap/issues/953)).
-- **`ALTER TABLE` on `file://` storage** loses the table's rows at the
-  next restart when the table was already on disk (after a restart or a
-  checkpoint): Stoolap replays the ALTER's renames wrongly
-  ([stoolap#941](https://github.com/stoolap/stoolap/issues/941)).
-  `case_22_restart` reports it as known until the fix lands.
 
 ## Build
 
