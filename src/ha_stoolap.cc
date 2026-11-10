@@ -411,6 +411,7 @@ int raise_commit_error(const char* msg) {
 
 namespace {
 
+using stoolap_mariadb::stoolap_column_name;
 using stoolap_mariadb::stoolap_table_from_path;
 
 std::string quote_ident(std::string_view s) {
@@ -578,6 +579,8 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
                          bool if_not_exists, bool with_fks, const char* what) {
     std::vector<StoolapColumnDef> columns;
     columns.reserve(form->s->fields);
+    std::vector<std::string> names;
+    names.reserve(form->s->fields);
     for (uint i = 0; i < form->s->fields; ++i) {
         const Field* f = form->field[i];
         const int32_t kind = stoolap_column_kind(f);
@@ -587,7 +590,9 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
                 f->field_name.str, (int)f->real_type());
             return HA_ERR_UNSUPPORTED;
         }
-        columns.push_back({f->field_name.str, kind, f->real_maybe_null(),
+        names.push_back(stoolap_column_name(
+            std::string_view(f->field_name.str, f->field_name.length)));
+        columns.push_back({names.back().c_str(), kind, f->real_maybe_null(),
                            (f->flags & AUTO_INCREMENT_FLAG) != 0});
     }
     std::vector<std::vector<int32_t>> parts(form->s->keys);
@@ -2205,8 +2210,8 @@ void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,
     }
 
     std::string sql = "SELECT MAX(";
-    sql += quote_ident(std::string_view(auto_field->field_name.str,
-                                        auto_field->field_name.length));
+    sql += quote_ident(stoolap_column_name(std::string_view(
+        auto_field->field_name.str, auto_field->field_name.length)));
     sql += ") FROM ";
     sql += quote_ident(stoolap_table_);
     auto* ctx = get_thd_ctx(ha_thd());

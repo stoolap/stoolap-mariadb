@@ -51,7 +51,11 @@
 namespace stoolap_sqlgen {
 namespace {
 
-std::string quote_ident(std::string_view s) {
+// Every identifier written goes through stoolap_column_name: a column, an
+// alias and a table name alike, so a name and its references agree (a
+// table's stoolap name never is `_rowid_`).
+std::string quote_ident(std::string_view name) {
+    const std::string s = stoolap_mariadb::stoolap_column_name(name);
     std::string out;
     out.reserve(s.size() + 2);
     out.push_back('"');
@@ -108,8 +112,10 @@ public:
     bool exists_list_ = false;
 
 private:
-    // Appends a quoted identifier / a positional column name to out.
-    void ident(std::string_view s) {
+    // Appends a quoted identifier (as quote_ident) / a positional column
+    // name to out.
+    void ident(std::string_view name) {
+        const std::string s = stoolap_mariadb::stoolap_column_name(name);
         out.push_back('"');
         if (s.find('"') == std::string_view::npos) {
             out.append(s);
