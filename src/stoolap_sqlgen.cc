@@ -1529,12 +1529,6 @@ bool Gen::modify(SELECT_LEX* sel, Item* where) {
     if (!t || t->next_local || t->derived || t->nested_join || !t->table ||
         !t->table->s)
         return fail("modified table");
-    // One row named by its primary key: the row pump reads and writes it
-    // by its key, faster than a statement stoolap parses and plans (a
-    // point UPDATE 13-16 us against 20-28 us, a DELETE 14 against 16),
-    // and checks it as the statement would (a concurrent change is 1213)
-    if (where && pk_equality(where, t->table))
-        return fail("one row by its primary key");
     const std::string name = quote_ident(stoolap_table_name(t->table->s));
     alias_[t] = name;
     std::string changes;  // UPDATE: a row's SET changes it
@@ -1887,6 +1881,10 @@ bool gen_unit(THD* thd, st_select_lex_unit* unit, std::string* out,
     }
     *out = std::move(g.out);
     return true;
+}
+
+bool one_row_by_key(Item* where, TABLE* table) {
+    return where && table && pk_equality(where, table);
 }
 
 }  // namespace stoolap_sqlgen

@@ -172,6 +172,11 @@ bool can_direct_modify(THD* thd, const Item* where) {
         return false;  // multi-table UPDATE/DELETE
     if (sel->order_list.elements || sel->limit_params.select_limit)
         return false;  // ORDER BY / LIMIT
+    // One row by its primary key: the row pump's (one_row_by_key), told
+    // before the checks below, which each statement runs more than once
+    if (stoolap_sqlgen::one_row_by_key(const_cast<Item*>(where),
+                                       sel->get_table_list()->table))
+        return false;
     if (sel->uncacheable & UNCACHEABLE_SIDEEFFECT) return false;
 
     // True if `root` references a ci-string or DECIMAL field. Both
