@@ -188,7 +188,7 @@ pub fn create_table(
         sql.push_str(&key_columns(k)?);
     }
     for fk in foreign_keys {
-        foreign_key(fk, &mut sql)?;
+        foreign_key(fk, table, &mut sql)?;
     }
     sql.push(')');
     session.run(&sql, ParamVec::new())?;
@@ -321,11 +321,17 @@ pub fn kept_foreign_keys(
     };
     fks.into_iter()
         .map(|fk| {
-            if dropped.iter().any(|d| same(d, &fk.column_name)) {
-                return Err(Error::NotSupported(format!(
-                    "column '{}' is used by a FOREIGN KEY: it cannot be dropped",
-                    fk.column_name
-                )));
+            let own = same(&fk.referenced_table, from);
+            for column in [Some(&fk.column_name), own.then_some(&fk.referenced_column)]
+                .into_iter()
+                .flatten()
+            {
+                if dropped.iter().any(|d| same(d, column)) {
+                    return Err(Error::NotSupported(format!(
+                        "column '{}' is used by a FOREIGN KEY: it cannot be dropped",
+                        column
+                    )));
+                }
             }
             let renamed = |name: String| {
                 renames
@@ -333,7 +339,7 @@ pub fn kept_foreign_keys(
                     .find(|(old, _)| same(old, &name))
                     .map_or(name, |(_, new)| new.clone())
             };
-            let (parent, parent_column) = if same(&fk.referenced_table, from) {
+            let (parent, parent_column) = if own {
                 (to.to_string(), renamed(fk.referenced_column))
             } else {
                 (fk.referenced_table, fk.referenced_column)
@@ -350,7 +356,10 @@ pub fn kept_foreign_keys(
 }
 
 /// Appends `fk` as a clause of its table's CREATE TABLE
-fn foreign_key(fk: &ForeignKey, out: &mut String) -> Result<()> {
+fn foreign_key(fk: &ForeignKey, table: &str, out: &mut String) -> Result<()> {
+    // InnoDB refuses an update that would cascade back into the table it
+    // updates (1451): a key naming its own table restricts its updates
+    let own = fk.parent.to_lowercase() == table.to_lowercase();
     out.push_str(", FOREIGN KEY (");
     out.push_str(&quote(&fk.column));
     out.push_str(") REFERENCES ");
@@ -360,7 +369,11 @@ fn foreign_key(fk: &ForeignKey, out: &mut String) -> Result<()> {
         out.push_str(&quote(c));
         out.push(')');
     }
-    for (event, action) in [("DELETE", fk.on_delete), ("UPDATE", fk.on_update)] {
+    let on_update = match fk.on_update {
+        STOOLAP_FK_CASCADE | STOOLAP_FK_SET_NULL if own => STOOLAP_FK_RESTRICT,
+        action => action,
+    };
+    for (event, action) in [("DELETE", fk.on_delete), ("UPDATE", on_update)] {
         let words = match action {
             STOOLAP_FK_UNDEF => continue,
             STOOLAP_FK_RESTRICT => "RESTRICT",
@@ -393,7 +406,7 @@ mod tests {
         };
         let sql = |k: ForeignKey| {
             let mut out = String::new();
-            foreign_key(&k, &mut out).map(|_| out)
+            foreign_key(&k, "d_1c", &mut out).map(|_| out)
         };
         assert_eq!(
             sql(fk("d_1p", Some("id"), STOOLAP_FK_CASCADE, STOOLAP_FK_SET_NULL)).unwrap(),
@@ -403,10 +416,14 @@ mod tests {
             sql(fk("o_1p", None, STOOLAP_FK_UNDEF, STOOLAP_FK_NO_ACTION)).unwrap(),
             ", FOREIGN KEY (\"p\"\"id\") REFERENCES \"o_1p\" ON UPDATE NO ACTION"
         );
-        // A key naming its own table
+        // A key naming its own table restricts its updates
         assert_eq!(
             sql(fk("d_1c", Some("id"), STOOLAP_FK_UNDEF, STOOLAP_FK_UNDEF)).unwrap(),
             ", FOREIGN KEY (\"p\"\"id\") REFERENCES \"d_1c\" (\"id\")"
+        );
+        assert_eq!(
+            sql(fk("D_1C", Some("id"), STOOLAP_FK_CASCADE, STOOLAP_FK_CASCADE)).unwrap(),
+            ", FOREIGN KEY (\"p\"\"id\") REFERENCES \"D_1C\" (\"id\") ON DELETE CASCADE ON UPDATE RESTRICT"
         );
         assert!(sql(fk("d_1p", Some("id"), 9, STOOLAP_FK_UNDEF)).is_err());
     }

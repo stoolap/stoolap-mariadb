@@ -13,7 +13,7 @@
 //! not at all.
 
 use stoolap::api::ParamVec;
-use stoolap::core::{DataType, Error, Result, Row, Value};
+use stoolap::core::{Error, Result, Row, Value};
 
 use crate::session::Session;
 use crate::write;
@@ -104,38 +104,38 @@ pub fn update(
 }
 
 /// Refuses `table` when a row holds a foreign key value its parent holds
-/// in no row, naming the first such key: one query per key, over every
-/// row, with the parent read as the statement sees it
+/// in no row, as the executor refuses an INSERT: by an UPDATE setting each
+/// key column to itself, which has the executor check every row's values
+/// against their parents and hold each parent key until the transaction
+/// ends, so a concurrent delete of one conflicts instead of leaving a row
+/// without it
 pub fn check_foreign_keys(session: &Session, table: &str) -> Result<()> {
     let schema = session.with_any_write_table(table, |t| Ok(t.schema().clone()))?;
+    let mut columns: Vec<String> = Vec::new();
     for fk in &schema.foreign_keys {
-        let sql = format!(
-            "SELECT c.{col} FROM {table} c WHERE c.{col} IS NOT NULL AND NOT EXISTS \
-             (SELECT 1 FROM {parent} p WHERE p.{pcol} = c.{col}) LIMIT 1",
-            col = quote(&fk.column_name),
-            table = quote(table),
-            parent = quote(&fk.referenced_table),
-            pcol = quote(&fk.referenced_column),
-        );
-        let mut rows = session.run(&sql, ParamVec::new())?;
-        if rows.next() {
-            let value = rows
-                .row()
-                .get(0)
-                .cloned()
-                .unwrap_or(Value::Null(DataType::Null));
-            return Err(Error::foreign_key_violation(
-                table,
-                &fk.column_name,
-                &fk.referenced_table,
-                &fk.referenced_column,
-                format!(
-                    "referenced row with {} = {} does not exist",
-                    fk.referenced_column, value
-                ),
-            ));
+        let column = quote(&fk.column_name);
+        if !columns.contains(&column) {
+            columns.push(column);
         }
     }
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let sql = format!(
+        "UPDATE {} SET {} WHERE {}",
+        quote(table),
+        columns
+            .iter()
+            .map(|c| format!("{c} = {c}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        columns
+            .iter()
+            .map(|c| format!("{c} IS NOT NULL"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    );
+    session.run_write(&sql, ParamVec::new())?;
     Ok(())
 }
 
