@@ -625,10 +625,18 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
         // A parent's copying ALTER, whose swap would take the key to the
         // old table, waits for this statement or this one for it
         std::string missing;
+        bool other_engine = false;
         if (!fks.empty() &&
-            !stoolap_thd_lock_fk_parents(current_thd, form->s->db.str,
-                                         form->s->db.length, &missing)) {
-            if (!missing.empty())
+            !stoolap_thd_lock_fk_parents(
+                current_thd, form->s->db.str, form->s->db.length,
+                form->s->table_name.str, form->s->table_name.length,
+                stoolap_hton, &missing, &other_engine)) {
+            if (other_engine)
+                my_printf_error(ER_GET_ERRMSG,
+                                "stoolap: FOREIGN KEY references '%s', a "
+                                "table of another engine",
+                                MYF(0), missing.c_str());
+            else if (!missing.empty())
                 my_printf_error(ER_GET_ERRMSG,
                                 "stoolap: FOREIGN KEY references non-existent "
                                 "table '%s'",

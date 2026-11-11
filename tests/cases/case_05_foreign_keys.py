@@ -206,6 +206,28 @@ INSERT INTO fk_chain.d VALUES (1, 1);
                      "CREATE TABLE lu (id INT NOT NULL PRIMARY KEY, pid INT, "
                      f"FOREIGN KEY (pid) REFERENCES LP (id)) ENGINE={h.engine}",
                      r"non-existent table")
+        # MariaDB locks LP ahead of a copying ALTER ... ADD FOREIGN KEY;
+        # the key is still checked against it
+        h.assert_err("so is one an ALTER adds",
+                     "ALTER TABLE lc ADD FOREIGN KEY (pid) REFERENCES LP (id), "
+                     "ALGORITHM=COPY", r"non-existent table")
+        # An InnoDB LP beside the stoolap lp: the key would bind to lp
+        # while the lock holds LP
+        h.exec_stmt("CREATE TABLE LP (id INT NOT NULL PRIMARY KEY) "
+                    "ENGINE=InnoDB")
+        h.assert_err("a parent of another engine, lp beside it, is no parent",
+                     "CREATE TABLE lu (id INT NOT NULL PRIMARY KEY, pid INT, "
+                     f"FOREIGN KEY (pid) REFERENCES LP (id)) ENGINE={h.engine}",
+                     r"another engine")
+        h.assert_err("nor for an ALTER",
+                     "ALTER TABLE lc ADD FOREIGN KEY (pid) REFERENCES LP (id), "
+                     "ALGORITHM=COPY", r"another engine")
+        h.exec_stmt("DROP TABLE LP")
+    h.exec_stmt("CREATE TABLE li (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB")
+    h.assert_err("a parent of another engine is refused",
+                 "CREATE TABLE lu (id INT NOT NULL PRIMARY KEY, pid INT, "
+                 f"FOREIGN KEY (pid) REFERENCES li (id)) ENGINE={h.engine}",
+                 r"another engine")
     h.assert_scalar("and is gone", "SELECT COUNT(*) FROM information_schema.schemata "
                     "WHERE schema_name = 'fk_chain'", "0")
 
