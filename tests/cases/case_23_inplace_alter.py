@@ -285,4 +285,14 @@ INSERT INTO ir VALUES (1, 1, 2), (2, 2, 1);
                 "ADD INDEX k (b), ALGORITHM=INPLACE")
     h.assert_scalar("reads by the moved key",
                     "SELECT id FROM ir FORCE INDEX (k) WHERE b = 1", "2")
+    # j shares k's index; k moved to other columns takes a name of its own
+    h.assert_ok("a key over a kept key's columns",
+                "ALTER TABLE ir ADD INDEX j (b), ALGORITHM=INPLACE")
+    h.assert_ok("the kept key moved",
+                "ALTER TABLE ir DROP INDEX k, ADD INDEX k (aa), "
+                "ALGORITHM=INPLACE")
+    h.assert_scalar("reads by the moved key",
+                    "SELECT id FROM ir FORCE INDEX (k) WHERE aa = 2", "2")
+    h.assert_scalar("and by the other",
+                    "SELECT id FROM ir FORCE INDEX (j) WHERE b = 2", "1")
     h.exec_script("DROP TABLE iq; DROP TABLE ir")

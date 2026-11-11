@@ -240,11 +240,6 @@ pub fn create_table(
     Ok(failed)
 }
 
-/// The stoolap index of `table`'s non-unique key `key`
-fn index_name(table: &str, key: &str) -> String {
-    quote(&format!("{table}__{key}"))
-}
-
 /// The names of `table`'s indexes over `columns`, in their order, that
 /// `keep` keeps. Stoolap keeps one index per column list, so the keys of
 /// the table over the same columns share it; an index keeps the name it
@@ -271,22 +266,38 @@ fn indexes_on(
 
 /// Creates the index of `table`'s non-unique key `key` over `columns`,
 /// unless an index over them is there (another key's, a UNIQUE key's, a
-/// FOREIGN KEY's), which serves the key too
+/// FOREIGN KEY's), which serves the key too. It is named `table__key`, or
+/// with `_N` after it when another index has that name (one another key
+/// over other columns shares). An index made meanwhile, as a concurrent
+/// open's reconcile may make it, is the key's too.
 pub fn create_index(session: &Session, table: &str, key: &str, columns: &[&str]) -> Result<()> {
     if !indexes_on(session, table, columns, |_, _| true)?.is_empty() {
         return Ok(());
     }
+    let taken: Vec<String> = session
+        .table_indexes(table)?
+        .into_iter()
+        .map(|(name, _, _)| name.to_lowercase())
+        .collect();
+    let base = format!("{table}__{key}");
+    let name = std::iter::once(base.clone())
+        .chain((1..).map(|n| format!("{base}_{n}")))
+        .find(|n| !taken.contains(&n.to_lowercase()))
+        .expect("a free name");
     let quoted: Vec<String> = columns.iter().map(|c| quote(c)).collect();
-    session.run(
+    let made = session.run(
         &format!(
-            "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
-            index_name(table, key),
+            "CREATE INDEX {} ON {} ({})",
+            quote(&name),
             quote(table),
             quoted.join(", ")
         ),
         ParamVec::new(),
-    )?;
-    Ok(())
+    );
+    match made {
+        Err(_) if !indexes_on(session, table, columns, |_, _| true)?.is_empty() => Ok(()),
+        made => made.map(|_| ()),
+    }
 }
 
 /// Drops the non-unique index of `table` over `columns`, for a key dropped
@@ -690,6 +701,27 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), n);
         assert!(seen.iter().all(|&v| v != 0));
+
+        // A name another key's columns keep (j's, which shares k's index)
+        // is not taken again for k over other columns
+        run("CREATE TABLE i_1n (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        create_index(&s, "i_1n", "k", &["a"]).unwrap();
+        create_index(&s, "i_1n", "j", &["a"]).unwrap();
+        create_index(&s, "i_1n", "k", &["b"]).unwrap();
+        let mut on: Vec<(String, Vec<String>)> = s
+            .table_indexes("i_1n")
+            .unwrap()
+            .into_iter()
+            .map(|(name, _, columns)| (name.to_lowercase(), columns))
+            .collect();
+        on.sort();
+        assert_eq!(
+            on,
+            vec![
+                ("i_1n__k".to_string(), vec!["a".to_string()]),
+                ("i_1n__k_1".to_string(), vec!["b".to_string()]),
+            ]
+        );
 
         // A UNIQUE key's index stays, whatever its name
         let column = |name: &str| Column {
