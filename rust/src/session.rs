@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use rustc_hash::FxHashMap;
 
 use stoolap::api::{Database, ParamVec};
-use stoolap::core::{Error, IsolationLevel, Result, Row};
+use stoolap::core::{Error, IndexType, IsolationLevel, Result, Row};
 use stoolap::executor::{CachedPlanRef, ExecutionContext, Executor};
 use stoolap::parser::ast::{RollbackStatement, Statement};
 use stoolap::storage::mvcc::registry::StatementView;
@@ -215,13 +215,22 @@ impl Session {
         self.take()?.rollback()
     }
 
-    /// The stoolap names of `table`'s indexes, its primary key's aside
-    pub fn table_indexes(&self, table: &str) -> Result<Vec<String>> {
+    /// `table`'s indexes, its primary key's aside: name, whether unique,
+    /// columns
+    pub fn table_indexes(&self, table: &str) -> Result<Vec<(String, bool, Vec<String>)>> {
         Ok(self
             .exec
             .engine()
-            .list_table_indexes(table)?
-            .into_keys()
+            .get_all_indexes(table)?
+            .iter()
+            .filter(|i| i.index_type() != IndexType::PrimaryKey)
+            .map(|i| {
+                (
+                    i.name().to_string(),
+                    i.is_unique(),
+                    i.column_names().to_vec(),
+                )
+            })
             .collect())
     }
 

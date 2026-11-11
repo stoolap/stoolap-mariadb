@@ -245,3 +245,19 @@ INSERT INTO ic VALUES (1, 1);
     h.assert_err("the key still holds after the refusal",
                  "INSERT INTO ic VALUES (4, 9)", "1452")
     h.exec_script("DROP TABLE ic; DROP TABLE ip")
+
+    h.section("A key's index, not another's of its name")
+    # `_d`.`t`'s first UNIQUE index is stoolap's unique__0d_1t_0, named as
+    # the index of a key `0d_1t_0` would be; dropping that key keeps it
+    h.exec_script(f"""
+DROP DATABASE IF EXISTS `_d`;
+CREATE DATABASE `_d`;
+CREATE TABLE `_d`.t (id INT NOT NULL PRIMARY KEY, a INT UNIQUE, b INT,
+  KEY `0d_1t_0` (b)) ENGINE={h.engine};
+INSERT INTO `_d`.t VALUES (1, 1, 1);
+""", use_db=False)
+    h.assert_ok("the key dropped", "ALTER TABLE `_d`.t DROP INDEX `0d_1t_0`, "
+                "ALGORITHM=INPLACE")
+    h.assert_err("the UNIQUE key still holds",
+                 "INSERT INTO `_d`.t VALUES (2, 1, 2)", "1062")
+    h.exec_script("DROP DATABASE `_d`", use_db=False)

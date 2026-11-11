@@ -245,47 +245,52 @@ fn index_name(table: &str, key: &str) -> String {
     quote(&format!("{table}__{key}"))
 }
 
-/// The stoolap indexes of `table`'s non-unique key `key`. An index keeps
-/// the name it was created with, by the table's name then: a RENAME TABLE,
-/// and the swap of a copying ALTER, leave it. No stoolap table name holds
-/// `__` (the escaping writes `_` as `_0`), so an index's key name is what
-/// follows its first one.
-fn key_indexes(session: &Session, table: &str, key: &str) -> Result<Vec<String>> {
-    let key = key.to_lowercase();
+/// The stoolap indexes of `table`'s non-unique key `key` over `columns`.
+/// An index keeps the name it was created with, by the table's name then
+/// (a RENAME TABLE, and the swap of a copying ALTER, leave it), which a
+/// shortened table name makes no prefix to split off: it is one the plugin
+/// created for the key when non-unique, over those columns, and named
+/// `..__key`.
+fn key_indexes(session: &Session, table: &str, key: &str, columns: &[&str]) -> Result<Vec<String>> {
+    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    let suffix = format!("__{}", key.to_lowercase());
     Ok(session
         .table_indexes(table)?
         .into_iter()
-        .filter(|n| {
-            n.split_once("__")
-                .is_some_and(|(_, k)| k.to_lowercase() == key)
+        .filter(|(name, unique, on)| {
+            !unique
+                && name.to_lowercase().ends_with(&suffix)
+                && on.len() == columns.len()
+                && on.iter().zip(columns).all(|(a, b)| same(a, b))
         })
+        .map(|(name, _, _)| name)
         .collect())
 }
 
 /// Creates the index of `table`'s non-unique key `key` over `columns`,
 /// unless the key has one, by whatever name
 pub fn create_index(session: &Session, table: &str, key: &str, columns: &[&str]) -> Result<()> {
-    if !key_indexes(session, table, key)?.is_empty() {
+    if !key_indexes(session, table, key, columns)?.is_empty() {
         return Ok(());
     }
-    let columns: Vec<String> = columns.iter().map(|c| quote(c)).collect();
+    let quoted: Vec<String> = columns.iter().map(|c| quote(c)).collect();
     session.run(
         &format!(
             "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
             index_name(table, key),
             quote(table),
-            columns.join(", ")
+            quoted.join(", ")
         ),
         ParamVec::new(),
     )?;
     Ok(())
 }
 
-/// Drops the indexes of `table`'s non-unique key `key`, by the names they
-/// were created with; none when there are none (a dropped column takes its
-/// indexes with it)
-pub fn drop_index(session: &Session, table: &str, key: &str) -> Result<()> {
-    for name in key_indexes(session, table, key)? {
+/// Drops the indexes of `table`'s non-unique key `key` over `columns`, by
+/// the names they were created with; none when there are none (a dropped
+/// column takes its indexes with it)
+pub fn drop_index(session: &Session, table: &str, key: &str, columns: &[&str]) -> Result<()> {
+    for name in key_indexes(session, table, key, columns)? {
         session.run(
             &format!("DROP INDEX {} ON {}", quote(&name), quote(table)),
             ParamVec::new(),
@@ -303,7 +308,13 @@ pub fn table_version(session: &Session, table: &str) -> Result<u64> {
     let mut indexes: Vec<String> = session
         .table_indexes(table)?
         .into_iter()
-        .map(|n| n.to_lowercase())
+        .map(|(name, unique, columns)| {
+            format!(
+                "{}\0{unique}\0{}",
+                name.to_lowercase(),
+                columns.join("\0").to_lowercase()
+            )
+        })
         .collect();
     indexes.sort();
     let mut text = String::new();
@@ -628,6 +639,16 @@ mod tests {
         let run = |sql: &str| {
             s.run(sql, ParamVec::new()).unwrap();
         };
+        let names = |table: &str| {
+            let mut n: Vec<String> = s
+                .table_indexes(table)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _, _)| name.to_lowercase())
+                .collect();
+            n.sort();
+            n
+        };
         run("CREATE TABLE d_1t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
         create_index(&s, "d_1t", "k", &["a"]).unwrap();
         create_index(&s, "d_1t", "k_0", &["b"]).unwrap();
@@ -635,14 +656,11 @@ mod tests {
         assert_eq!(before, table_version(&s, "d_1t").unwrap());
         // A renamed table's indexes keep their names, and are its keys'
         run("ALTER TABLE d_1t RENAME TO d_1u");
-        assert_eq!(key_indexes(&s, "d_1u", "K").unwrap().len(), 1);
+        assert_eq!(key_indexes(&s, "d_1u", "K", &["A"]).unwrap().len(), 1);
         create_index(&s, "d_1u", "k", &["a"]).unwrap();
-        assert_eq!(s.table_indexes("d_1u").unwrap().len(), 2);
-        drop_index(&s, "d_1u", "k").unwrap();
-        let mut left = s.table_indexes("d_1u").unwrap();
-        left.sort();
-        assert_eq!(left.len(), 1);
-        assert!(left[0].to_lowercase().ends_with("__k_0"));
+        assert_eq!(names("d_1u").len(), 2);
+        drop_index(&s, "d_1u", "k", &["a"]).unwrap();
+        assert_eq!(names("d_1u"), vec!["d_1t__k_0"]);
         // Each change of a column or an index changes the version
         let mut seen = vec![before, table_version(&s, "d_1u").unwrap()];
         add_column(&s, "d_1u", "c", STOOLAP_COL_TEXT, true, &Value::text("x")).unwrap();
@@ -659,6 +677,62 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), n);
         assert!(seen.iter().all(|&v| v != 0));
+
+        // A UNIQUE key's index, named as a non-unique key's would be, is
+        // not that key's: `_d.t`'s first is unique__0d_1t_0
+        let column = |name: &str| Column {
+            name: name.into(),
+            kind: STOOLAP_COL_INTEGER,
+            nullable: true,
+            auto_increment: false,
+        };
+        let key = |name: &str, columns: Vec<usize>, kind| Key {
+            name: name.into(),
+            columns,
+            kind,
+        };
+        create_table(
+            &s,
+            "_0d_1t",
+            &[column("a"), column("b")],
+            &[
+                key("a", vec![0], STOOLAP_KEYDEF_UNIQUE),
+                key("0d_1t_0", vec![1], STOOLAP_KEYDEF_INDEX),
+            ],
+            &[],
+            false,
+        )
+        .unwrap();
+        let unique: Vec<String> = s
+            .table_indexes("_0d_1t")
+            .unwrap()
+            .into_iter()
+            .filter(|(_, unique, _)| *unique)
+            .map(|(name, _, _)| name)
+            .collect();
+        assert_eq!(unique.len(), 1);
+        assert!(unique[0].to_lowercase().ends_with("__0d_1t_0"));
+        drop_index(&s, "_0d_1t", "0d_1t_0", &["b"]).unwrap();
+        assert_eq!(
+            names("_0d_1t"),
+            unique.iter().map(|n| n.to_lowercase()).collect::<Vec<_>>()
+        );
+        run("INSERT INTO \"_0d_1t\" VALUES (1, 1)");
+        assert!(s
+            .run("INSERT INTO \"_0d_1t\" VALUES (1, 2)", ParamVec::new())
+            .is_err());
+
+        // A shortened name holds `__` (`_` cut from `_0`, then `_2`)
+        let long = fit_name(format!("{}_1{}", "_0".repeat(64), "_0".repeat(64)));
+        assert!(long.contains("__"));
+        run(&format!(
+            "CREATE TABLE {} (id INTEGER PRIMARY KEY, a INTEGER)",
+            quote(&long)
+        ));
+        create_index(&s, &long, "k", &["a"]).unwrap();
+        assert_eq!(names(&long).len(), 1);
+        drop_index(&s, &long, "k", &["a"]).unwrap();
+        assert!(names(&long).is_empty());
     }
 
     #[test]

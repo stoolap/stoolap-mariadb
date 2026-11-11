@@ -1124,27 +1124,35 @@ bool ha_stoolap::commit_inplace_alter_table(TABLE* altered_table,
     }
     // The indexes after the column: a dropped column took its own
     std::string failed;
-    for (const KEY* k : plan.drop_keys)
-        if (stoolap_alter_index(db, tbl, k->name.str, 0, nullptr, 0) !=
-            STOOLAP_OK)
-            failed +=
-                std::string(k->name.str) + ": " + stoolap_errmsg(db) + "; ";
-    for (const KEY* k : plan.add_keys) {
-        std::vector<std::string> names;
-        for (uint j = 0; j < k->user_defined_key_parts; ++j) {
-            const LEX_CSTRING& n =
-                altered_table->field[k->key_part[j].fieldnr]->field_name;
-            names.push_back(
-                stoolap_column_name(std::string_view(n.str, n.length)));
-        }
+    // A key's index, by the key's name and its columns' names
+    auto alter_index = [&](const KEY* k, const std::vector<std::string>& names,
+                           bool create) {
         std::vector<const char*> columns;
         for (const auto& n : names)
             columns.push_back(n.c_str());
-        if (stoolap_alter_index(db, tbl, k->name.str, 1, columns.data(),
+        if (stoolap_alter_index(db, tbl, k->name.str, create, columns.data(),
                                 static_cast<int32_t>(columns.size())) !=
             STOOLAP_OK)
             failed +=
                 std::string(k->name.str) + ": " + stoolap_errmsg(db) + "; ";
+    };
+    auto name_of = [](const Field* f) {
+        return stoolap_column_name(
+            std::string_view(f->field_name.str, f->field_name.length));
+    };
+    // The old table's keys name their fields; the new ones number them
+    for (const KEY* k : plan.drop_keys) {
+        std::vector<std::string> names;
+        for (uint j = 0; j < k->user_defined_key_parts; ++j)
+            names.push_back(name_of(k->key_part[j].field));
+        alter_index(k, names, false);
+    }
+    for (const KEY* k : plan.add_keys) {
+        std::vector<std::string> names;
+        for (uint j = 0; j < k->user_defined_key_parts; ++j)
+            names.push_back(
+                name_of(altered_table->field[k->key_part[j].fieldnr]));
+        alter_index(k, names, true);
     }
     if (!failed.empty())
         sql_print_warning(
