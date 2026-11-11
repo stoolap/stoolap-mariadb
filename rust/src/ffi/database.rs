@@ -70,6 +70,7 @@ pub unsafe extern "C" fn stoolap_open(dsn: *const c_char, out_db: *mut *mut Stoo
 
         match Database::open(dsn_str) {
             Ok(db) => {
+                crate::ddl::rename_reserved_columns(&db);
                 let handle = Box::new(StoolapDB {
                     session: Session::new(&db),
                     last_error: None,

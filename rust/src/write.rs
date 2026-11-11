@@ -112,7 +112,7 @@ pub fn update(
             }
             check_unique(table, row_id, &row, columns)?;
         }
-        let mut set = |mut row: Row| -> Result<(Row, bool)> {
+        let mut set = |_: i64, mut row: Row| -> Result<(Row, bool)> {
             if read.changed(&row) {
                 return Err(conflict(row_id));
             }
@@ -201,7 +201,7 @@ pub(crate) fn check_update(
 /// the check and the write. The row as held, or None when it is gone.
 pub fn hold_unchanged(table: &mut dyn Table, row_id: i64, read: &ReadCheck) -> Result<Option<Row>> {
     let mut held = None;
-    let mut hold = |row: Row| -> Result<(Row, bool)> {
+    let mut hold = |_: i64, row: Row| -> Result<(Row, bool)> {
         if read.changed(&row) {
             return Err(conflict(row_id));
         }
@@ -293,28 +293,6 @@ fn check_unique_batch(table: &dyn Table, rows: &[Row]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Whether a row of `table` holds `value` in its `column`-th column
-pub fn holds(table: &dyn Table, column: usize, value: &Value) -> Result<bool> {
-    let schema = table.schema();
-    let mut filter = ComparisonExpr::new(
-        schema.columns[column].name.as_str(),
-        Operator::Eq,
-        value.clone(),
-    );
-    filter.prepare_for_schema(schema);
-    let plan = table.index_plan(&filter);
-    let access = match &plan {
-        Some(p) => ScanAccess::Index(p),
-        None => ScanAccess::Seq,
-    };
-    let mut scanner = table.scan_access(access, &[], None, Some(&filter))?;
-    let found = scanner.next();
-    match scanner.err() {
-        Some(e) => Err(e.clone()),
-        None => Ok(found),
-    }
 }
 
 /// Refuses `row`, the new state of row `row_id`, when a UNIQUE index over

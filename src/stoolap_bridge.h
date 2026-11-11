@@ -170,6 +170,25 @@ inline std::string stoolap_table_from_path(const char* mariadb_path) {
     return fit_table_name(std::move(out));
 }
 
+// Stoolap's name for the column MariaDB names `name`. Stoolap keeps
+// `_rowid_`, in any case, for a row's identity and refuses it as a column
+// or an alias, so that name takes a suffix no MariaDB identifier holds: a
+// character past the Basic Multilingual Plane (U+F0000). Every other name
+// is its own. A column an older build stored as `_rowid_` takes this name
+// when the database opens (ddl::rename_reserved_columns).
+inline std::string stoolap_column_name(std::string_view name) {
+    static constexpr std::string_view kRowid = "_rowid_";
+    std::string out(name);
+    if (name.size() != kRowid.size()) return out;
+    for (size_t i = 0; i < name.size(); ++i) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != kRowid[i]) return out;
+    }
+    out += "\xF3\xB0\x80\x80";
+    return out;
+}
+
 // Hot-path read with memory_order_relaxed; bool read + branch, free off.
 extern std::atomic<bool> g_perf_trace_enabled;
 

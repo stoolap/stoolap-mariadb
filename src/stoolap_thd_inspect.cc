@@ -17,6 +17,7 @@
 #include "sql_lex.h"
 #include "sql_table.h"  // tablename_to_filename
 #include "stoolap_mariadb.h"
+#include "stoolap_bridge.h"
 
 static_assert(FK_OPTION_UNDEF == STOOLAP_FK_UNDEF &&
                   FK_OPTION_RESTRICT == STOOLAP_FK_RESTRICT &&
@@ -66,15 +67,16 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
             return false;
         StoolapThdForeignKey def;
         const Key_part_spec* col = fk->columns.head();
-        def.column.assign(col->field_name.str, col->field_name.length);
+        def.column = stoolap_mariadb::stoolap_column_name(
+            std::string_view(col->field_name.str, col->field_name.length));
         def.parent_path = file_name(
             fk->ref_db.length ? fk->ref_db
                               : LEX_CSTRING{child_db, child_db_length});
         def.parent_path += '/';
         def.parent_path += file_name(fk->ref_table);
         if (const Key_part_spec* ref = fk->ref_columns.head())
-            def.parent_column.assign(ref->field_name.str,
-                                     ref->field_name.length);
+            def.parent_column = stoolap_mariadb::stoolap_column_name(
+                std::string_view(ref->field_name.str, ref->field_name.length));
         def.on_delete = fk->delete_opt;
         def.on_update = fk->update_opt;
         out->push_back(std::move(def));
@@ -103,23 +105,28 @@ bool stoolap_thd_altered_table(
         *path = file_name(t->db) + '/' + file_name(t->table_name);
     List_iterator_fast<Alter_drop> drops(lex->alter_info.drop_list);
     while (const Alter_drop* d = drops++) {
-        if (d->type == Alter_drop::COLUMN) dropped->emplace_back(d->name);
+        if (d->type == Alter_drop::COLUMN)
+            dropped->push_back(stoolap_mariadb::stoolap_column_name(d->name));
     }
     // CHANGE old new ...
     List_iterator_fast<Create_field> fields(lex->alter_info.create_list);
     while (const Create_field* f = fields++) {
         if (f->change.length)
             renames->emplace_back(
-                std::string(f->change.str, f->change.length),
-                std::string(f->field_name.str, f->field_name.length));
+                stoolap_mariadb::stoolap_column_name(
+                    std::string_view(f->change.str, f->change.length)),
+                stoolap_mariadb::stoolap_column_name(
+                    std::string_view(f->field_name.str, f->field_name.length)));
     }
     // RENAME COLUMN old TO new
     List_iterator_fast<Alter_column> columns(lex->alter_info.alter_list);
     while (const Alter_column* c = columns++) {
         if (c->new_name.length)
             renames->emplace_back(
-                std::string(c->name.str, c->name.length),
-                std::string(c->new_name.str, c->new_name.length));
+                stoolap_mariadb::stoolap_column_name(
+                    std::string_view(c->name.str, c->name.length)),
+                stoolap_mariadb::stoolap_column_name(
+                    std::string_view(c->new_name.str, c->new_name.length)));
     }
     return true;
 }
