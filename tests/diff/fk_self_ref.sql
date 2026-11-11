@@ -23,25 +23,6 @@ CREATE TABLE n (id INT NOT NULL PRIMARY KEY, pid INT,
 INSERT INTO n VALUES (1, NULL), (2, 1), (3, 1), (4, 2);
 DELETE FROM n WHERE id = 1;
 SELECT id, pid FROM n ORDER BY id;
--- InnoDB refuses an update that would cascade back into its own table
--- (1451): CASCADE and SET NULL on UPDATE restrict, ON DELETE acts
-CREATE TABLE uc (id INT NOT NULL PRIMARY KEY, pid INT,
-                 FOREIGN KEY (pid) REFERENCES uc (id)
-                 ON UPDATE CASCADE ON DELETE CASCADE) ENGINE={E};
-CREATE TABLE un (id INT NOT NULL PRIMARY KEY, pid INT,
-                 FOREIGN KEY (pid) REFERENCES un (id) ON UPDATE SET NULL) ENGINE={E};
-INSERT INTO uc VALUES (1, NULL), (2, 1), (3, NULL);
-INSERT INTO un VALUES (1, NULL), (2, 1), (3, NULL);
-UPDATE uc SET id = 10 WHERE id = 1;
-UPDATE un SET id = 10 WHERE id = 1;
-UPDATE uc SET id = 30 WHERE id = 3;
-UPDATE un SET id = 30 WHERE id = 3;
-DELETE FROM uc WHERE id = 1;
-SELECT id, pid FROM uc ORDER BY id;
-SELECT id, pid FROM un ORDER BY id;
-ALTER TABLE uc ADD COLUMN w INT, ALGORITHM=COPY;
-INSERT INTO uc VALUES (1, NULL, 0), (2, 1, 0);
-UPDATE uc SET id = 10 WHERE id = 1;
 -- a copying ALTER keeps the key on the copy, whatever order its rows
 -- are copied in (3 names 4)
 ALTER TABLE t ADD COLUMN w INT, ALGORITHM=COPY;

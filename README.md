@@ -291,6 +291,9 @@ the list stays current.
 - **A FOREIGN KEY to an indexed non-unique column** is refused.
 - **A row whose FOREIGN KEY names that row itself** is deleted, as it
   leaves no row naming a missing one; InnoDB refuses it (1451).
+- **An ON UPDATE CASCADE or SET NULL that comes back into its own table**
+  (a key naming its own table, or a chain of keys that returns to it)
+  runs, as in PostgreSQL; InnoDB refuses it (1451).
 - **On a table a FOREIGN KEY names that has no primary key**, the row
   pump cannot name a row: an UPDATE with ORDER BY / LIMIT fails (1296),
   and an UPDATE of a UNIQUE column is checked as a set.

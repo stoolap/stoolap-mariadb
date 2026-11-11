@@ -13,7 +13,7 @@
 //! not at all.
 
 use stoolap::api::ParamVec;
-use stoolap::core::{DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, Row, Value};
+use stoolap::core::{DataType, Error, ForeignKeyConstraint, Result, Row, Value};
 
 use crate::session::Session;
 use crate::write;
@@ -180,60 +180,6 @@ fn missing_parent(table: &str, fk: &ForeignKeyConstraint, value: &Value) -> Erro
             fk.referenced_column, value
         ),
     )
-}
-
-/// Refuses setting `set` in a row of `table` that held `was` (by column
-/// name) when a changed column is the parent of a key of `table` itself
-/// with ON UPDATE CASCADE or SET NULL and a row names the old value:
-/// InnoDB refuses an update that would cascade back into the table it
-/// updates (1451), where stoolap would run the action
-pub fn refuse_own_cascade(
-    session: &Session,
-    table: &str,
-    set: &[(String, Value)],
-    was: &[(String, Value)],
-) -> Result<()> {
-    let schema = session.with_any_write_table(table, |t| Ok(t.schema().clone()))?;
-    for fk in &schema.foreign_keys {
-        if fk.referenced_table.to_lowercase() != table.to_lowercase()
-            || !matches!(
-                fk.on_update,
-                ForeignKeyAction::Cascade | ForeignKeyAction::SetNull
-            )
-        {
-            continue;
-        }
-        let parent = schema.get_column_index(&fk.referenced_column);
-        let at = |list: &[(String, Value)]| {
-            list.iter()
-                .find(|(name, _)| schema.get_column_index(name) == parent)
-                .map(|(_, v)| v.clone())
-        };
-        let (Some(new), Some(old)) = (at(set), at(was)) else {
-            continue;
-        };
-        if old.is_null() || new == old {
-            continue;
-        }
-        let sql = format!(
-            "SELECT 1 FROM {} WHERE {} = $1 LIMIT 1",
-            quote(table),
-            quote(&fk.column_name)
-        );
-        if session.run(&sql, params([old.clone()]))?.next() {
-            return Err(Error::foreign_key_violation(
-                table,
-                &fk.column_name,
-                table,
-                &fk.referenced_column,
-                format!(
-                    "cannot update row with {} = {} \u{2014} still referenced by table '{}'",
-                    fk.referenced_column, old, table
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Deletes the row `key` names
