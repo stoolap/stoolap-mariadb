@@ -16,7 +16,8 @@
 #include "mysql/plugin.h"
 #include "field.h"
 #include "key.h"
-#include "sql_priv.h"  // OPTION_NOT_AUTOCOMMIT, OPTION_BEGIN
+#include "sql_alter.h"  // Alter_info
+#include "sql_priv.h"   // OPTION_NOT_AUTOCOMMIT, OPTION_BEGIN
 #include "sql_string.h"
 #include "log.h"
 #include "mysqld_error.h"  // ER_GET_ERRMSG (used by report_stoolap_error)
@@ -155,6 +156,22 @@ int stoolap_rollback_cb(handlerton* /*hton*/, THD* thd, bool all) {
         return HA_ERR_GENERIC;
     }
     return 0;
+}
+
+// DDL recovery of an in-place ALTER that a crash cut short: 0 when the
+// stoolap table took the change (its definition's version is not the one
+// taken before it, `create_id`), so MariaDB installs the new .frm; else
+// it keeps the old one.
+int stoolap_check_version_cb(handlerton* /*hton*/, const char* path,
+                             const LEX_CUSTRING* /*version*/,
+                             ulonglong create_id) {
+    stoolap_mariadb::DbPtr db = g_engine.clone_handle();
+    const uint64_t now =
+        db ? stoolap_table_version(
+                 db.get(),
+                 stoolap_mariadb::stoolap_table_from_path(path).c_str())
+           : 0;
+    return now && now != create_id ? 0 : 1;
 }
 
 int stoolap_close_connection_cb(handlerton* /*hton*/, THD* thd) {
@@ -698,6 +715,7 @@ int stoolap_init_func(void* p) {
     // HTON_CAN_RECREATE would route TRUNCATE through DROP+CREATE; we expose
     // a real truncate that runs stoolap's native TRUNCATE instead.
     stoolap_hton->flags = 0;
+    stoolap_hton->check_version = stoolap_check_version_cb;
     stoolap_hton->commit = stoolap_commit_cb;
     stoolap_hton->rollback = stoolap_rollback_cb;
     stoolap_hton->close_connection = stoolap_close_connection_cb;
@@ -944,6 +962,228 @@ int ha_stoolap::delete_table(const char* name) {
 bool ha_stoolap::can_switch_engines() {
     StoolapDB* db = get_thd_ctx(ha_thd())->db();
     return !db || stoolap_writes_through_sql(db, stoolap_table_.c_str()) == 0;
+}
+
+namespace {
+
+// What an in-place ALTER does to the stoolap table: one column change
+// (stoolap's DDL statements are not atomic together, so an ALTER of more
+// columns copies), then the non-unique indexes it drops and adds, whose
+// failures are warnings as at CREATE (a missing index full-scans).
+struct InplacePlan {
+    int32_t op = 0;  // STOOLAP_ALTER_*, 0 for none
+    std::string name, new_name;
+    int32_t kind = 0;
+    bool nullable = false;
+    StoolapValue default_value{};
+    std::string default_text;
+    std::vector<const KEY*> drop_keys;
+    std::vector<const KEY*> add_keys;
+};
+
+// The ALTER operations done in place; any other copies the table
+constexpr alter_table_operations kInplaceOps =
+    ALTER_ADD_STORED_BASE_COLUMN | ALTER_DROP_STORED_COLUMN |
+    ALTER_COLUMN_NAME | ALTER_CHANGE_COLUMN_DEFAULT |
+    ALTER_ADD_NON_UNIQUE_NON_PRIM_INDEX | ALTER_DROP_NON_UNIQUE_NON_PRIM_INDEX |
+    ALTER_RENAME |
+    // Columns after a dropped one move up, kept in order (checked)
+    ALTER_STORED_COLUMN_ORDER |
+    // Keys renumbered: the plugin finds a non-unique one by its name, and
+    // the UNIQUE ones, numbered in order, stay first
+    ALTER_INDEX_ORDER;
+
+bool extract_field(Field* f, StoolapValue& v, std::string& text_holder);
+
+// The value the rows there take for added field `f`: its constant
+// default, as an insert would write it. False when it has none to give
+// (an expression, evaluated per row) or the text holds a NUL, which would
+// end its SQL literal.
+bool added_default(TABLE* altered, Field* f, InplacePlan* plan) {
+    if (f->default_value || f->vcol_info || (f->flags & AUTO_INCREMENT_FLAG))
+        return false;
+    const my_ptrdiff_t at = altered->s->default_values - altered->record[0];
+    f->move_field_offset(at);
+    const bool ok = extract_field(f, plan->default_value, plan->default_text);
+    f->move_field_offset(-at);
+    if (!ok) return false;
+    const StoolapValue& v = plan->default_value;
+    if (v.value_type == STOOLAP_TYPE_TEXT &&
+        std::memchr(v.v.text.ptr, 0, static_cast<size_t>(v.v.text.len)))
+        return false;
+    return true;
+}
+
+// Plans an in-place ALTER of `table` into `altered`; false when it copies
+bool plan_inplace(TABLE* table, TABLE* altered, Alter_inplace_info* info,
+                  InplacePlan* plan) {
+    // A NOT NULL column with no value for the rows there (a zero date
+    // under NO_ZERO_DATE): the copy refuses a table that has rows
+    if ((info->handler_flags & ~kInplaceOps) || info->error_if_not_empty)
+        return false;
+    std::vector<bool> kept(table->s->fields, false);
+    int changes = 0;
+    uint i = 0, next = 0;
+    List_iterator_fast<Create_field> it(info->alter_info->create_list);
+    while (const Create_field* cf = it++) {
+        Field* f = altered->field[i];
+        // As refuse_unsupported_columns, which the copy's create() runs
+        if ((f->flags & BLOB_FLAG) && f->compression_method()) return false;
+        if (!cf->field) {
+            // At the end: stoolap adds a column there, and the plugin
+            // writes a row's values in MariaDB's column order
+            if (++changes > 1 || i != table->s->fields) return false;
+            plan->op = STOOLAP_ALTER_ADD_COLUMN;
+            plan->name = stoolap_column_name(
+                std::string_view(f->field_name.str, f->field_name.length));
+            plan->kind = stoolap_column_kind(f);
+            plan->nullable = f->real_maybe_null();
+            if (!plan->kind || !added_default(altered, f, plan)) return false;
+        } else {
+            // The kept columns in their order
+            if (cf->field->field_index < next) return false;
+            next = cf->field->field_index + 1;
+            kept[cf->field->field_index] = true;
+            const LEX_CSTRING& was = cf->field->field_name;
+            if (was.length != cf->field_name.length ||
+                std::memcmp(was.str, cf->field_name.str, was.length)) {
+                if (++changes > 1) return false;
+                plan->op = STOOLAP_ALTER_RENAME_COLUMN;
+                plan->name =
+                    stoolap_column_name(std::string_view(was.str, was.length));
+                plan->new_name = stoolap_column_name(std::string_view(
+                    cf->field_name.str, cf->field_name.length));
+            }
+        }
+        ++i;
+    }
+    for (uint j = 0; j < table->s->fields; ++j) {
+        if (kept[j]) continue;
+        if (++changes > 1) return false;
+        const LEX_CSTRING& n = table->field[j]->field_name;
+        plan->op = STOOLAP_ALTER_DROP_COLUMN;
+        plan->name = stoolap_column_name(std::string_view(n.str, n.length));
+    }
+    for (uint k = 0; k < info->index_drop_count; ++k)
+        plan->drop_keys.push_back(info->index_drop_buffer[k]);
+    for (uint k = 0; k < info->index_add_count; ++k)
+        plan->add_keys.push_back(
+            &info->key_info_buffer[info->index_add_buffer[k]]);
+    return true;
+}
+
+}  // namespace
+
+enum_alter_inplace_result ha_stoolap::check_if_supported_inplace_alter(
+    TABLE* altered_table, Alter_inplace_info* ha_alter_info) {
+    InplacePlan plan;
+    if (!plan_inplace(table, altered_table, ha_alter_info, &plan))
+        return HA_ALTER_INPLACE_NOT_SUPPORTED;
+    // Nothing for stoolap to change: a default, which MariaDB writes
+    if (!plan.op && plan.drop_keys.empty() && plan.add_keys.empty())
+        return HA_ALTER_INPLACE_INSTANT;
+    return HA_ALTER_INPLACE_EXCLUSIVE_LOCK;
+}
+
+ulonglong ha_stoolap::table_version() const {
+    auto* ctx = ha_thd() ? get_thd_ctx(ha_thd()) : nullptr;
+    StoolapDB* db = ctx ? ctx->db() : nullptr;
+    return db ? stoolap_table_version(db, stoolap_table_.c_str()) : 0;
+}
+
+// The change runs at commit, past every wait MariaDB can still fail or
+// be killed in: nothing rolls a stoolap DDL statement back.
+bool ha_stoolap::commit_inplace_alter_table(TABLE* altered_table,
+                                            Alter_inplace_info* ha_alter_info,
+                                            bool commit) {
+    ha_alter_info->group_commit_ctx = nullptr;  // as handler's own
+    if (!commit) return false;
+    InplacePlan plan;
+    if (!plan_inplace(table, altered_table, ha_alter_info, &plan)) {
+        my_error(ER_ALTER_OPERATION_NOT_SUPPORTED, MYF(0), "ALGORITHM=INPLACE",
+                 "ALGORITHM=COPY");
+        return true;
+    }
+    StoolapDB* db = ddl_db();
+    if (!db) {
+        my_error(ER_OUT_OF_RESOURCES, MYF(0));
+        return true;
+    }
+    const char* tbl = stoolap_table_.c_str();
+    if (plan.op &&
+        stoolap_alter_column(db, tbl, plan.op, plan.name.c_str(),
+                             plan.new_name.c_str(), plan.kind, plan.nullable,
+                             &plan.default_value) != STOOLAP_OK) {
+        auto verr = fetch_db_error(db);
+        sql_print_error("stoolap: ALTER TABLE of '%s' failed: %s", tbl,
+                        verr.message);
+        const int rc = report_stoolap_error(verr);
+        if (rc != HA_ERR_GENERIC && rc != HA_ERR_UNSUPPORTED)
+            print_error(rc, MYF(0));
+        return true;
+    }
+    // The indexes after the column: a dropped column took its own
+    std::string failed;
+    // A key's index, by its columns' names: stoolap keeps one index per
+    // column list, which the keys over it share
+    auto alter_index = [&](const KEY* k, const std::vector<std::string>& names,
+                           bool create) {
+        std::vector<const char*> columns;
+        for (const auto& n : names)
+            columns.push_back(n.c_str());
+        if (stoolap_alter_index(db, tbl, k->name.str, create, columns.data(),
+                                static_cast<int32_t>(columns.size())) !=
+            STOOLAP_OK)
+            failed +=
+                std::string(k->name.str) + ": " + stoolap_errmsg(db) + "; ";
+    };
+    auto name_of = [](const Field* f) {
+        return stoolap_column_name(
+            std::string_view(f->field_name.str, f->field_name.length));
+    };
+    // The new definition's keys number their fields
+    auto new_names = [&](const KEY* k) {
+        std::vector<std::string> names;
+        for (uint j = 0; j < k->user_defined_key_parts; ++j)
+            names.push_back(
+                name_of(altered_table->field[k->key_part[j].fieldnr]));
+        return names;
+    };
+    auto same = [](const std::vector<std::string>& a,
+                   const std::vector<std::string>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t j = 0; j < a.size(); ++j)
+            if (my_strcasecmp(system_charset_info, a[j].c_str(), b[j].c_str()))
+                return false;
+        return true;
+    };
+    // A dropped key's columns by their names now, the column renamed
+    // first; its index goes unless a non-unique key of the new definition
+    // is over the same columns
+    for (const KEY* k : plan.drop_keys) {
+        std::vector<std::string> names;
+        for (uint j = 0; j < k->user_defined_key_parts; ++j) {
+            names.push_back(name_of(k->key_part[j].field));
+            if (plan.op == STOOLAP_ALTER_RENAME_COLUMN &&
+                !my_strcasecmp(system_charset_info, names.back().c_str(),
+                               plan.name.c_str()))
+                names.back() = plan.new_name;
+        }
+        bool shared = false;
+        for (uint n = 0; n < ha_alter_info->key_count && !shared; ++n) {
+            const KEY* kept = &ha_alter_info->key_info_buffer[n];
+            shared = !(kept->flags & HA_NOSAME) && same(new_names(kept), names);
+        }
+        if (!shared) alter_index(k, names, false);
+    }
+    for (const KEY* k : plan.add_keys)
+        alter_index(k, new_names(k), true);
+    if (!failed.empty())
+        sql_print_warning(
+            "stoolap: failed to change indexes of '%s': %s-- queries on "
+            "these keys will full-scan",
+            tbl, failed.c_str());
+    return false;
 }
 
 int ha_stoolap::rename_table(const char* from, const char* to) {

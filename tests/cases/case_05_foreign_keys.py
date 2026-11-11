@@ -307,7 +307,7 @@ INSERT INTO `my-db`.`P\u00e9` VALUES (1);
     h.exec_stmt("CREATE TABLE sz (id INT NOT NULL PRIMARY KEY, pid INT, "
                 f"FOREIGN KEY (pid) REFERENCES sp (id)) ENGINE={h.engine}")
     h.assert_err("dropping a FOREIGN KEY's column is refused",
-                 "ALTER TABLE sz DROP COLUMN pid",
+                 "ALTER TABLE sz DROP COLUMN pid, ALGORITHM=COPY",
                  r"used by a FOREIGN KEY")
     h.assert_err("the key survives the refused ALTER",
                  "INSERT INTO sz VALUES (1, 98)",
@@ -359,14 +359,20 @@ INSERT INTO sv VALUES (1, 10, 20, NULL), (2, 20, 10, 10);
     h.assert_ok("FK naming its column in other case",
                 "CREATE TABLE su (`\u00e9` INT, FOREIGN KEY (`\u00c9`) "
                 f"REFERENCES sp (id)) ENGINE={h.engine}")
-    h.assert_ok("copying ALTER keeps it", "ALTER TABLE su ADD COLUMN z INT")
+    h.assert_ok("copying ALTER keeps it",
+                "ALTER TABLE su ADD COLUMN z INT, ALGORITHM=COPY")
     h.assert_err("the key is enforced after the ALTER",
                  "INSERT INTO su VALUES (97, NULL)",
                  r"foreign key constraint fails")
     h.assert_ok("renaming its column keeps it",
-                "ALTER TABLE su CHANGE `\u00c9` `\u00f6` INT")
+                "ALTER TABLE su CHANGE `\u00c9` `\u00f6` INT, ALGORITHM=COPY")
     h.assert_err("the key follows the rename",
                  "INSERT INTO su VALUES (96, NULL)",
+                 r"foreign key constraint fails")
+    h.assert_ok("so does renaming it in place",
+                "ALTER TABLE su CHANGE `\u00d6` `\u00fc` INT, ALGORITHM=INPLACE")
+    h.assert_err("the key follows that rename too",
+                 "INSERT INTO su VALUES (95, NULL)",
                  r"foreign key constraint fails")
     # A table converted from another engine has no stoolap keys to keep
     h.exec_script("CREATE TABLE si (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB;"

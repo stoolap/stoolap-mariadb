@@ -22,11 +22,11 @@ use std::sync::{Arc, Mutex};
 use rustc_hash::FxHashMap;
 
 use stoolap::api::{Database, ParamVec};
-use stoolap::core::{Error, IsolationLevel, Result, Row};
+use stoolap::core::{Error, IndexType, IsolationLevel, Result, Row};
 use stoolap::executor::{CachedPlanRef, ExecutionContext, Executor};
 use stoolap::parser::ast::{RollbackStatement, Statement};
 use stoolap::storage::mvcc::registry::StatementView;
-use stoolap::storage::traits::{QueryResult, Table, Transaction};
+use stoolap::storage::traits::{Engine, QueryResult, Table, Transaction};
 
 pub struct Session {
     exec: Executor,
@@ -213,6 +213,43 @@ impl Session {
 
     pub fn rollback(&self) -> Result<()> {
         self.take()?.rollback()
+    }
+
+    /// `table`'s indexes, its primary key's aside: name, whether unique,
+    /// columns
+    pub fn table_indexes(&self, table: &str) -> Result<Vec<(String, bool, Vec<String>)>> {
+        Ok(self
+            .exec
+            .engine()
+            .get_all_indexes(table)?
+            .iter()
+            .filter(|i| i.index_type() != IndexType::PrimaryKey)
+            .map(|i| {
+                (
+                    i.name().to_string(),
+                    i.is_unique(),
+                    i.column_names().to_vec(),
+                )
+            })
+            .collect())
+    }
+
+    /// `table`'s columns as stoolap holds them now: name, type, nullable
+    pub fn table_columns(&self, table: &str) -> Result<Vec<(String, String, bool)>> {
+        Ok(self
+            .exec
+            .engine()
+            .get_table_schema(table)?
+            .columns
+            .iter()
+            .map(|c| {
+                (
+                    c.name_lower.clone(),
+                    format!("{:?}", c.data_type),
+                    c.nullable,
+                )
+            })
+            .collect())
     }
 
     /// Runs `f` on the read handle on `table` of the open transaction,

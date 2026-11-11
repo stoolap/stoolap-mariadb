@@ -16,7 +16,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use stoolap::api::{Database, ParamVec};
 use stoolap::core::schema::ROWID_NAME;
-use stoolap::core::{Error, Result};
+use stoolap::core::{Error, Result, Value};
 
 use crate::session::Session;
 
@@ -228,17 +228,221 @@ pub fn create_table(
         .iter()
         .filter(|k| k.kind == STOOLAP_KEYDEF_INDEX && !k.columns.is_empty())
     {
-        let index_sql = format!(
-            "CREATE INDEX IF NOT EXISTS {} ON {} {}",
-            quote(&format!("{}__{}", table, k.name)),
-            quote(table),
-            key_columns(k)?
-        );
-        if let Err(e) = session.run(&index_sql, ParamVec::new()) {
+        let names = k
+            .columns
+            .iter()
+            .map(|&i| column_name(i))
+            .collect::<Result<Vec<_>>>()?;
+        if let Err(e) = create_index(session, table, &k.name, &names) {
             failed.push(format!("{}: {}", k.name, e));
         }
     }
     Ok(failed)
+}
+
+/// The names of `table`'s indexes over `columns`, in their order, that
+/// `keep` keeps. Stoolap keeps one index per column list, so the keys of
+/// the table over the same columns share it; an index keeps the name it
+/// was created with (a RENAME TABLE, and the swap of a copying ALTER,
+/// leave it).
+fn indexes_on(
+    session: &Session,
+    table: &str,
+    columns: &[&str],
+    keep: impl Fn(&str, bool) -> bool,
+) -> Result<Vec<String>> {
+    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    Ok(session
+        .table_indexes(table)?
+        .into_iter()
+        .filter(|(name, unique, on)| {
+            keep(name, *unique)
+                && on.len() == columns.len()
+                && on.iter().zip(columns).all(|(a, b)| same(a, b))
+        })
+        .map(|(name, _, _)| name)
+        .collect())
+}
+
+/// Creates the index of `table`'s non-unique key `key` over `columns`,
+/// unless an index over them is there (another key's, a UNIQUE key's, a
+/// FOREIGN KEY's), which serves the key too. It is named `table__key`, or
+/// with `_N` after it when another index has that name (one another key
+/// over other columns shares). An index made meanwhile, as a concurrent
+/// open's reconcile may make it, is the key's too.
+pub fn create_index(session: &Session, table: &str, key: &str, columns: &[&str]) -> Result<()> {
+    if !indexes_on(session, table, columns, |_, _| true)?.is_empty() {
+        return Ok(());
+    }
+    let taken: Vec<String> = session
+        .table_indexes(table)?
+        .into_iter()
+        .map(|(name, _, _)| name.to_lowercase())
+        .collect();
+    let base = format!("{table}__{key}");
+    let name = std::iter::once(base.clone())
+        .chain((1..).map(|n| format!("{base}_{n}")))
+        .find(|n| !taken.contains(&n.to_lowercase()))
+        .expect("a free name");
+    let quoted: Vec<String> = columns.iter().map(|c| quote(c)).collect();
+    let made = session.run(
+        &format!(
+            "CREATE INDEX {} ON {} ({})",
+            quote(&name),
+            quote(table),
+            quoted.join(", ")
+        ),
+        ParamVec::new(),
+    );
+    match made {
+        Err(_) if !indexes_on(session, table, columns, |_, _| true)?.is_empty() => Ok(()),
+        made => made.map(|_| ()),
+    }
+}
+
+/// Drops the non-unique index of `table` over `columns`, for a key dropped
+/// when no other key of the table is over them (the caller's to know). A
+/// UNIQUE key's index stays, and so does the index a FOREIGN KEY's column
+/// has; none there is none to drop (a dropped column takes its indexes)
+pub fn drop_index(session: &Session, table: &str, columns: &[&str]) -> Result<()> {
+    let key_column = session.with_table(table, |t| {
+        Ok(columns.len() == 1
+            && t.schema()
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.column_name.to_lowercase() == columns[0].to_lowercase()))
+    })?;
+    if key_column {
+        return Ok(());
+    }
+    for name in indexes_on(session, table, columns, |_, unique| !unique)? {
+        session.run(
+            &format!("DROP INDEX {} ON {}", quote(&name), quote(table)),
+            ParamVec::new(),
+        )?;
+    }
+    Ok(())
+}
+
+/// A version of `table`'s definition as stoolap holds it: its columns and
+/// indexes, hashed (FNV-1a, 64 bits). An in-place ALTER changes it, so the
+/// version taken before tells whether the change was made (the crash
+/// recovery of MariaDB's DDL log asks). Never 0, which MariaDB reads as
+/// none.
+pub fn table_version(session: &Session, table: &str) -> Result<u64> {
+    let mut indexes: Vec<String> = session
+        .table_indexes(table)?
+        .into_iter()
+        .map(|(name, unique, columns)| {
+            format!(
+                "{}\0{unique}\0{}",
+                name.to_lowercase(),
+                columns.join("\0").to_lowercase()
+            )
+        })
+        .collect();
+    indexes.sort();
+    let mut text = String::new();
+    for (name, ty, nullable) in session.table_columns(table)? {
+        text.push_str(&format!("{name}\0{ty}\0{nullable}\0"));
+    }
+    text.push('\0');
+    for name in indexes {
+        text.push_str(&name);
+        text.push('\0');
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        hash = (hash ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    Ok(hash.max(1))
+}
+
+/// `value` as an SQL literal, None when stoolap would not read it back as
+/// it is: text holding a NUL, which ends a literal
+fn literal(value: &Value) -> Option<String> {
+    match value {
+        Value::Null(_) => Some("NULL".into()),
+        Value::Integer(i) => Some(i.to_string()),
+        Value::Float(f) if f.is_finite() => Some(format!("{f:?}")),
+        Value::Text(t) if !t.as_str().contains('\0') => Some(format!(
+            "'{}'",
+            t.as_str().replace('\\', "\\\\").replace('\'', "''")
+        )),
+        _ => None,
+    }
+}
+
+/// Adds column `name` at the end of `table`, its rows holding `default`
+/// (the column's value for a row MariaDB wrote before it). In place: the
+/// rows are not copied
+pub fn add_column(
+    session: &Session,
+    table: &str,
+    name: &str,
+    kind: i32,
+    nullable: bool,
+    default: &Value,
+) -> Result<()> {
+    let ty = match kind {
+        STOOLAP_COL_INTEGER => "INTEGER",
+        STOOLAP_COL_FLOAT => "FLOAT",
+        STOOLAP_COL_TEXT => "TEXT",
+        _ => return Err(Error::internal("unknown column type")),
+    };
+    let default = literal(default)
+        .ok_or_else(|| Error::NotSupported(format!("the default of column '{name}'")))?;
+    session.run(
+        &format!(
+            "ALTER TABLE {} ADD COLUMN {} {ty}{} DEFAULT {default}",
+            quote(table),
+            quote(name),
+            if nullable { "" } else { " NOT NULL" }
+        ),
+        ParamVec::new(),
+    )?;
+    Ok(())
+}
+
+/// Drops column `name` of `table`. One a FOREIGN KEY of the table uses is
+/// refused, as InnoDB refuses it (stoolap would drop the key with it); one
+/// another table's key references, by stoolap
+pub fn drop_column(session: &Session, table: &str, name: &str) -> Result<()> {
+    let lower = name.to_lowercase();
+    let used = session.with_table(table, |t| {
+        Ok(t.schema()
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.column_name.to_lowercase() == lower))
+    })?;
+    if used {
+        return Err(Error::NotSupported(format!(
+            "column '{name}' is used by a FOREIGN KEY: it cannot be dropped"
+        )));
+    }
+    session.run(
+        &format!("ALTER TABLE {} DROP COLUMN {}", quote(table), quote(name)),
+        ParamVec::new(),
+    )?;
+    Ok(())
+}
+
+/// Renames column `from` of `table` to `to`; its indexes and keys follow.
+/// Names in other letter case alone name the column already
+pub fn rename_column(session: &Session, table: &str, from: &str, to: &str) -> Result<()> {
+    if from.to_lowercase() == to.to_lowercase() {
+        return Ok(());
+    }
+    session.run(
+        &format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            quote(table),
+            quote(from),
+            quote(to)
+        ),
+        ParamVec::new(),
+    )?;
+    Ok(())
 }
 
 /// Drops `table` if it is there. A parent other tables' foreign keys name
@@ -451,6 +655,144 @@ mod tests {
             ", FOREIGN KEY (\"p\"\"id\") REFERENCES \"d_1c\" (\"id\")"
         );
         assert!(sql(fk("d_1p", Some("id"), 9, STOOLAP_FK_UNDEF)).is_err());
+    }
+
+    #[test]
+    fn indexes_by_columns_and_versions() {
+        let db = Database::open("memory://").unwrap();
+        let s = Session::new(&db);
+        let run = |sql: &str| {
+            s.run(sql, ParamVec::new()).unwrap();
+        };
+        let names = |table: &str| {
+            let mut n: Vec<String> = s
+                .table_indexes(table)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _, _)| name.to_lowercase())
+                .collect();
+            n.sort();
+            n
+        };
+        run("CREATE TABLE d_1t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        create_index(&s, "d_1t", "k", &["a"]).unwrap();
+        create_index(&s, "d_1t", "k_0", &["b"]).unwrap();
+        let before = table_version(&s, "d_1t").unwrap();
+        assert_eq!(before, table_version(&s, "d_1t").unwrap());
+        // A renamed table's indexes keep their names, and serve its keys
+        run("ALTER TABLE d_1t RENAME TO d_1u");
+        create_index(&s, "d_1u", "k", &["A"]).unwrap();
+        assert_eq!(names("d_1u"), vec!["d_1t__k", "d_1t__k_0"]);
+        drop_index(&s, "d_1u", &["a"]).unwrap();
+        assert_eq!(names("d_1u"), vec!["d_1t__k_0"]);
+        // Each change of a column or an index changes the version
+        let mut seen = vec![before, table_version(&s, "d_1u").unwrap()];
+        add_column(&s, "d_1u", "c", STOOLAP_COL_TEXT, true, &Value::text("x")).unwrap();
+        seen.push(table_version(&s, "d_1u").unwrap());
+        rename_column(&s, "d_1u", "c", "e").unwrap();
+        seen.push(table_version(&s, "d_1u").unwrap());
+        // In other letter case it names the column already, and is no change
+        rename_column(&s, "d_1u", "e", "E").unwrap();
+        assert_eq!(*seen.last().unwrap(), table_version(&s, "d_1u").unwrap());
+        drop_column(&s, "d_1u", "b").unwrap();
+        seen.push(table_version(&s, "d_1u").unwrap());
+        let n = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), n);
+        assert!(seen.iter().all(|&v| v != 0));
+
+        // A name another key's columns keep (j's, which shares k's index)
+        // is not taken again for k over other columns
+        run("CREATE TABLE i_1n (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        create_index(&s, "i_1n", "k", &["a"]).unwrap();
+        create_index(&s, "i_1n", "j", &["a"]).unwrap();
+        create_index(&s, "i_1n", "k", &["b"]).unwrap();
+        let mut on: Vec<(String, Vec<String>)> = s
+            .table_indexes("i_1n")
+            .unwrap()
+            .into_iter()
+            .map(|(name, _, columns)| (name.to_lowercase(), columns))
+            .collect();
+        on.sort();
+        assert_eq!(
+            on,
+            vec![
+                ("i_1n__k".to_string(), vec!["a".to_string()]),
+                ("i_1n__k_1".to_string(), vec!["b".to_string()]),
+            ]
+        );
+
+        // A UNIQUE key's index stays, whatever its name
+        let column = |name: &str| Column {
+            name: name.into(),
+            kind: STOOLAP_COL_INTEGER,
+            nullable: true,
+            auto_increment: false,
+        };
+        create_table(
+            &s,
+            "_0d_1t",
+            &[column("a"), column("b")],
+            &[
+                Key {
+                    name: "a".into(),
+                    columns: vec![0],
+                    kind: STOOLAP_KEYDEF_UNIQUE,
+                },
+                Key {
+                    name: "0d_1t_0".into(),
+                    columns: vec![1],
+                    kind: STOOLAP_KEYDEF_INDEX,
+                },
+            ],
+            &[],
+            false,
+        )
+        .unwrap();
+        drop_index(&s, "_0d_1t", &["a"]).unwrap();
+        drop_index(&s, "_0d_1t", &["b"]).unwrap();
+        assert_eq!(s.table_indexes("_0d_1t").unwrap().len(), 1);
+        run("INSERT INTO \"_0d_1t\" VALUES (1, 1)");
+        assert!(s
+            .run("INSERT INTO \"_0d_1t\" VALUES (1, 2)", ParamVec::new())
+            .is_err());
+
+        // So does a FOREIGN KEY's, which a key over its column shares
+        run("CREATE TABLE i_1q (id INTEGER PRIMARY KEY)");
+        run("CREATE TABLE i_1c (id INTEGER PRIMARY KEY, pid INTEGER, \
+             FOREIGN KEY (pid) REFERENCES i_1q (id))");
+        let fk = names("i_1c");
+        create_index(&s, "i_1c", "k", &["pid"]).unwrap();
+        drop_index(&s, "i_1c", &["pid"]).unwrap();
+        assert_eq!(names("i_1c"), fk);
+
+        // A shortened name holds `__` (`_` cut from `_0`, then `_2`)
+        let long = fit_name(format!("{}_1{}", "_0".repeat(64), "_0".repeat(64)));
+        assert!(long.contains("__"));
+        run(&format!(
+            "CREATE TABLE {} (id INTEGER PRIMARY KEY, a INTEGER)",
+            quote(&long)
+        ));
+        create_index(&s, &long, "k", &["a"]).unwrap();
+        assert_eq!(names(&long).len(), 1);
+        drop_index(&s, &long, &["a"]).unwrap();
+        assert!(names(&long).is_empty());
+    }
+
+    #[test]
+    fn literals() {
+        assert_eq!(
+            literal(&Value::Integer(i64::MIN)).unwrap(),
+            "-9223372036854775808"
+        );
+        assert_eq!(literal(&Value::Float(1e-7)).unwrap(), "1e-7");
+        assert_eq!(
+            literal(&Value::text("it's \\ ok")).unwrap(),
+            "'it''s \\\\ ok'"
+        );
+        assert_eq!(literal(&Value::null_unknown()).unwrap(), "NULL");
+        assert!(literal(&Value::text("a\0b")).is_none());
     }
 
     #[test]
