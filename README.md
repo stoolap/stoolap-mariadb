@@ -289,8 +289,9 @@ the list stays current.
 - **`utf8mb4_bin` UNIQUE** ignores PAD SPACE (`'a'` and `'a '` are both
   accepted).
 - **A FOREIGN KEY to an indexed non-unique column** is refused.
-- **A row whose FOREIGN KEY names that row itself** is deleted, as it
-  leaves no row naming a missing one; InnoDB refuses it (1451).
+- **A row whose FOREIGN KEY names that row itself** is deleted, or its
+  key moved together with the value naming it, as that leaves no row
+  naming a missing one; InnoDB refuses both (1451), also under RESTRICT.
 - **An ON UPDATE CASCADE or SET NULL that comes back into its own table**
   (a key naming its own table, or a chain of keys that returns to it)
   runs, as in PostgreSQL; InnoDB refuses it (1451).
