@@ -263,6 +263,20 @@ INSERT INTO sv VALUES (1, 10, 20, NULL), (2, 20, 10, 10);
     h.assert_err("the key still names the parent column",
                  "INSERT INTO sv VALUES (3, 30, 40, 40)",
                  r"foreign key constraint fails")
+    # SET NULL on a NOT NULL column is refused, for a key naming its own
+    # table too, and when a later ALTER makes the column NOT NULL (1005 /
+    # 1830 in InnoDB)
+    h.assert_err("own key ON UPDATE SET NULL on NOT NULL refused",
+                 "CREATE TABLE sx1 (id INT NOT NULL PRIMARY KEY, pid INT NOT "
+                 "NULL, FOREIGN KEY (pid) REFERENCES sx1 (id) ON UPDATE SET "
+                 f"NULL) ENGINE={h.engine}",
+                 r"SET NULL but is NOT NULL")
+    h.exec_stmt("CREATE TABLE sx2 (id INT NOT NULL PRIMARY KEY, pid INT, "
+                "FOREIGN KEY (pid) REFERENCES sx2 (id) ON UPDATE SET NULL) "
+                f"ENGINE={h.engine}")
+    h.assert_err("making its column NOT NULL is refused",
+                 "ALTER TABLE sx2 MODIFY pid INT NOT NULL",
+                 r"SET NULL but is NOT NULL")
     # A TEMPORARY table keeps its own keys, not those of the permanent
     # table its name shadows
     h.assert_ok("ALTER of a TEMPORARY table shadowing a child",

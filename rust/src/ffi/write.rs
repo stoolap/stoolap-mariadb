@@ -474,6 +474,12 @@ pub unsafe extern "C" fn stoolap_update_record(
             }
             let keys = field_slice(keys, nkeys)?;
             let set = named(session, name, &changed, &new)?;
+            sql_write::refuse_own_cascade(
+                session,
+                name,
+                &set,
+                &named(session, name, &changed, &old)?,
+            )?;
             let key = named(session, name, keys, &old)?;
             let columns: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
             let check = (has_row_id != 0).then_some((row_id, columns.as_slice()));

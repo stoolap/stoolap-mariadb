@@ -60,6 +60,18 @@ INSERT INTO r VALUES (1, NULL), (2, 1), (3, 2);
 INSERT INTO r VALUES (4, 9);
 DELETE FROM r WHERE rid = 2;
 SELECT rid, parent FROM r ORDER BY rid;
+-- a copying ALTER of a table whose key column is also its own key's
+-- parent: the check leaves the parent's unchanged values alone
+CREATE TABLE kp (id INT NOT NULL PRIMARY KEY) ENGINE={E};
+INSERT INTO kp VALUES (1), (2);
+CREATE TABLE kc (id INT NOT NULL PRIMARY KEY, pid INT,
+                 FOREIGN KEY (id) REFERENCES kp (id),
+                 FOREIGN KEY (pid) REFERENCES kc (id)) ENGINE={E};
+INSERT INTO kc VALUES (1, NULL), (2, 1);
+ALTER TABLE kc ADD COLUMN v INT, ALGORITHM=COPY;
+INSERT INTO kc VALUES (3, 1, 0);
+INSERT INTO kc VALUES (2, 3, 0);
+SELECT id, pid, v FROM kc ORDER BY id;
 -- a key an ALTER adds to its own table
 CREATE TABLE a (id INT NOT NULL PRIMARY KEY, pid INT) ENGINE={E};
 INSERT INTO a VALUES (1, NULL), (2, 1);
