@@ -751,10 +751,11 @@ int32_t stoolap_alter_column(StoolapDB* db, const char* table, int32_t op,
 uint64_t stoolap_table_version(StoolapDB* db, const char* table);
 
 /**
- * Create (`create`) the index of `table`'s non-unique key `key` over
- * `columns`, unless it has one, or drop the ones it has: the non-unique
- * indexes over `columns` named `..__key`, by the names they were created
- * with (a RENAME TABLE keeps them).
+ * Create the index of `table`'s non-unique key `key` over `columns`
+ * (`create`), unless an index over them is there, which serves the key
+ * too; or drop the non-unique one over them, but a FOREIGN KEY's (`key`
+ * unused). Stoolap keeps one index per column list, shared by the keys
+ * over it: drop it for the last of them.
  */
 int32_t stoolap_alter_index(StoolapDB* db, const char* table, const char* key,
                             int32_t create, const char* const* columns,

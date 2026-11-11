@@ -1124,7 +1124,8 @@ bool ha_stoolap::commit_inplace_alter_table(TABLE* altered_table,
     }
     // The indexes after the column: a dropped column took its own
     std::string failed;
-    // A key's index, by the key's name and its columns' names
+    // A key's index, by its columns' names: stoolap keeps one index per
+    // column list, which the keys over it share
     auto alter_index = [&](const KEY* k, const std::vector<std::string>& names,
                            bool create) {
         std::vector<const char*> columns;
@@ -1140,20 +1141,43 @@ bool ha_stoolap::commit_inplace_alter_table(TABLE* altered_table,
         return stoolap_column_name(
             std::string_view(f->field_name.str, f->field_name.length));
     };
-    // The old table's keys name their fields; the new ones number them
-    for (const KEY* k : plan.drop_keys) {
-        std::vector<std::string> names;
-        for (uint j = 0; j < k->user_defined_key_parts; ++j)
-            names.push_back(name_of(k->key_part[j].field));
-        alter_index(k, names, false);
-    }
-    for (const KEY* k : plan.add_keys) {
+    // The new definition's keys number their fields
+    auto new_names = [&](const KEY* k) {
         std::vector<std::string> names;
         for (uint j = 0; j < k->user_defined_key_parts; ++j)
             names.push_back(
                 name_of(altered_table->field[k->key_part[j].fieldnr]));
-        alter_index(k, names, true);
+        return names;
+    };
+    auto same = [](const std::vector<std::string>& a,
+                   const std::vector<std::string>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t j = 0; j < a.size(); ++j)
+            if (my_strcasecmp(system_charset_info, a[j].c_str(), b[j].c_str()))
+                return false;
+        return true;
+    };
+    // A dropped key's columns by their names now, the column renamed
+    // first; its index goes unless a non-unique key of the new definition
+    // is over the same columns
+    for (const KEY* k : plan.drop_keys) {
+        std::vector<std::string> names;
+        for (uint j = 0; j < k->user_defined_key_parts; ++j) {
+            names.push_back(name_of(k->key_part[j].field));
+            if (plan.op == STOOLAP_ALTER_RENAME_COLUMN &&
+                !my_strcasecmp(system_charset_info, names.back().c_str(),
+                               plan.name.c_str()))
+                names.back() = plan.new_name;
+        }
+        bool shared = false;
+        for (uint n = 0; n < ha_alter_info->key_count && !shared; ++n) {
+            const KEY* kept = &ha_alter_info->key_info_buffer[n];
+            shared = !(kept->flags & HA_NOSAME) && same(new_names(kept), names);
+        }
+        if (!shared) alter_index(k, names, false);
     }
+    for (const KEY* k : plan.add_keys)
+        alter_index(k, new_names(k), true);
     if (!failed.empty())
         sql_print_warning(
             "stoolap: failed to change indexes of '%s': %s-- queries on "

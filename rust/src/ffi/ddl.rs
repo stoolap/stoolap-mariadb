@@ -362,8 +362,8 @@ pub unsafe extern "C" fn stoolap_alter_column(
     })
 }
 
-/// Creates (`create`) or drops the index of `table`'s non-unique key `key`
-/// over `columns`.
+/// Creates the index of `table`'s non-unique key `key` over `columns`
+/// (`create`), or drops the one over them.
 ///
 /// # Safety
 ///
@@ -379,15 +379,14 @@ pub unsafe extern "C" fn stoolap_alter_index(
 ) -> i32 {
     on_session(db, "stoolap_alter_index", |session| {
         let table = text(table, "table name")?;
-        let key = text(key, "key name")?;
         let columns = slice(columns, ncolumns)?
             .iter()
             .map(|&c| text(c, "key column"))
             .collect::<Result<Vec<_>>>()?;
         if create != 0 {
-            ddl::create_index(session, table, key, &columns)?;
+            ddl::create_index(session, table, text(key, "key name")?, &columns)?;
         } else {
-            ddl::drop_index(session, table, key, &columns)?;
+            ddl::drop_index(session, table, &columns)?;
         }
         Ok(STOOLAP_OK)
     })

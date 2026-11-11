@@ -261,3 +261,28 @@ INSERT INTO `_d`.t VALUES (1, 1, 1);
     h.assert_err("the UNIQUE key still holds",
                  "INSERT INTO `_d`.t VALUES (2, 1, 2)", "1062")
     h.exec_script("DROP DATABASE `_d`", use_db=False)
+
+    h.section("Keys over the same columns, and a key changed with a rename")
+    # Stoolap keeps one index per column list: the keys over it share it,
+    # and it goes with the last of them
+    h.exec_script(f"""
+CREATE TABLE iq (id INT NOT NULL PRIMARY KEY, a INT, b INT,
+  KEY p__k (a, b), KEY k (a, b)) ENGINE={h.engine};
+INSERT INTO iq VALUES (1, 1, 1), (2, 1, 2);
+CREATE TABLE ir (id INT NOT NULL PRIMARY KEY, a INT, b INT, KEY k (a))
+  ENGINE={h.engine};
+INSERT INTO ir VALUES (1, 1, 2), (2, 2, 1);
+""")
+    h.assert_ok("a key over another's columns dropped",
+                "ALTER TABLE iq DROP INDEX k, ALGORITHM=INPLACE")
+    h.assert_scalar("the other reads by it",
+                    "SELECT id FROM iq FORCE INDEX (p__k) WHERE a = 1 "
+                    "AND b = 2", "2")
+    h.assert_ok("then the other",
+                "ALTER TABLE iq DROP INDEX p__k, ALGORITHM=INPLACE")
+    h.assert_ok("a column renamed, and its key moved to another",
+                "ALTER TABLE ir RENAME COLUMN a TO aa, DROP INDEX k, "
+                "ADD INDEX k (b), ALGORITHM=INPLACE")
+    h.assert_scalar("reads by the moved key",
+                    "SELECT id FROM ir FORCE INDEX (k) WHERE b = 1", "2")
+    h.exec_script("DROP TABLE iq; DROP TABLE ir")

@@ -245,21 +245,23 @@ fn index_name(table: &str, key: &str) -> String {
     quote(&format!("{table}__{key}"))
 }
 
-/// The stoolap indexes of `table`'s non-unique key `key` over `columns`.
-/// An index keeps the name it was created with, by the table's name then
-/// (a RENAME TABLE, and the swap of a copying ALTER, leave it), which a
-/// shortened table name makes no prefix to split off: it is one the plugin
-/// created for the key when non-unique, over those columns, and named
-/// `..__key`.
-fn key_indexes(session: &Session, table: &str, key: &str, columns: &[&str]) -> Result<Vec<String>> {
+/// The names of `table`'s indexes over `columns`, in their order, that
+/// `keep` keeps. Stoolap keeps one index per column list, so the keys of
+/// the table over the same columns share it; an index keeps the name it
+/// was created with (a RENAME TABLE, and the swap of a copying ALTER,
+/// leave it).
+fn indexes_on(
+    session: &Session,
+    table: &str,
+    columns: &[&str],
+    keep: impl Fn(&str, bool) -> bool,
+) -> Result<Vec<String>> {
     let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
-    let suffix = format!("__{}", key.to_lowercase());
     Ok(session
         .table_indexes(table)?
         .into_iter()
         .filter(|(name, unique, on)| {
-            !unique
-                && name.to_lowercase().ends_with(&suffix)
+            keep(name, *unique)
                 && on.len() == columns.len()
                 && on.iter().zip(columns).all(|(a, b)| same(a, b))
         })
@@ -268,9 +270,10 @@ fn key_indexes(session: &Session, table: &str, key: &str, columns: &[&str]) -> R
 }
 
 /// Creates the index of `table`'s non-unique key `key` over `columns`,
-/// unless the key has one, by whatever name
+/// unless an index over them is there (another key's, a UNIQUE key's, a
+/// FOREIGN KEY's), which serves the key too
 pub fn create_index(session: &Session, table: &str, key: &str, columns: &[&str]) -> Result<()> {
-    if !key_indexes(session, table, key, columns)?.is_empty() {
+    if !indexes_on(session, table, columns, |_, _| true)?.is_empty() {
         return Ok(());
     }
     let quoted: Vec<String> = columns.iter().map(|c| quote(c)).collect();
@@ -286,11 +289,22 @@ pub fn create_index(session: &Session, table: &str, key: &str, columns: &[&str])
     Ok(())
 }
 
-/// Drops the indexes of `table`'s non-unique key `key` over `columns`, by
-/// the names they were created with; none when there are none (a dropped
-/// column takes its indexes with it)
-pub fn drop_index(session: &Session, table: &str, key: &str, columns: &[&str]) -> Result<()> {
-    for name in key_indexes(session, table, key, columns)? {
+/// Drops the non-unique index of `table` over `columns`, for a key dropped
+/// when no other key of the table is over them (the caller's to know). A
+/// UNIQUE key's index stays, and so does the index a FOREIGN KEY's column
+/// has; none there is none to drop (a dropped column takes its indexes)
+pub fn drop_index(session: &Session, table: &str, columns: &[&str]) -> Result<()> {
+    let key_column = session.with_table(table, |t| {
+        Ok(columns.len() == 1
+            && t.schema()
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.column_name.to_lowercase() == columns[0].to_lowercase()))
+    })?;
+    if key_column {
+        return Ok(());
+    }
+    for name in indexes_on(session, table, columns, |_, unique| !unique)? {
         session.run(
             &format!("DROP INDEX {} ON {}", quote(&name), quote(table)),
             ParamVec::new(),
@@ -633,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn indexes_by_key_and_versions() {
+    fn indexes_by_columns_and_versions() {
         let db = Database::open("memory://").unwrap();
         let s = Session::new(&db);
         let run = |sql: &str| {
@@ -654,12 +668,11 @@ mod tests {
         create_index(&s, "d_1t", "k_0", &["b"]).unwrap();
         let before = table_version(&s, "d_1t").unwrap();
         assert_eq!(before, table_version(&s, "d_1t").unwrap());
-        // A renamed table's indexes keep their names, and are its keys'
+        // A renamed table's indexes keep their names, and serve its keys
         run("ALTER TABLE d_1t RENAME TO d_1u");
-        assert_eq!(key_indexes(&s, "d_1u", "K", &["A"]).unwrap().len(), 1);
-        create_index(&s, "d_1u", "k", &["a"]).unwrap();
-        assert_eq!(names("d_1u").len(), 2);
-        drop_index(&s, "d_1u", "k", &["a"]).unwrap();
+        create_index(&s, "d_1u", "k", &["A"]).unwrap();
+        assert_eq!(names("d_1u"), vec!["d_1t__k", "d_1t__k_0"]);
+        drop_index(&s, "d_1u", &["a"]).unwrap();
         assert_eq!(names("d_1u"), vec!["d_1t__k_0"]);
         // Each change of a column or an index changes the version
         let mut seen = vec![before, table_version(&s, "d_1u").unwrap()];
@@ -678,49 +691,49 @@ mod tests {
         assert_eq!(seen.len(), n);
         assert!(seen.iter().all(|&v| v != 0));
 
-        // A UNIQUE key's index, named as a non-unique key's would be, is
-        // not that key's: `_d.t`'s first is unique__0d_1t_0
+        // A UNIQUE key's index stays, whatever its name
         let column = |name: &str| Column {
             name: name.into(),
             kind: STOOLAP_COL_INTEGER,
             nullable: true,
             auto_increment: false,
         };
-        let key = |name: &str, columns: Vec<usize>, kind| Key {
-            name: name.into(),
-            columns,
-            kind,
-        };
         create_table(
             &s,
             "_0d_1t",
             &[column("a"), column("b")],
             &[
-                key("a", vec![0], STOOLAP_KEYDEF_UNIQUE),
-                key("0d_1t_0", vec![1], STOOLAP_KEYDEF_INDEX),
+                Key {
+                    name: "a".into(),
+                    columns: vec![0],
+                    kind: STOOLAP_KEYDEF_UNIQUE,
+                },
+                Key {
+                    name: "0d_1t_0".into(),
+                    columns: vec![1],
+                    kind: STOOLAP_KEYDEF_INDEX,
+                },
             ],
             &[],
             false,
         )
         .unwrap();
-        let unique: Vec<String> = s
-            .table_indexes("_0d_1t")
-            .unwrap()
-            .into_iter()
-            .filter(|(_, unique, _)| *unique)
-            .map(|(name, _, _)| name)
-            .collect();
-        assert_eq!(unique.len(), 1);
-        assert!(unique[0].to_lowercase().ends_with("__0d_1t_0"));
-        drop_index(&s, "_0d_1t", "0d_1t_0", &["b"]).unwrap();
-        assert_eq!(
-            names("_0d_1t"),
-            unique.iter().map(|n| n.to_lowercase()).collect::<Vec<_>>()
-        );
+        drop_index(&s, "_0d_1t", &["a"]).unwrap();
+        drop_index(&s, "_0d_1t", &["b"]).unwrap();
+        assert_eq!(s.table_indexes("_0d_1t").unwrap().len(), 1);
         run("INSERT INTO \"_0d_1t\" VALUES (1, 1)");
         assert!(s
             .run("INSERT INTO \"_0d_1t\" VALUES (1, 2)", ParamVec::new())
             .is_err());
+
+        // So does a FOREIGN KEY's, which a key over its column shares
+        run("CREATE TABLE i_1q (id INTEGER PRIMARY KEY)");
+        run("CREATE TABLE i_1c (id INTEGER PRIMARY KEY, pid INTEGER, \
+             FOREIGN KEY (pid) REFERENCES i_1q (id))");
+        let fk = names("i_1c");
+        create_index(&s, "i_1c", "k", &["pid"]).unwrap();
+        drop_index(&s, "i_1c", &["pid"]).unwrap();
+        assert_eq!(names("i_1c"), fk);
 
         // A shortened name holds `__` (`_` cut from `_0`, then `_2`)
         let long = fit_name(format!("{}_1{}", "_0".repeat(64), "_0".repeat(64)));
@@ -731,7 +744,7 @@ mod tests {
         ));
         create_index(&s, &long, "k", &["a"]).unwrap();
         assert_eq!(names(&long).len(), 1);
-        drop_index(&s, &long, "k", &["a"]).unwrap();
+        drop_index(&s, &long, &["a"]).unwrap();
         assert!(names(&long).is_empty());
     }
 
