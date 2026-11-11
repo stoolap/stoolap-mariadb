@@ -161,6 +161,17 @@ INSERT INTO fk_chain.d VALUES (1, 1);
 """, use_db=False)
     h.assert_err("a referenced parent alone is still refused",
                  "DROP TABLE fk_chain.b", "1451")
+    # A copying ALTER of a table other tables' keys name is refused: the
+    # copy is swapped in by renames, which take those keys to the old table
+    # (stoolap#987). The keys keep naming the table, and the database drops
+    h.assert_err("a copying ALTER of a referenced table is refused",
+                 "ALTER TABLE fk_chain.b ADD COLUMN w INT, ALGORITHM=COPY",
+                 r"FOREIGN KEY of .* names it")
+    h.assert_ok("a row of the table takes a new child",
+                "INSERT INTO fk_chain.b VALUES (2, 1)")
+    h.assert_ok("which names it", "INSERT INTO fk_chain.c VALUES (2, 2, 1)")
+    h.assert_err("the key still checks the table",
+                 "INSERT INTO fk_chain.c VALUES (3, 9, 1)", "1452")
     h.assert_ok("the database drops", "DROP DATABASE fk_chain")
     h.assert_scalar("and is gone", "SELECT COUNT(*) FROM information_schema.schemata "
                     "WHERE schema_name = 'fk_chain'", "0")

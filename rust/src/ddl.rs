@@ -297,6 +297,9 @@ pub const STOOLAP_FK_SET_DEFAULT: i32 = 5;
 /// (`dropped`) under a key is refused, whatever column takes its name. A
 /// key naming `from` itself names `to`, the copy, by the column's new name.
 /// None when `from` is not a stoolap table (ALTER ... ENGINE=STOOLAP).
+/// Refused when another table's key names `from`: MariaDB swaps the copy
+/// in by renames, and a rename takes those keys to the old table, which
+/// they would go on naming (stoolap#987)
 pub fn kept_foreign_keys(
     session: &Session,
     from: &str,
@@ -308,6 +311,12 @@ pub fn kept_foreign_keys(
     // Column names compare as MariaDB and stoolap compare them, by case
     // past ASCII too
     let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    if let Some((child, _, _)) = session.referencing_tables(from).first() {
+        return Err(Error::NotSupported(format!(
+            "this ALTER TABLE copies the table, and a FOREIGN KEY of '{child}' names it: \
+             the key would stay with the old table (stoolap#987)"
+        )));
+    }
     let fks = match session.with_table(from, |t| Ok(t.schema().foreign_keys.clone())) {
         Ok(fks) => fks,
         Err(Error::TableNotFound(_)) => return Ok(Vec::new()),
