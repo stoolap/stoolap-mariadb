@@ -84,6 +84,33 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
     return true;
 }
 
+bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
+                                 size_t child_db_length) {
+    if (!thd || !thd->lex) return true;
+    List_iterator_fast<Key> it(thd->lex->alter_info.key_list);
+    while (Key* k = it++) {
+        if (k->type != Key::FOREIGN_KEY) continue;
+        const auto* fk = static_cast<Foreign_key*>(k);
+        // As MariaDB names a table in its locks
+        std::string db = fk->ref_db.length
+                             ? std::string(fk->ref_db.str, fk->ref_db.length)
+                             : std::string(child_db, child_db_length);
+        std::string name(fk->ref_table.str, fk->ref_table.length);
+        table_case_convert(db.data(), static_cast<uint>(db.size()));
+        table_case_convert(name.data(), static_cast<uint>(name.size()));
+        if (thd->mdl_context.is_lock_owner(MDL_key::TABLE, db.c_str(),
+                                           name.c_str(), MDL_SHARED))
+            continue;
+        MDL_request request;
+        MDL_REQUEST_INIT(&request, MDL_key::TABLE, db.c_str(), name.c_str(),
+                         MDL_SHARED_NO_WRITE, MDL_TRANSACTION);
+        if (thd->mdl_context.acquire_lock(&request,
+                                          thd->variables.lock_wait_timeout))
+            return false;
+    }
+    return true;
+}
+
 bool stoolap_thd_altered_table(
     THD* thd, std::string* path,
     std::vector<std::pair<std::string, std::string>>* renames,

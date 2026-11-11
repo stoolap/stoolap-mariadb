@@ -173,6 +173,26 @@ INSERT INTO fk_chain.d VALUES (1, 1);
     h.assert_err("the key still checks the table",
                  "INSERT INTO fk_chain.c VALUES (3, 9, 1)", "1452")
     h.assert_ok("the database drops", "DROP DATABASE fk_chain")
+    # A key's CREATE locks its parent against a copying ALTER of it, which
+    # would leave the key with the old table: it waits for a statement that
+    # holds the parent, as an ALTER does, here a write in an open transaction
+    h.exec_stmt(f"CREATE TABLE lp (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine}")
+    w = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=False)
+    try:
+        w.cursor().execute("INSERT INTO lp VALUES (1)")
+        h.exec_stmt("SET SESSION lock_wait_timeout = 1")
+        h.assert_err("a key's CREATE waits for a statement holding its parent",
+                     "CREATE TABLE lc (id INT NOT NULL PRIMARY KEY, pid INT, "
+                     f"FOREIGN KEY (pid) REFERENCES lp (id)) ENGINE={h.engine}",
+                     "1205")
+    finally:
+        h.exec_stmt("SET SESSION lock_wait_timeout = DEFAULT")
+        w.rollback()
+        w.close()
+    h.assert_ok("and goes ahead once it ends",
+                "CREATE TABLE lc (id INT NOT NULL PRIMARY KEY, pid INT, "
+                f"FOREIGN KEY (pid) REFERENCES lp (id)) ENGINE={h.engine}")
     h.assert_scalar("and is gone", "SELECT COUNT(*) FROM information_schema.schemata "
                     "WHERE schema_name = 'fk_chain'", "0")
 

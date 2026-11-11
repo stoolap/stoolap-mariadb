@@ -43,6 +43,15 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
                               size_t child_db_length,
                               std::vector<StoolapThdForeignKey>* out);
 
+// Locks each parent of the statement's FOREIGN KEYs against a copying
+// ALTER of it until the statement ends (MDL_SHARED_NO_WRITE, which the
+// ALTER's MDL_SHARED_UPGRADABLE excludes): the key then names the table
+// the ALTER leaves, or the ALTER, waiting for it, finds the key and is
+// refused. A parent the statement holds already (its own table) is
+// skipped. False when a wait fails, with the error raised.
+bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
+                                 size_t child_db_length);
+
 // sql_class.h-dependent helpers: live in stoolap_thd_inspect.cc to keep
 // the heavy sql_class/wsrep include chain out of most TUs.
 extern "C" int stoolap_thd_is_update_or_delete(THD* thd);

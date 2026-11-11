@@ -622,6 +622,12 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
                             MYF(0));
             return HA_ERR_UNSUPPORTED;
         }
+        // A parent's copying ALTER, whose swap would take the key to the
+        // old table, waits for this statement or this one for it
+        if (!fks.empty() &&
+            !stoolap_thd_lock_fk_parents(current_thd, form->s->db.str,
+                                         form->s->db.length))
+            return HA_ERR_LOCK_WAIT_TIMEOUT;
         for (const auto& fk : fks)
             parents.push_back(stoolap_table_from_path(fk.parent_path.c_str()));
         for (size_t i = 0; i < fks.size(); ++i)
