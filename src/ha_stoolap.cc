@@ -576,7 +576,8 @@ bool refuse_unsupported_columns(TABLE* form) {
 // handler error. A secondary index that fails is a warning: queries on
 // its key full-scan.
 int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
-                         bool if_not_exists, bool with_fks, const char* what) {
+                         bool if_not_exists, bool with_fks, bool temporary,
+                         const char* what) {
     std::vector<StoolapColumnDef> columns;
     columns.reserve(form->s->fields);
     std::vector<std::string> names;
@@ -629,7 +630,7 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
         if (!fks.empty() &&
             !stoolap_thd_lock_fk_parents(
                 current_thd, form->s->db.str, form->s->db.length,
-                form->s->table_name.str, form->s->table_name.length,
+                form->s->table_name.str, form->s->table_name.length, temporary,
                 stoolap_hton, &missing, &other_engine)) {
             if (other_engine)
                 my_printf_error(ER_GET_ERRMSG,
@@ -844,10 +845,10 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
         // without them, leaving "index-served" queries on a full scan.
         // Not the statement's FOREIGN KEYs: they belong to the table it
         // creates, if any, and MariaDB keeps none for this one.
-        if (int err =
-                create_stoolap_table(d, stoolap_table_, table,
-                                     /*if_not_exists=*/true,
-                                     /*with_fks=*/false, "schema reconcile"))
+        if (int err = create_stoolap_table(
+                d, stoolap_table_, table,
+                /*if_not_exists=*/true,
+                /*with_fks=*/false, /*temporary=*/false, "schema reconcile"))
             return err;
         g_engine.mark_reconciled(stoolap_table_);
     }
@@ -880,15 +881,15 @@ StoolapDB* ha_stoolap::ddl_db() {
     return d;
 }
 
-int ha_stoolap::create(const char* name, TABLE* form,
-                       HA_CREATE_INFO* /*info*/) {
+int ha_stoolap::create(const char* name, TABLE* form, HA_CREATE_INFO* info) {
     const std::string tbl = stoolap_table_from_path(name);
     if (refuse_unenforceable_keys(form) || refuse_unsupported_columns(form))
         return HA_ERR_UNSUPPORTED;
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
     if (int err = create_stoolap_table(db, tbl, form, /*if_not_exists=*/false,
-                                       /*with_fks=*/true, "CREATE TABLE"))
+                                       /*with_fks=*/true, info->tmp_table(),
+                                       "CREATE TABLE"))
         return err;
     g_engine.mark_reconciled(tbl);
     return 0;

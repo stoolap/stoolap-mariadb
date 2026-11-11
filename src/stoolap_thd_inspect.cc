@@ -86,8 +86,9 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
 
 bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
                                  size_t child_db_length, const char* child_name,
-                                 size_t child_name_length, handlerton* hton,
-                                 std::string* missing, bool* other_engine) {
+                                 size_t child_name_length, bool temporary,
+                                 handlerton* hton, std::string* missing,
+                                 bool* other_engine) {
     if (!thd || !thd->lex) return true;
     // The table the statement creates, or the one an ALTER copies (the
     // table created is its copy), as MariaDB names it. A CREATE ... SELECT
@@ -112,8 +113,10 @@ bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
         std::string name(fk->ref_table.str, fk->ref_table.length);
         table_case_convert(db.data(), static_cast<uint>(db.size()));
         table_case_convert(name.data(), static_cast<uint>(name.size()));
-        // A self-reference: the statement holds its own table already
-        if (db == self_db && name == self_name) continue;
+        // A self-reference: the statement holds its own table already. A
+        // TEMPORARY table, stoolap's by its file in the tmpdir, has none:
+        // its key names the permanent table of that name
+        if (!temporary && db == self_db && name == self_name) continue;
         // A lock as strong held already (MariaDB takes one on each parent
         // of an ALTER ... ADD FOREIGN KEY) is not taken again; the parent
         // is still checked below

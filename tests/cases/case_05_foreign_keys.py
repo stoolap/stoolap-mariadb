@@ -192,6 +192,11 @@ INSERT INTO fk_chain.d VALUES (1, 1);
                      f"FOREIGN KEY (pid) REFERENCES lp (id)) ENGINE={h.engine} "
                      "AS SELECT id, id AS pid FROM lp WHERE 0",
                      "1205")
+        # A TEMPORARY table of the parent's name is no self-reference:
+        # its key names the permanent table
+        h.assert_err("so does a TEMPORARY table of the parent's name",
+                     "CREATE TEMPORARY TABLE lp (pid INT, FOREIGN KEY (pid) "
+                     f"REFERENCES lp (id)) ENGINE={h.engine}", "1205")
     finally:
         h.exec_stmt("SET SESSION lock_wait_timeout = DEFAULT")
         w.rollback()
