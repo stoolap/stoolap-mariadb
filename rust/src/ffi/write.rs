@@ -30,13 +30,16 @@ use crate::write::{self, ReadCheck};
 
 /// Runs `direct` on `table`'s write handle, or `sql` when a foreign key
 /// names the table or the row is named `by_key`, storing the count in
-/// `affected`
+/// `affected`. `unchecked` runs `direct` whatever keys name the table:
+/// rows the caller checks against them after (a copying ALTER's)
+#[allow(clippy::too_many_arguments)]
 unsafe fn write_through(
     db: *mut StoolapDB,
     table: *const c_char,
     affected: *mut i64,
     what: &str,
     by_key: bool,
+    unchecked: bool,
     direct: impl FnOnce(&mut dyn Table) -> Result<i64>,
     sql: impl FnOnce(&Session, &str) -> Result<i64>,
 ) -> i32 {
@@ -49,6 +52,9 @@ unsafe fn write_through(
         let session = &handle.session;
         if by_key {
             return sql(session, name);
+        }
+        if unchecked {
+            return session.with_any_write_table(name, direct);
         }
         match session.with_write_table(name, direct)? {
             Some(n) => Ok(n),
@@ -178,6 +184,39 @@ pub unsafe extern "C" fn stoolap_writes_through_sql(
     }
 }
 
+/// Checks every row of `table` against its foreign keys: the rows a
+/// copying ALTER wrote unchecked. `STOOLAP_OK`, or the first row's
+/// violation.
+///
+/// # Safety
+///
+/// `db` must be a valid `StoolapDB`, `table` a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_check_foreign_keys(
+    db: *mut StoolapDB,
+    table: *const c_char,
+) -> i32 {
+    let Some(handle) = db.as_mut() else {
+        return STOOLAP_ERROR;
+    };
+    handle.last_error = None;
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        sql_write::check_foreign_keys(&handle.session, table_name(table)?)
+    }));
+    match result {
+        Ok(Ok(())) => STOOLAP_OK,
+        Ok(Err(e)) => {
+            handle.set_error(&e.to_string());
+            super::error::note_error(&e);
+            STOOLAP_ERROR
+        }
+        Err(_) => {
+            handle.set_error("panic during stoolap_check_foreign_keys");
+            STOOLAP_ERROR
+        }
+    }
+}
+
 /// Inserts the row in `record`: `fields` describe every column, in order,
 /// and `encode(ctx, ...)` gives the values they do not read themselves.
 ///
@@ -196,6 +235,7 @@ pub unsafe extern "C" fn stoolap_insert_record(
     record: *const u8,
     encode: Option<EncodeFn>,
     ctx: *mut c_void,
+    unchecked: i32,
     affected: *mut i64,
 ) -> i32 {
     let src = RecordIn {
@@ -209,6 +249,7 @@ pub unsafe extern "C" fn stoolap_insert_record(
         affected,
         "stoolap_insert_record",
         false,
+        unchecked != 0,
         |t| {
             let row = row_values(field_slice(fields, nfields)?, &src)?;
             write::insert(t, columns(table_columns)?, vec![row])
@@ -324,6 +365,7 @@ pub unsafe extern "C" fn stoolap_insert_buffer(
     table: *const c_char,
     table_columns: i32,
     buffer: *mut StoolapRowBuffer,
+    unchecked: i32,
     affected: *mut i64,
 ) -> i32 {
     let rows = match buffer.as_mut() {
@@ -336,6 +378,7 @@ pub unsafe extern "C" fn stoolap_insert_buffer(
         affected,
         "stoolap_insert_buffer",
         false,
+        unchecked != 0,
         |t| write::insert(t, columns(table_columns)?, rows.take()),
         |session, name| sql_write::insert(session, name, rows.take()),
     )
@@ -404,6 +447,7 @@ pub unsafe extern "C" fn stoolap_update_record(
         affected,
         "stoolap_update_record",
         has_row_id == 0,
+        false,
         |t| {
             let set: Vec<usize> = changed.iter().map(|f| f.column as usize).collect();
             let values = read_values(&changed, &new)?;
@@ -476,6 +520,7 @@ pub unsafe extern "C" fn stoolap_delete_record(
         affected,
         "stoolap_delete_record",
         has_row_id == 0,
+        false,
         |t| {
             let was = read_values(read, &src)?;
             let check = ReadCheck {

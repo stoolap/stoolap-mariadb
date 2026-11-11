@@ -1048,6 +1048,11 @@ void ha_stoolap::start_bulk_insert(ha_rows /*rows*/, uint /*flags*/) {
     bulk_active_ = false;
     bulk_owns_tx_ = false;
     bulk_rows_ = 0;
+    // A copying ALTER writes only its copy
+    const int command = thd_sql_command(ha_thd());
+    alter_copy_ = command == SQLCOM_ALTER_TABLE ||
+                  command == SQLCOM_CREATE_INDEX ||
+                  command == SQLCOM_DROP_INDEX;
 
     // INSERT IGNORE / REPLACE / ODKU need per-row HA_ERR_FOUND_DUPP_KEY
     // callbacks for recovery; a batch is all-or-nothing, and one duplicate
@@ -1065,11 +1070,23 @@ void ha_stoolap::start_bulk_insert(ha_rows /*rows*/, uint /*flags*/) {
 }
 
 int ha_stoolap::end_bulk_insert() {
-    if (!bulk_active_) return 0;
-    bulk_active_ = false;
-    const int err = flush_bulk_buffer();
-    // mysql_insert reports a failed end_bulk_insert by my_errno (with the
-    // duplicate key from get_dup_key), not by this return value.
+    int err = 0;
+    if (bulk_active_) {
+        bulk_active_ = false;
+        err = flush_bulk_buffer();
+    }
+    if (alter_copy_) {
+        alter_copy_ = false;
+        THD* thd = ha_thd();
+        StoolapDB* db = get_thd_ctx(thd)->db();
+        if (!err && !thd_test_options(thd, OPTION_NO_FOREIGN_KEY_CHECKS) &&
+            stoolap_check_foreign_keys(db, stoolap_table_.c_str()) !=
+                STOOLAP_OK)
+            err = write_error(db, "ALTER TABLE");
+    }
+    // mysql_insert (and an ALTER's copy) reports a failed end_bulk_insert
+    // by my_errno (with the duplicate key from get_dup_key), not by this
+    // return value.
     if (err) my_errno = err;
     return err;
 }
@@ -1094,9 +1111,9 @@ int ha_stoolap::flush_bulk_buffer(bool partial) {
     StoolapDB* db = direct_write_db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
     int64_t affected = 0;
-    const int rc = stoolap_insert_buffer(db, stoolap_table_.c_str(),
-                                         static_cast<int32_t>(table->s->fields),
-                                         row_buffer_.get(), &affected);
+    const int rc = stoolap_insert_buffer(
+        db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
+        row_buffer_.get(), alter_copy_, &affected);
     cur_row_id_valid_ = false;
     if (rc != STOOLAP_OK) {
         invalidate_records_cache();
@@ -1164,7 +1181,7 @@ int ha_stoolap::write_row(const uchar* buf) {
     const int rc = stoolap_insert_record(
         db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
         fields.data(), static_cast<int32_t>(fields.size()), buf, &encode_cell,
-        &src, &affected);
+        &src, alter_copy_, &affected);
     cur_row_id_valid_ = false;
     if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "INSERT");
     apply_count_delta(affected);

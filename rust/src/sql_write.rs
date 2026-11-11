@@ -13,7 +13,7 @@
 //! not at all.
 
 use stoolap::api::ParamVec;
-use stoolap::core::{Error, Result, Row, Value};
+use stoolap::core::{DataType, Error, Result, Row, Value};
 
 use crate::session::Session;
 use crate::write;
@@ -101,6 +101,42 @@ pub fn update(
     );
     let values = set.into_iter().chain(key).map(|(_, v)| v);
     Ok(session.run_write(&sql, params(values))?.rows_affected())
+}
+
+/// Refuses `table` when a row holds a foreign key value its parent holds
+/// in no row, naming the first such key: one query per key, over every
+/// row, with the parent read as the statement sees it
+pub fn check_foreign_keys(session: &Session, table: &str) -> Result<()> {
+    let schema = session.with_any_write_table(table, |t| Ok(t.schema().clone()))?;
+    for fk in &schema.foreign_keys {
+        let sql = format!(
+            "SELECT c.{col} FROM {table} c WHERE c.{col} IS NOT NULL AND NOT EXISTS \
+             (SELECT 1 FROM {parent} p WHERE p.{pcol} = c.{col}) LIMIT 1",
+            col = quote(&fk.column_name),
+            table = quote(table),
+            parent = quote(&fk.referenced_table),
+            pcol = quote(&fk.referenced_column),
+        );
+        let mut rows = session.run(&sql, ParamVec::new())?;
+        if rows.next() {
+            let value = rows
+                .row()
+                .get(0)
+                .cloned()
+                .unwrap_or(Value::Null(DataType::Null));
+            return Err(Error::foreign_key_violation(
+                table,
+                &fk.column_name,
+                &fk.referenced_table,
+                &fk.referenced_column,
+                format!(
+                    "referenced row with {} = {} does not exist",
+                    fk.referenced_column, value
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Deletes the row `key` names

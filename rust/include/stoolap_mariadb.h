@@ -482,8 +482,15 @@ int32_t stoolap_end_statement(StoolapDB* db, int32_t commit);
 int32_t stoolap_writes_through_sql(StoolapDB* db, const char* table);
 
 /**
+ * Check every row of `table` against its foreign keys (the rows a copying
+ * ALTER wrote `unchecked`): STOOLAP_OK, or the first violation.
+ */
+int32_t stoolap_check_foreign_keys(StoolapDB* db, const char* table);
+
+/**
  * Insert the row in `record`: `fields` describe every column, in order;
  * `encode(ctx, ...)` gives the values they do not read themselves.
+ * `unchecked` writes it direct whatever foreign keys name the table.
  */
 int32_t stoolap_insert_record(
     StoolapDB* db,
@@ -492,6 +499,7 @@ int32_t stoolap_insert_record(
     const StoolapField* fields, int32_t nfields,
     const uint8_t* record,
     StoolapEncodeFn encode, void* ctx,
+    int32_t unchecked,
     int64_t* rows_affected
 );
 
@@ -520,13 +528,14 @@ const char* stoolap_row_buffer_errmsg(const StoolapRowBuffer* buffer);
 /**
  * Insert the rows `buffer` holds, which it gives up: it is empty after,
  * whatever the outcome. Through SQL, rows outside an open transaction go
- * in one of their own.
+ * in one of their own. `unchecked` as stoolap_insert_record().
  */
 int32_t stoolap_insert_buffer(
     StoolapDB* db,
     const char* table,
     int32_t table_columns,
     StoolapRowBuffer* buffer,
+    int32_t unchecked,
     int64_t* rows_affected
 );
 
