@@ -624,10 +624,17 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
         }
         // A parent's copying ALTER, whose swap would take the key to the
         // old table, waits for this statement or this one for it
+        std::string missing;
         if (!fks.empty() &&
             !stoolap_thd_lock_fk_parents(current_thd, form->s->db.str,
-                                         form->s->db.length))
-            return HA_ERR_LOCK_WAIT_TIMEOUT;
+                                         form->s->db.length, &missing)) {
+            if (!missing.empty())
+                my_printf_error(ER_GET_ERRMSG,
+                                "stoolap: FOREIGN KEY references non-existent "
+                                "table '%s'",
+                                MYF(0), missing.c_str());
+            return HA_ERR_GENERIC;
+        }
         for (const auto& fk : fks)
             parents.push_back(stoolap_table_from_path(fk.parent_path.c_str()));
         for (size_t i = 0; i < fks.size(); ++i)

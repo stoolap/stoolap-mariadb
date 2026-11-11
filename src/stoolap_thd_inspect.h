@@ -47,10 +47,12 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
 // ALTER of it until the statement ends (MDL_SHARED_NO_WRITE, which the
 // ALTER's MDL_SHARED_UPGRADABLE excludes): the key then names the table
 // the ALTER leaves, or the ALTER, waiting for it, finds the key and is
-// refused. A parent the statement holds already (its own table) is
-// skipped. False when a wait fails, with the error raised.
+// refused. A parent the statement holds as strongly already (the table it
+// creates) is skipped. False when a wait fails, with the error raised, or
+// when a parent is no table MariaDB knows by that name, named in `missing`
+// ("db.table").
 bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
-                                 size_t child_db_length);
+                                 size_t child_db_length, std::string* missing);
 
 // sql_class.h-dependent helpers: live in stoolap_thd_inspect.cc to keep
 // the heavy sql_class/wsrep include chain out of most TUs.

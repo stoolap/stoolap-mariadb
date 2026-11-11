@@ -186,6 +186,12 @@ INSERT INTO fk_chain.d VALUES (1, 1);
                      "CREATE TABLE lc (id INT NOT NULL PRIMARY KEY, pid INT, "
                      f"FOREIGN KEY (pid) REFERENCES lp (id)) ENGINE={h.engine}",
                      "1205")
+        # Reading the parent too, which takes a weaker lock on it
+        h.assert_err("so does a CREATE ... SELECT reading its parent",
+                     "CREATE TABLE ls (id INT NOT NULL PRIMARY KEY, pid INT, "
+                     f"FOREIGN KEY (pid) REFERENCES lp (id)) ENGINE={h.engine} "
+                     "AS SELECT id, id AS pid FROM lp WHERE 0",
+                     "1205")
     finally:
         h.exec_stmt("SET SESSION lock_wait_timeout = DEFAULT")
         w.rollback()
@@ -193,6 +199,13 @@ INSERT INTO fk_chain.d VALUES (1, 1);
     h.assert_ok("and goes ahead once it ends",
                 "CREATE TABLE lc (id INT NOT NULL PRIMARY KEY, pid INT, "
                 f"FOREIGN KEY (pid) REFERENCES lp (id)) ENGINE={h.engine}")
+    # The parent is the table MariaDB finds by that name: by its letter case
+    # under lower_case_table_names = 0, where InnoDB refuses the key too
+    if h.sql("SELECT @@lower_case_table_names").strip() == "0":
+        h.assert_err("a parent named in other letter case is no parent",
+                     "CREATE TABLE lu (id INT NOT NULL PRIMARY KEY, pid INT, "
+                     f"FOREIGN KEY (pid) REFERENCES LP (id)) ENGINE={h.engine}",
+                     r"non-existent table")
     h.assert_scalar("and is gone", "SELECT COUNT(*) FROM information_schema.schemata "
                     "WHERE schema_name = 'fk_chain'", "0")
 

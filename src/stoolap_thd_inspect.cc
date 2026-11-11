@@ -85,7 +85,7 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
 }
 
 bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
-                                 size_t child_db_length) {
+                                 size_t child_db_length, std::string* missing) {
     if (!thd || !thd->lex) return true;
     List_iterator_fast<Key> it(thd->lex->alter_info.key_list);
     while (Key* k = it++) {
@@ -98,8 +98,9 @@ bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
         std::string name(fk->ref_table.str, fk->ref_table.length);
         table_case_convert(db.data(), static_cast<uint>(db.size()));
         table_case_convert(name.data(), static_cast<uint>(name.size()));
+        // A lock as strong held already (the table the statement creates)
         if (thd->mdl_context.is_lock_owner(MDL_key::TABLE, db.c_str(),
-                                           name.c_str(), MDL_SHARED))
+                                           name.c_str(), MDL_SHARED_NO_WRITE))
             continue;
         MDL_request request;
         MDL_REQUEST_INIT(&request, MDL_key::TABLE, db.c_str(), name.c_str(),
@@ -107,6 +108,15 @@ bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
         if (thd->mdl_context.acquire_lock(&request,
                                           thd->variables.lock_wait_timeout))
             return false;
+        // The parent is the table of that name, as MariaDB finds it (by
+        // its letter case under lower_case_table_names = 0), not the one
+        // stoolap would find by its name in lower case
+        const LEX_CSTRING db_name{db.c_str(), db.size()};
+        const LEX_CSTRING table_name{name.c_str(), name.size()};
+        if (!ha_table_exists(thd, &db_name, &table_name)) {
+            *missing = db + "." + name;
+            return false;
+        }
     }
     return true;
 }
