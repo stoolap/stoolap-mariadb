@@ -103,6 +103,43 @@ pub fn update(
     Ok(session.run_write(&sql, params(values))?.rows_affected())
 }
 
+/// Refuses `table` when a row holds a foreign key value its parent holds
+/// in no row, as the executor refuses an INSERT: by an UPDATE setting each
+/// key column to itself, which has the executor check every row's values
+/// against their parents and hold each parent key until the transaction
+/// ends, so a concurrent delete of one conflicts instead of leaving a row
+/// without it. A column the table's own key names keeps its value, which
+/// asks that key nothing (stoolap#981)
+pub fn check_foreign_keys(session: &Session, table: &str) -> Result<()> {
+    let schema = session.with_any_write_table(table, |t| Ok(t.schema().clone()))?;
+    let mut columns: Vec<String> = Vec::new();
+    for fk in &schema.foreign_keys {
+        let column = quote(&fk.column_name);
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let sql = format!(
+        "UPDATE {} SET {} WHERE {}",
+        quote(table),
+        columns
+            .iter()
+            .map(|c| format!("{c} = {c}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        columns
+            .iter()
+            .map(|c| format!("{c} IS NOT NULL"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    );
+    session.run_write(&sql, ParamVec::new())?;
+    Ok(())
+}
+
 /// Deletes the row `key` names
 pub fn delete(session: &Session, table: &str, key: Vec<(String, Value)>) -> Result<i64> {
     let sql = format!(

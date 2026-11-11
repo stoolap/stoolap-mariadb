@@ -65,19 +65,6 @@ CREATE TABLE pp (a INT NOT NULL, b INT NOT NULL,
                 f"CREATE TABLE vcomp (id INT NOT NULL PRIMARY KEY, c "
                 f"VARCHAR(100) COMPRESSED) ENGINE={h.engine}")
 
-    h.section("Self-referencing FOREIGN KEY refused")
-    h.assert_err("self-ref FK rejected at CREATE",
-                 f"""CREATE TABLE selfref (
-                       id INT NOT NULL PRIMARY KEY,
-                       parent_id INT,
-                       FOREIGN KEY (parent_id) REFERENCES selfref (id)
-                     ) ENGINE={h.engine}""",
-                 r"self-referencing FOREIGN KEY")
-    h.assert_scalar("self-ref table not present",
-                    "SELECT COUNT(*) FROM information_schema.tables "
-                    f"WHERE table_schema = '{h.db}' AND table_name = 'selfref'",
-                    "0")
-
     h.section("Direct UPDATE: UNIQUE violation -> ER_DUP_ENTRY (1062)")
     h.exec_script(f"""
 CREATE TABLE du (id INT NOT NULL PRIMARY KEY,

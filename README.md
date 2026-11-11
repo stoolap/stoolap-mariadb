@@ -212,9 +212,9 @@ Tables created by an older build of the plugin must be re-created.
 | `KEY` / `CREATE INDEX`, single-column or composite | Yes (one Stoolap index over all parts) |
 | `PRIMARY KEY` / `UNIQUE` on a case-insensitive collation | Refused (Stoolap compares bytes: use a `_bin` collation) |
 | `PRIMARY KEY` / `UNIQUE` over a column prefix (`a(3)`) | Refused (Stoolap enforces whole values) |
-| `FOREIGN KEY` | Yes: single-column, to a PRIMARY KEY or UNIQUE column; RESTRICT, NO ACTION, CASCADE, SET NULL |
-| Composite or self-referencing `FOREIGN KEY` | Refused |
-| FOREIGN KEYs through a copying `ALTER TABLE` | Kept, following renamed columns; dropping a key column is refused |
+| `FOREIGN KEY` | Yes: single-column, to a PRIMARY KEY or UNIQUE column, of another table or its own; RESTRICT, NO ACTION, CASCADE, SET NULL |
+| Composite `FOREIGN KEY` | Refused |
+| FOREIGN KEYs through a copying `ALTER TABLE` | Kept, following renamed columns; the copy is checked whole once its rows are in (1452), so the order they are copied in does not matter; dropping a key column is refused |
 | `DROP TABLE` of a referenced parent | Refused with 1451, as InnoDB does (not with `foreign_key_checks = 0`); `DROP DATABASE` drops its own children first |
 | `RENAME TABLE` | Yes (children's FOREIGN KEYs follow the parent) |
 | `ALTER TABLE` ADD / DROP / CHANGE COLUMN, ADD / DROP INDEX | Yes (copying ALTER) |
@@ -289,6 +289,12 @@ the list stays current.
 - **`utf8mb4_bin` UNIQUE** ignores PAD SPACE (`'a'` and `'a '` are both
   accepted).
 - **A FOREIGN KEY to an indexed non-unique column** is refused.
+- **A row whose FOREIGN KEY names that row itself** is deleted, or its
+  key moved together with the value naming it, as that leaves no row
+  naming a missing one; InnoDB refuses both (1451), also under RESTRICT.
+- **An ON UPDATE CASCADE or SET NULL that comes back into its own table**
+  (a key naming its own table, or a chain of keys that returns to it)
+  runs, as in PostgreSQL; InnoDB refuses it (1451).
 - **On a table a FOREIGN KEY names that has no primary key**, the row
   pump cannot name a row: an UPDATE with ORDER BY / LIMIT fails (1296),
   and an UPDATE of a UNIQUE column is checked as a set.

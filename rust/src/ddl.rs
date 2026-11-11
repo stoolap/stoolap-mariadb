@@ -188,7 +188,7 @@ pub fn create_table(
         sql.push_str(&key_columns(k)?);
     }
     for fk in foreign_keys {
-        foreign_key(fk, table, &mut sql)?;
+        foreign_key(fk, &mut sql)?;
     }
     sql.push(')');
     session.run(&sql, ParamVec::new())?;
@@ -294,11 +294,13 @@ pub const STOOLAP_FK_SET_DEFAULT: i32 = 5;
 /// The foreign keys of `from`, the table a copying ALTER rebuilds, for its
 /// copy: MariaDB keeps none to hand back. A column the ALTER renames
 /// (`renames`, old name to new) goes by its new name; one it drops
-/// (`dropped`) under a key is refused, whatever column takes its name.
+/// (`dropped`) under a key is refused, whatever column takes its name. A
+/// key naming `from` itself names `to`, the copy, by the column's new name.
 /// None when `from` is not a stoolap table (ALTER ... ENGINE=STOOLAP).
 pub fn kept_foreign_keys(
     session: &Session,
     from: &str,
+    to: &str,
     renames: &[(String, String)],
     dropped: &[String],
 ) -> Result<Vec<ForeignKey>> {
@@ -319,20 +321,33 @@ pub fn kept_foreign_keys(
     };
     fks.into_iter()
         .map(|fk| {
-            if dropped.iter().any(|d| same(d, &fk.column_name)) {
-                return Err(Error::NotSupported(format!(
-                    "column '{}' is used by a FOREIGN KEY: it cannot be dropped",
-                    fk.column_name
-                )));
+            let own = same(&fk.referenced_table, from);
+            for column in [Some(&fk.column_name), own.then_some(&fk.referenced_column)]
+                .into_iter()
+                .flatten()
+            {
+                if dropped.iter().any(|d| same(d, column)) {
+                    return Err(Error::NotSupported(format!(
+                        "column '{}' is used by a FOREIGN KEY: it cannot be dropped",
+                        column
+                    )));
+                }
             }
-            let column = renames
-                .iter()
-                .find(|(old, _)| same(old, &fk.column_name))
-                .map_or(fk.column_name, |(_, new)| new.clone());
+            let renamed = |name: String| {
+                renames
+                    .iter()
+                    .find(|(old, _)| same(old, &name))
+                    .map_or(name, |(_, new)| new.clone())
+            };
+            let (parent, parent_column) = if own {
+                (to.to_string(), renamed(fk.referenced_column))
+            } else {
+                (fk.referenced_table, fk.referenced_column)
+            };
             Ok(ForeignKey {
-                column,
-                parent: fk.referenced_table,
-                parent_column: Some(fk.referenced_column),
+                column: renamed(fk.column_name),
+                parent,
+                parent_column: Some(parent_column),
                 on_delete: action(fk.on_delete),
                 on_update: action(fk.on_update),
             })
@@ -340,16 +355,8 @@ pub fn kept_foreign_keys(
         .collect()
 }
 
-/// Appends `fk`, a key of `table`, as a clause of its CREATE TABLE
-fn foreign_key(fk: &ForeignKey, table: &str, out: &mut String) -> Result<()> {
-    // Stoolap looks the parent up at CREATE, before this table exists
-    if fk.parent == table {
-        return Err(Error::NotSupported(format!(
-            "self-referencing FOREIGN KEY on '{}': stoolap resolves the \
-             parent at CREATE-time, before the table is registered.",
-            fk.column
-        )));
-    }
+/// Appends `fk` as a clause of its table's CREATE TABLE
+fn foreign_key(fk: &ForeignKey, out: &mut String) -> Result<()> {
     out.push_str(", FOREIGN KEY (");
     out.push_str(&quote(&fk.column));
     out.push_str(") REFERENCES ");
@@ -392,7 +399,7 @@ mod tests {
         };
         let sql = |k: ForeignKey| {
             let mut out = String::new();
-            foreign_key(&k, "d_1c", &mut out).map(|_| out)
+            foreign_key(&k, &mut out).map(|_| out)
         };
         assert_eq!(
             sql(fk("d_1p", Some("id"), STOOLAP_FK_CASCADE, STOOLAP_FK_SET_NULL)).unwrap(),
@@ -402,7 +409,11 @@ mod tests {
             sql(fk("o_1p", None, STOOLAP_FK_UNDEF, STOOLAP_FK_NO_ACTION)).unwrap(),
             ", FOREIGN KEY (\"p\"\"id\") REFERENCES \"o_1p\" ON UPDATE NO ACTION"
         );
-        assert!(sql(fk("d_1c", Some("id"), STOOLAP_FK_UNDEF, STOOLAP_FK_UNDEF)).is_err());
+        // A key naming its own table
+        assert_eq!(
+            sql(fk("d_1c", Some("id"), STOOLAP_FK_UNDEF, STOOLAP_FK_UNDEF)).unwrap(),
+            ", FOREIGN KEY (\"p\"\"id\") REFERENCES \"d_1c\" (\"id\")"
+        );
         assert!(sql(fk("d_1p", Some("id"), 9, STOOLAP_FK_UNDEF)).is_err());
     }
 

@@ -249,6 +249,34 @@ INSERT INTO `my-db`.`P\u00e9` VALUES (1);
     h.assert_err("a dropped key column renamed over is refused",
                  "ALTER TABLE sw DROP COLUMN pid, CHANGE qid pid INT",
                  r"used by a FOREIGN KEY")
+    # Nor does a key naming its own table move to the column renamed into
+    # its parent column's place (1829 in InnoDB)
+    h.exec_script(f"""
+CREATE TABLE sv (id INT NOT NULL PRIMARY KEY, u INT, x INT, pid INT,
+  UNIQUE KEY (u), UNIQUE KEY (x), FOREIGN KEY (pid) REFERENCES sv (u))
+  ENGINE={h.engine};
+INSERT INTO sv VALUES (1, 10, 20, NULL), (2, 20, 10, 10);
+""")
+    h.assert_err("a dropped own parent column renamed over is refused",
+                 "ALTER TABLE sv DROP COLUMN u, CHANGE COLUMN x u INT",
+                 r"used by a FOREIGN KEY")
+    h.assert_err("the key still names the parent column",
+                 "INSERT INTO sv VALUES (3, 30, 40, 40)",
+                 r"foreign key constraint fails")
+    # SET NULL on a NOT NULL column is refused, for a key naming its own
+    # table too, and when a later ALTER makes the column NOT NULL (1005 /
+    # 1830 in InnoDB)
+    h.assert_err("own key ON UPDATE SET NULL on NOT NULL refused",
+                 "CREATE TABLE sx1 (id INT NOT NULL PRIMARY KEY, pid INT NOT "
+                 "NULL, FOREIGN KEY (pid) REFERENCES sx1 (id) ON UPDATE SET "
+                 f"NULL) ENGINE={h.engine}",
+                 r"SET NULL but is NOT NULL")
+    h.exec_stmt("CREATE TABLE sx2 (id INT NOT NULL PRIMARY KEY, pid INT, "
+                "FOREIGN KEY (pid) REFERENCES sx2 (id) ON UPDATE SET NULL) "
+                f"ENGINE={h.engine}")
+    h.assert_err("making its column NOT NULL is refused",
+                 "ALTER TABLE sx2 MODIFY pid INT NOT NULL",
+                 r"SET NULL but is NOT NULL")
     # A TEMPORARY table keeps its own keys, not those of the permanent
     # table its name shadows
     h.assert_ok("ALTER of a TEMPORARY table shadowing a child",

@@ -180,6 +180,7 @@ pub unsafe extern "C" fn stoolap_create_table(
             ddl::kept_foreign_keys(
                 session,
                 text(keep_from, "altered table")?,
+                text(table, "table name")?,
                 &renames,
                 &dropped,
             )?
@@ -187,9 +188,16 @@ pub unsafe extern "C" fn stoolap_create_table(
         let new_fks = slice(foreign_keys, nforeign_keys)?
             .iter()
             .map(|f| {
+                // A key an ALTER adds naming the altered table names its copy
+                let mut parent = text(f.parent, "foreign key parent")?;
+                if !keep_from.is_null()
+                    && parent.to_lowercase() == text(keep_from, "altered table")?.to_lowercase()
+                {
+                    parent = text(table, "table name")?;
+                }
                 Ok(ForeignKey {
                     column: text(f.column, "foreign key column")?.to_string(),
-                    parent: text(f.parent, "foreign key parent")?.to_string(),
+                    parent: parent.to_string(),
                     parent_column: if f.parent_column.is_null() {
                         None
                     } else {

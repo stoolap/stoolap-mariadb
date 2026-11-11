@@ -192,6 +192,8 @@ fn class_of_text(m: &str) -> (i32, i32) {
         "type error",
         "invalid argument",
         "value for column ",
+        // A key's SET NULL on a NOT NULL column
+        "foreign key column '",
         "IO error",
         "query cancelled",
         "transaction already",
@@ -257,6 +259,10 @@ mod tests {
             STOOLAP_ERR_DEADLOCK
         );
         assert_eq!(c("column 'x' not found").0, STOOLAP_ERR_GENERIC);
+        assert_eq!(
+            c("foreign key column 'pid' has ON UPDATE SET NULL but is NOT NULL").0,
+            STOOLAP_ERR_GENERIC
+        );
         assert_eq!(c("table 'x' not found").0, STOOLAP_ERR_NO_SUCH_TABLE);
         assert_eq!(
             c("invalid argument: row-pump UPDATE/DELETE ... is unsupported.").0,

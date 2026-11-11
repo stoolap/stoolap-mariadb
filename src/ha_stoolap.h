@@ -241,6 +241,11 @@ private:
     // (bulk_owns_tx_), which a failure rolls back.
     bool bulk_fk_ = false;
     bool bulk_owns_tx_ = false;
+    // The rows are a copying ALTER's, into its copy of the table: they go
+    // in unchecked against the foreign keys, in whatever order, and the
+    // copy is checked whole at end_bulk_insert (as InnoDB checks the copy
+    // against the table it copies, whose rows are all there).
+    bool alter_copy_ = false;
 
     // Writes read the record by these: every field (inserts), the fields
     // write_set names (updates, rebuilt when it changes), and the PRIMARY
