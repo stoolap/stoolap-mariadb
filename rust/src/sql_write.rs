@@ -13,7 +13,7 @@
 //! not at all.
 
 use stoolap::api::ParamVec;
-use stoolap::core::{DataType, Error, ForeignKeyConstraint, Result, Row, Value};
+use stoolap::core::{Error, Result, Row, Value};
 
 use crate::session::Session;
 use crate::write;
@@ -108,41 +108,12 @@ pub fn update(
 /// key column to itself, which has the executor check every row's values
 /// against their parents and hold each parent key until the transaction
 /// ends, so a concurrent delete of one conflicts instead of leaving a row
-/// without it. A column a key of the table itself names stays out of the
-/// UPDATE, whose RESTRICT check would refuse the unchanged value its rows
-/// name; its own key is checked by a query, holding nothing
+/// without it. A column the table's own key names keeps its value, which
+/// asks that key nothing (stoolap#981)
 pub fn check_foreign_keys(session: &Session, table: &str) -> Result<()> {
     let schema = session.with_any_write_table(table, |t| Ok(t.schema().clone()))?;
-    let own =
-        |fk: &ForeignKeyConstraint| fk.referenced_table.to_lowercase() == table.to_lowercase();
-    let named = |column: &str| {
-        schema.foreign_keys.iter().any(|k| {
-            own(k)
-                && schema.get_column_index(&k.referenced_column) == schema.get_column_index(column)
-        })
-    };
     let mut columns: Vec<String> = Vec::new();
     for fk in &schema.foreign_keys {
-        if named(&fk.column_name) {
-            let sql = format!(
-                "SELECT c.{col} FROM {table} c WHERE c.{col} IS NOT NULL AND NOT EXISTS \
-                 (SELECT 1 FROM {parent} p WHERE p.{pcol} = c.{col}) LIMIT 1",
-                col = quote(&fk.column_name),
-                table = quote(table),
-                parent = quote(&fk.referenced_table),
-                pcol = quote(&fk.referenced_column),
-            );
-            let mut rows = session.run(&sql, ParamVec::new())?;
-            if rows.next() {
-                let value = rows
-                    .row()
-                    .get(0)
-                    .cloned()
-                    .unwrap_or(Value::Null(DataType::Null));
-                return Err(missing_parent(table, fk, &value));
-            }
-            continue;
-        }
         let column = quote(&fk.column_name);
         if !columns.contains(&column) {
             columns.push(column);
@@ -167,19 +138,6 @@ pub fn check_foreign_keys(session: &Session, table: &str) -> Result<()> {
     );
     session.run_write(&sql, ParamVec::new())?;
     Ok(())
-}
-
-fn missing_parent(table: &str, fk: &ForeignKeyConstraint, value: &Value) -> Error {
-    Error::foreign_key_violation(
-        table,
-        &fk.column_name,
-        &fk.referenced_table,
-        &fk.referenced_column,
-        format!(
-            "referenced row with {} = {} does not exist",
-            fk.referenced_column, value
-        ),
-    )
 }
 
 /// Deletes the row `key` names
