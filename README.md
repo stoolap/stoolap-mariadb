@@ -214,7 +214,7 @@ Tables created by an older build of the plugin must be re-created.
 | `PRIMARY KEY` / `UNIQUE` over a column prefix (`a(3)`) | Refused (Stoolap enforces whole values) |
 | `FOREIGN KEY` | Yes: single-column, to a PRIMARY KEY or UNIQUE column, of another table or its own; RESTRICT, NO ACTION, CASCADE, SET NULL |
 | Composite `FOREIGN KEY` | Refused |
-| FOREIGN KEYs through a copying `ALTER TABLE` | Kept, following renamed columns; the copy is checked whole once its rows are in (1452), so the order they are copied in does not matter; dropping a key column is refused |
+| FOREIGN KEYs through a copying `ALTER TABLE` | A table's own keys are kept, following renamed columns (a table other tables' keys name is refused, see [Known differences](#known-differences)); the copy is checked whole once its rows are in (1452), so the order they are copied in does not matter; dropping a key column is refused |
 | `DROP TABLE` of a referenced parent | Refused with 1451, as InnoDB does (not with `foreign_key_checks = 0`); `DROP DATABASE` drops its own children first |
 | `RENAME TABLE` | Yes (children's FOREIGN KEYs follow the parent) |
 | `ALTER TABLE` ADD / DROP / CHANGE COLUMN, ADD / DROP INDEX | Yes (copying ALTER) |
@@ -289,6 +289,10 @@ the list stays current.
 - **`utf8mb4_bin` UNIQUE** ignores PAD SPACE (`'a'` and `'a '` are both
   accepted).
 - **A FOREIGN KEY to an indexed non-unique column** is refused.
+- **A copying `ALTER TABLE` of a table another table's FOREIGN KEY names**
+  is refused (1296): MariaDB swaps the copy in by renames, and a rename
+  takes the keys to the old table
+  ([stoolap#987](https://github.com/stoolap/stoolap/issues/987)).
 - **A row whose FOREIGN KEY names that row itself** is deleted, or its
   key moved together with the value naming it, as that leaves no row
   naming a missing one; InnoDB refuses both (1451), also under RESTRICT.

@@ -116,18 +116,24 @@ CREATE TABLE nn (
     h.assert_ok("CREATE a child of the long parent",
                 f"CREATE TABLE `{u}`.c (id INT PRIMARY KEY, pid INT, "
                 f"FOREIGN KEY (pid) REFERENCES `{u}` (id)) ENGINE={h.engine}")
-    # stoolap matches table names lowercased: a parent named in other
-    # letter case, one name shortened, is still found
+    # A parent named in other letter case, one name shortened, is found as
+    # MariaDB finds it: by its name in lower case (stoolap's way too) under
+    # lower_case_table_names 1 or 2; under 0 it is no table, as for InnoDB
     pa = "_" * 63 + "a"
     h.exec_script(f"CREATE TABLE `{u}`.`{pa}` (id INT PRIMARY KEY) "
                   f"ENGINE={h.engine}")
-    h.assert_ok("CREATE a child naming the long parent in upper case",
-                f"CREATE TABLE `{u}`.c2 (id INT PRIMARY KEY, pid INT, "
-                f"FOREIGN KEY (pid) REFERENCES `{pa.upper()}` (id)) "
-                f"ENGINE={h.engine}")
+    child = (f"CREATE TABLE `{u}`.c2 (id INT PRIMARY KEY, pid INT, "
+             f"FOREIGN KEY (pid) REFERENCES `{pa.upper()}` (id)) "
+             f"ENGINE={h.engine}")
     h.exec_stmt(f"INSERT INTO `{u}`.`{pa}` VALUES (1)")
-    h.assert_ok("child row of the parent named in upper case",
-                f"INSERT INTO `{u}`.c2 VALUES (1, 1)")
+    if h.sql("SELECT @@lower_case_table_names").strip() == "0":
+        h.assert_err("a child naming the long parent in upper case is refused",
+                     child, r"non-existent table")
+    else:
+        h.assert_ok("CREATE a child naming the long parent in upper case",
+                    child)
+        h.assert_ok("child row of the parent named in upper case",
+                    f"INSERT INTO `{u}`.c2 VALUES (1, 1)")
     h.exec_stmt(f"INSERT INTO `{u}`.`{u}` VALUES (1, 100)")
     h.exec_stmt(f"INSERT INTO `{u}`.`{u[1:]}` VALUES (1, 200)")
     h.assert_ok("child row of an existing parent",

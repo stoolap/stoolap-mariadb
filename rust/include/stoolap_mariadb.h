@@ -719,8 +719,13 @@ size_t stoolap_fit_table_name(const char* name, size_t len, char* out);
 int32_t stoolap_drop_table(StoolapDB* db, const char* table, int32_t check_fks,
                            const char* const* dropping, int32_t ndropping);
 
-/** Rename table `from` to `to`. */
-int32_t stoolap_rename_table(StoolapDB* db, const char* from, const char* to);
+/**
+ * Rename table `from` to `to`. `swap` when a copying ALTER renames its table
+ * away to swap a copy in: refused when another table's FOREIGN KEY names it,
+ * since the rename would take the key to the old table (stoolap#987).
+ */
+int32_t stoolap_rename_table(StoolapDB* db, const char* from, const char* to,
+                             int32_t swap);
 
 /* =========================================================================
  * Error classes

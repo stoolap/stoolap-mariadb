@@ -576,7 +576,8 @@ bool refuse_unsupported_columns(TABLE* form) {
 // handler error. A secondary index that fails is a warning: queries on
 // its key full-scan.
 int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
-                         bool if_not_exists, bool with_fks, const char* what) {
+                         bool if_not_exists, bool with_fks, bool temporary,
+                         const char* what) {
     std::vector<StoolapColumnDef> columns;
     columns.reserve(form->s->fields);
     std::vector<std::string> names;
@@ -621,6 +622,27 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
                             "enforces single-column foreign keys only.",
                             MYF(0));
             return HA_ERR_UNSUPPORTED;
+        }
+        // A parent's copying ALTER, whose swap would take the key to the
+        // old table, waits for this statement or this one for it
+        std::string missing;
+        bool other_engine = false;
+        if (!fks.empty() &&
+            !stoolap_thd_lock_fk_parents(
+                current_thd, form->s->db.str, form->s->db.length,
+                form->s->table_name.str, form->s->table_name.length, temporary,
+                stoolap_hton, &missing, &other_engine)) {
+            if (other_engine)
+                my_printf_error(ER_GET_ERRMSG,
+                                "stoolap: FOREIGN KEY references '%s', a "
+                                "table of another engine",
+                                MYF(0), missing.c_str());
+            else if (!missing.empty())
+                my_printf_error(ER_GET_ERRMSG,
+                                "stoolap: FOREIGN KEY references non-existent "
+                                "table '%s'",
+                                MYF(0), missing.c_str());
+            return HA_ERR_GENERIC;
         }
         for (const auto& fk : fks)
             parents.push_back(stoolap_table_from_path(fk.parent_path.c_str()));
@@ -823,10 +845,10 @@ int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
         // without them, leaving "index-served" queries on a full scan.
         // Not the statement's FOREIGN KEYs: they belong to the table it
         // creates, if any, and MariaDB keeps none for this one.
-        if (int err =
-                create_stoolap_table(d, stoolap_table_, table,
-                                     /*if_not_exists=*/true,
-                                     /*with_fks=*/false, "schema reconcile"))
+        if (int err = create_stoolap_table(
+                d, stoolap_table_, table,
+                /*if_not_exists=*/true,
+                /*with_fks=*/false, /*temporary=*/false, "schema reconcile"))
             return err;
         g_engine.mark_reconciled(stoolap_table_);
     }
@@ -859,15 +881,15 @@ StoolapDB* ha_stoolap::ddl_db() {
     return d;
 }
 
-int ha_stoolap::create(const char* name, TABLE* form,
-                       HA_CREATE_INFO* /*info*/) {
+int ha_stoolap::create(const char* name, TABLE* form, HA_CREATE_INFO* info) {
     const std::string tbl = stoolap_table_from_path(name);
     if (refuse_unenforceable_keys(form) || refuse_unsupported_columns(form))
         return HA_ERR_UNSUPPORTED;
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
     if (int err = create_stoolap_table(db, tbl, form, /*if_not_exists=*/false,
-                                       /*with_fks=*/true, "CREATE TABLE"))
+                                       /*with_fks=*/true, info->tmp_table(),
+                                       "CREATE TABLE"))
         return err;
     g_engine.mark_reconciled(tbl);
     return 0;
@@ -919,12 +941,25 @@ int ha_stoolap::delete_table(const char* name) {
     return 0;
 }
 
+bool ha_stoolap::can_switch_engines() {
+    StoolapDB* db = get_thd_ctx(ha_thd())->db();
+    return !db || stoolap_writes_through_sql(db, stoolap_table_.c_str()) == 0;
+}
+
 int ha_stoolap::rename_table(const char* from, const char* to) {
     const std::string flat_from = stoolap_table_from_path(from);
     const std::string flat_to = stoolap_table_from_path(to);
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
-    if (stoolap_rename_table(db, flat_from.c_str(), flat_to.c_str()) !=
+    // A copying ALTER, into this engine or another, renames the table to a
+    // temporary name (#sql-backup-...) before the copy takes its place
+    const int command = thd_sql_command(ha_thd());
+    const std::string_view to_name(to);
+    const bool swap =
+        (command == SQLCOM_ALTER_TABLE || command == SQLCOM_CREATE_INDEX ||
+         command == SQLCOM_DROP_INDEX) &&
+        to_name.substr(to_name.rfind('/') + 1).rfind("#sql", 0) == 0;
+    if (stoolap_rename_table(db, flat_from.c_str(), flat_to.c_str(), swap) !=
         STOOLAP_OK) {
         auto verr = fetch_db_error(db);
         sql_print_error("stoolap: RENAME TABLE failed: %s", verr.message);

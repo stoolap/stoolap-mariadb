@@ -161,7 +161,78 @@ INSERT INTO fk_chain.d VALUES (1, 1);
 """, use_db=False)
     h.assert_err("a referenced parent alone is still refused",
                  "DROP TABLE fk_chain.b", "1451")
+    # A copying ALTER of a table other tables' keys name is refused: the
+    # copy is swapped in by renames, which take those keys to the old table
+    # (stoolap#987). The keys keep naming the table, and the database drops
+    h.assert_err("a copying ALTER of a referenced table is refused",
+                 "ALTER TABLE fk_chain.b ADD COLUMN w INT, ALGORITHM=COPY",
+                 r"FOREIGN KEY of .* names it")
+    h.assert_ok("a row of the table takes a new child",
+                "INSERT INTO fk_chain.b VALUES (2, 1)")
+    h.assert_ok("which names it", "INSERT INTO fk_chain.c VALUES (2, 2, 1)")
+    h.assert_err("the key still checks the table",
+                 "INSERT INTO fk_chain.c VALUES (3, 9, 1)", "1452")
     h.assert_ok("the database drops", "DROP DATABASE fk_chain")
+    # A key's CREATE locks its parent against a copying ALTER of it, which
+    # would leave the key with the old table: it waits for a statement that
+    # holds the parent, as an ALTER does, here a write in an open transaction
+    h.exec_stmt(f"CREATE TABLE lp (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine}")
+    w = mysql.connector.connect(user="root", unix_socket=h.socket,
+                                database=h.db, autocommit=False)
+    try:
+        w.cursor().execute("INSERT INTO lp VALUES (1)")
+        h.exec_stmt("SET SESSION lock_wait_timeout = 1")
+        h.assert_err("a key's CREATE waits for a statement holding its parent",
+                     "CREATE TABLE lc (id INT NOT NULL PRIMARY KEY, pid INT, "
+                     f"FOREIGN KEY (pid) REFERENCES lp (id)) ENGINE={h.engine}",
+                     "1205")
+        # Reading the parent too, which takes a weaker lock on it
+        h.assert_err("so does a CREATE ... SELECT reading its parent",
+                     "CREATE TABLE ls (id INT NOT NULL PRIMARY KEY, pid INT, "
+                     f"FOREIGN KEY (pid) REFERENCES lp (id)) ENGINE={h.engine} "
+                     "AS SELECT id, id AS pid FROM lp WHERE 0",
+                     "1205")
+        # A TEMPORARY table of the parent's name is no self-reference:
+        # its key names the permanent table
+        h.assert_err("so does a TEMPORARY table of the parent's name",
+                     "CREATE TEMPORARY TABLE lp (pid INT, FOREIGN KEY (pid) "
+                     f"REFERENCES lp (id)) ENGINE={h.engine}", "1205")
+    finally:
+        h.exec_stmt("SET SESSION lock_wait_timeout = DEFAULT")
+        w.rollback()
+        w.close()
+    h.assert_ok("and goes ahead once it ends",
+                "CREATE TABLE lc (id INT NOT NULL PRIMARY KEY, pid INT, "
+                f"FOREIGN KEY (pid) REFERENCES lp (id)) ENGINE={h.engine}")
+    # The parent is the table MariaDB finds by that name: by its letter case
+    # under lower_case_table_names = 0, where InnoDB refuses the key too
+    if h.sql("SELECT @@lower_case_table_names").strip() == "0":
+        h.assert_err("a parent named in other letter case is no parent",
+                     "CREATE TABLE lu (id INT NOT NULL PRIMARY KEY, pid INT, "
+                     f"FOREIGN KEY (pid) REFERENCES LP (id)) ENGINE={h.engine}",
+                     r"non-existent table")
+        # MariaDB locks LP ahead of a copying ALTER ... ADD FOREIGN KEY;
+        # the key is still checked against it
+        h.assert_err("so is one an ALTER adds",
+                     "ALTER TABLE lc ADD FOREIGN KEY (pid) REFERENCES LP (id), "
+                     "ALGORITHM=COPY", r"non-existent table")
+        # An InnoDB LP beside the stoolap lp: the key would bind to lp
+        # while the lock holds LP
+        h.exec_stmt("CREATE TABLE LP (id INT NOT NULL PRIMARY KEY) "
+                    "ENGINE=InnoDB")
+        h.assert_err("a parent of another engine, lp beside it, is no parent",
+                     "CREATE TABLE lu (id INT NOT NULL PRIMARY KEY, pid INT, "
+                     f"FOREIGN KEY (pid) REFERENCES LP (id)) ENGINE={h.engine}",
+                     r"another engine")
+        h.assert_err("nor for an ALTER",
+                     "ALTER TABLE lc ADD FOREIGN KEY (pid) REFERENCES LP (id), "
+                     "ALGORITHM=COPY", r"another engine")
+        h.exec_stmt("DROP TABLE LP")
+    h.exec_stmt("CREATE TABLE li (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB")
+    h.assert_err("a parent of another engine is refused",
+                 "CREATE TABLE lu (id INT NOT NULL PRIMARY KEY, pid INT, "
+                 f"FOREIGN KEY (pid) REFERENCES li (id)) ENGINE={h.engine}",
+                 r"another engine")
     h.assert_scalar("and is gone", "SELECT COUNT(*) FROM information_schema.schemata "
                     "WHERE schema_name = 'fk_chain'", "0")
 

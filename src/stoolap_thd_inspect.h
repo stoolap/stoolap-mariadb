@@ -15,6 +15,7 @@
 #include <vector>
 
 class THD;
+struct handlerton;
 
 // A single-column FOREIGN KEY as MariaDB's parser read it; the parent by
 // its file path, "db/table" as tablename_to_filename encodes them.
@@ -42,6 +43,22 @@ bool stoolap_thd_altered_table(
 bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
                               size_t child_db_length,
                               std::vector<StoolapThdForeignKey>* out);
+
+// Locks each parent of the statement's FOREIGN KEYs against a copying
+// ALTER of it until the statement ends (MDL_SHARED_NO_WRITE, which the
+// ALTER's MDL_SHARED_UPGRADABLE excludes): the key then names the table
+// the ALTER leaves, or the ALTER, waiting for it, finds the key and is
+// refused. A self-reference is skipped (a TEMPORARY table has none: its
+// key names the permanent table of its name); a parent locked as strongly
+// already is not locked again. False when a wait fails, with the error
+// raised, or when a parent is no table of engine `hton` by that name,
+// named in `missing` ("db.table"), with `other_engine` set when it is a
+// table of another engine.
+bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
+                                 size_t child_db_length, const char* child_name,
+                                 size_t child_name_length, bool temporary,
+                                 handlerton* hton, std::string* missing,
+                                 bool* other_engine);
 
 // sql_class.h-dependent helpers: live in stoolap_thd_inspect.cc to keep
 // the heavy sql_class/wsrep include chain out of most TUs.

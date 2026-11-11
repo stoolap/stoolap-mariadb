@@ -84,6 +84,70 @@ bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
     return true;
 }
 
+bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
+                                 size_t child_db_length, const char* child_name,
+                                 size_t child_name_length, bool temporary,
+                                 handlerton* hton, std::string* missing,
+                                 bool* other_engine) {
+    if (!thd || !thd->lex) return true;
+    // The table the statement creates, or the one an ALTER copies (the
+    // table created is its copy), as MariaDB names it. A CREATE ... SELECT
+    // has its table out of query_tables while it runs
+    std::string self_db(child_db, child_db_length);
+    std::string self_name(child_name, child_name_length);
+    const TABLE_LIST* altered = thd->lex->query_tables;
+    if (thd->lex->sql_command != SQLCOM_CREATE_TABLE && altered) {
+        self_db.assign(altered->db.str, altered->db.length);
+        self_name.assign(altered->table_name.str, altered->table_name.length);
+    }
+    table_case_convert(self_db.data(), static_cast<uint>(self_db.size()));
+    table_case_convert(self_name.data(), static_cast<uint>(self_name.size()));
+    List_iterator_fast<Key> it(thd->lex->alter_info.key_list);
+    while (Key* k = it++) {
+        if (k->type != Key::FOREIGN_KEY) continue;
+        const auto* fk = static_cast<Foreign_key*>(k);
+        // As MariaDB names a table in its locks
+        std::string db = fk->ref_db.length
+                             ? std::string(fk->ref_db.str, fk->ref_db.length)
+                             : std::string(child_db, child_db_length);
+        std::string name(fk->ref_table.str, fk->ref_table.length);
+        table_case_convert(db.data(), static_cast<uint>(db.size()));
+        table_case_convert(name.data(), static_cast<uint>(name.size()));
+        // A self-reference: the statement holds its own table already. A
+        // TEMPORARY table, stoolap's by its file in the tmpdir, has none:
+        // its key names the permanent table of that name
+        if (!temporary && db == self_db && name == self_name) continue;
+        // A lock as strong held already (MariaDB takes one on each parent
+        // of an ALTER ... ADD FOREIGN KEY) is not taken again; the parent
+        // is still checked below
+        if (!thd->mdl_context.is_lock_owner(MDL_key::TABLE, db.c_str(),
+                                            name.c_str(),
+                                            MDL_SHARED_NO_WRITE)) {
+            MDL_request request;
+            MDL_REQUEST_INIT(&request, MDL_key::TABLE, db.c_str(), name.c_str(),
+                             MDL_SHARED_NO_WRITE, MDL_TRANSACTION);
+            if (thd->mdl_context.acquire_lock(&request,
+                                              thd->variables.lock_wait_timeout))
+                return false;
+        }
+        // The locked table must be the one the key binds to. MariaDB finds
+        // it by its letter case under lower_case_table_names = 0, stoolap
+        // by its name in lower case; as stoolap keeps one table per name in
+        // lower case, a stoolap table found by MariaDB's name is that one
+        const LEX_CSTRING db_name{db.c_str(), db.size()};
+        const LEX_CSTRING table_name{name.c_str(), name.size()};
+        handlerton* found = nullptr;
+        if (!ha_table_exists(thd, &db_name, &table_name, nullptr, nullptr,
+                             &found) ||
+            found != hton) {
+            *missing = db + "." + name;
+            *other_engine = found != nullptr;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool stoolap_thd_altered_table(
     THD* thd, std::string* path,
     std::vector<std::pair<std::string, std::string>>* renames,

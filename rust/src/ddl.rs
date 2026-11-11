@@ -12,11 +12,35 @@
 //! for an engine that does not claim them, so the plugin hands over the
 //! ones its parser read, their parent tables under stoolap's names.
 
+use std::sync::{Mutex, MutexGuard};
+
 use stoolap::api::{Database, ParamVec};
 use stoolap::core::schema::ROWID_NAME;
 use stoolap::core::{Error, Result};
 
 use crate::session::Session;
+
+/// Held by the DDL that creates a key naming a table, and by the rename a
+/// copying ALTER swaps its table away with, around that rename's check:
+/// no key comes to name the table between the check and the rename
+static KEY_DDL: Mutex<()> = Mutex::new(());
+
+fn key_ddl() -> MutexGuard<'static, ()> {
+    KEY_DDL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Refuses a copying ALTER of `table` when another table's key names it:
+/// MariaDB swaps the copy in by renames, and a rename takes those keys to
+/// the old table, which they would go on naming (stoolap#987)
+fn refuse_referenced(session: &Session, table: &str) -> Result<()> {
+    match session.referencing_tables(table).first() {
+        Some((child, _, _)) => Err(Error::NotSupported(format!(
+            "this ALTER TABLE copies the table, and a FOREIGN KEY of '{child}' names it: \
+             the key would stay with the old table (stoolap#987)"
+        ))),
+        None => Ok(()),
+    }
+}
 
 pub const STOOLAP_COL_INTEGER: i32 = 1;
 pub const STOOLAP_COL_FLOAT: i32 = 2;
@@ -191,7 +215,10 @@ pub fn create_table(
         foreign_key(fk, &mut sql)?;
     }
     sql.push(')');
-    session.run(&sql, ParamVec::new())?;
+    {
+        let _held = (!foreign_keys.is_empty()).then(key_ddl);
+        session.run(&sql, ParamVec::new())?;
+    }
 
     // One stoolap index per non-unique key, over all of its parts
     // (stoolap serves leading-part equality and ranges from a composite
@@ -263,7 +290,13 @@ fn drop_tree(
 }
 
 /// Renames `from` to `to`
-pub fn rename_table(session: &Session, from: &str, to: &str) -> Result<()> {
+/// Renames `from` to `to`. A copying ALTER's `swap` of its table away
+/// (from any engine's copy) is refused when another table's key names it
+pub fn rename_table(session: &Session, from: &str, to: &str, swap: bool) -> Result<()> {
+    let _held = swap.then(key_ddl);
+    if swap {
+        refuse_referenced(session, from)?;
+    }
     session.run(
         &format!("ALTER TABLE {} RENAME TO {}", quote(from), quote(to)),
         ParamVec::new(),
@@ -297,6 +330,8 @@ pub const STOOLAP_FK_SET_DEFAULT: i32 = 5;
 /// (`dropped`) under a key is refused, whatever column takes its name. A
 /// key naming `from` itself names `to`, the copy, by the column's new name.
 /// None when `from` is not a stoolap table (ALTER ... ENGINE=STOOLAP).
+/// Refused when another table's key names `from` (`refuse_referenced`),
+/// before the rows are copied; the swap's rename asks again
 pub fn kept_foreign_keys(
     session: &Session,
     from: &str,
@@ -308,6 +343,7 @@ pub fn kept_foreign_keys(
     // Column names compare as MariaDB and stoolap compare them, by case
     // past ASCII too
     let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    refuse_referenced(session, from)?;
     let fks = match session.with_table(from, |t| Ok(t.schema().foreign_keys.clone())) {
         Ok(fks) => fks,
         Err(Error::TableNotFound(_)) => return Ok(Vec::new()),
