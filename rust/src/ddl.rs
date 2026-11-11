@@ -16,7 +16,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use stoolap::api::{Database, ParamVec};
 use stoolap::core::schema::ROWID_NAME;
-use stoolap::core::{Error, Result};
+use stoolap::core::{Error, Result, Value};
 
 use crate::session::Session;
 
@@ -228,17 +228,137 @@ pub fn create_table(
         .iter()
         .filter(|k| k.kind == STOOLAP_KEYDEF_INDEX && !k.columns.is_empty())
     {
-        let index_sql = format!(
-            "CREATE INDEX IF NOT EXISTS {} ON {} {}",
-            quote(&format!("{}__{}", table, k.name)),
-            quote(table),
-            key_columns(k)?
-        );
-        if let Err(e) = session.run(&index_sql, ParamVec::new()) {
+        let names = k
+            .columns
+            .iter()
+            .map(|&i| column_name(i))
+            .collect::<Result<Vec<_>>>()?;
+        if let Err(e) = create_index(session, table, &k.name, &names) {
             failed.push(format!("{}: {}", k.name, e));
         }
     }
     Ok(failed)
+}
+
+/// The stoolap index of `table`'s non-unique key `key`
+fn index_name(table: &str, key: &str) -> String {
+    quote(&format!("{table}__{key}"))
+}
+
+/// Creates the index of `table`'s non-unique key `key` over `columns`
+pub fn create_index(session: &Session, table: &str, key: &str, columns: &[&str]) -> Result<()> {
+    let columns: Vec<String> = columns.iter().map(|c| quote(c)).collect();
+    session.run(
+        &format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+            index_name(table, key),
+            quote(table),
+            columns.join(", ")
+        ),
+        ParamVec::new(),
+    )?;
+    Ok(())
+}
+
+/// Drops the index of `table`'s non-unique key `key`, if it is there (a
+/// dropped column takes its indexes with it)
+pub fn drop_index(session: &Session, table: &str, key: &str) -> Result<()> {
+    session.run(
+        &format!(
+            "DROP INDEX IF EXISTS {} ON {}",
+            index_name(table, key),
+            quote(table)
+        ),
+        ParamVec::new(),
+    )?;
+    Ok(())
+}
+
+/// `value` as an SQL literal, None when stoolap would not read it back as
+/// it is: text holding a NUL, which ends a literal
+fn literal(value: &Value) -> Option<String> {
+    match value {
+        Value::Null(_) => Some("NULL".into()),
+        Value::Integer(i) => Some(i.to_string()),
+        Value::Float(f) if f.is_finite() => Some(format!("{f:?}")),
+        Value::Text(t) if !t.as_str().contains('\0') => Some(format!(
+            "'{}'",
+            t.as_str().replace('\\', "\\\\").replace('\'', "''")
+        )),
+        _ => None,
+    }
+}
+
+/// Adds column `name` at the end of `table`, its rows holding `default`
+/// (the column's value for a row MariaDB wrote before it). In place: the
+/// rows are not copied
+pub fn add_column(
+    session: &Session,
+    table: &str,
+    name: &str,
+    kind: i32,
+    nullable: bool,
+    default: &Value,
+) -> Result<()> {
+    let ty = match kind {
+        STOOLAP_COL_INTEGER => "INTEGER",
+        STOOLAP_COL_FLOAT => "FLOAT",
+        STOOLAP_COL_TEXT => "TEXT",
+        _ => return Err(Error::internal("unknown column type")),
+    };
+    let default = literal(default)
+        .ok_or_else(|| Error::NotSupported(format!("the default of column '{name}'")))?;
+    session.run(
+        &format!(
+            "ALTER TABLE {} ADD COLUMN {} {ty}{} DEFAULT {default}",
+            quote(table),
+            quote(name),
+            if nullable { "" } else { " NOT NULL" }
+        ),
+        ParamVec::new(),
+    )?;
+    Ok(())
+}
+
+/// Drops column `name` of `table`. One a FOREIGN KEY of the table uses is
+/// refused, as InnoDB refuses it (stoolap would drop the key with it); one
+/// another table's key references, by stoolap
+pub fn drop_column(session: &Session, table: &str, name: &str) -> Result<()> {
+    let lower = name.to_lowercase();
+    let used = session.with_table(table, |t| {
+        Ok(t.schema()
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.column_name.to_lowercase() == lower))
+    })?;
+    if used {
+        return Err(Error::NotSupported(format!(
+            "column '{name}' is used by a FOREIGN KEY: it cannot be dropped"
+        )));
+    }
+    session.run(
+        &format!("ALTER TABLE {} DROP COLUMN {}", quote(table), quote(name)),
+        ParamVec::new(),
+    )?;
+    Ok(())
+}
+
+/// Renames column `from` of `table` to `to`; its indexes and keys follow.
+/// Names in other letter case alone name the column already
+pub fn rename_column(session: &Session, table: &str, from: &str, to: &str) -> Result<()> {
+    if from.to_lowercase() == to.to_lowercase() {
+        return Ok(());
+    }
+    session.run(
+        &format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            quote(table),
+            quote(from),
+            quote(to)
+        ),
+        ParamVec::new(),
+    )?;
+    Ok(())
 }
 
 /// Drops `table` if it is there. A parent other tables' foreign keys name
@@ -451,6 +571,21 @@ mod tests {
             ", FOREIGN KEY (\"p\"\"id\") REFERENCES \"d_1c\" (\"id\")"
         );
         assert!(sql(fk("d_1p", Some("id"), 9, STOOLAP_FK_UNDEF)).is_err());
+    }
+
+    #[test]
+    fn literals() {
+        assert_eq!(
+            literal(&Value::Integer(i64::MIN)).unwrap(),
+            "-9223372036854775808"
+        );
+        assert_eq!(literal(&Value::Float(1e-7)).unwrap(), "1e-7");
+        assert_eq!(
+            literal(&Value::text("it's \\ ok")).unwrap(),
+            "'it''s \\\\ ok'"
+        );
+        assert_eq!(literal(&Value::null_unknown()).unwrap(), "NULL");
+        assert!(literal(&Value::text("a\0b")).is_none());
     }
 
     #[test]

@@ -727,6 +727,30 @@ int32_t stoolap_drop_table(StoolapDB* db, const char* table, int32_t check_fks,
 int32_t stoolap_rename_table(StoolapDB* db, const char* from, const char* to,
                              int32_t swap);
 
+/** stoolap_alter_column() changes */
+#define STOOLAP_ALTER_ADD_COLUMN    1
+#define STOOLAP_ALTER_DROP_COLUMN   2
+#define STOOLAP_ALTER_RENAME_COLUMN 3
+
+/**
+ * Change a column of `table` in place, as `op` says: add `name` at the end
+ * (`kind` STOOLAP_COL_*, `nullable`), the rows there holding `default`;
+ * drop it (refused when a FOREIGN KEY of the table uses it); or rename it
+ * to `new_name` (a name in other letter case alone changes nothing).
+ */
+int32_t stoolap_alter_column(StoolapDB* db, const char* table, int32_t op,
+                             const char* name, const char* new_name,
+                             int32_t kind, int32_t nullable,
+                             const StoolapValue* default_value);
+
+/**
+ * Create (`create`) the index of `table`'s non-unique key `key` over
+ * `columns`, or drop it if it is there.
+ */
+int32_t stoolap_alter_index(StoolapDB* db, const char* table, const char* key,
+                            int32_t create, const char* const* columns,
+                            int32_t ncolumns);
+
 /* =========================================================================
  * Error classes
  * ========================================================================= */

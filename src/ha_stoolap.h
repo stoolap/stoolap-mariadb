@@ -46,6 +46,13 @@ public:
     // other engine's copy would leave the keys with the old table
     bool can_switch_engines() override;
 
+    // In place: one column added at the end, dropped or renamed, and
+    // non-unique indexes added and dropped (see plan_inplace)
+    enum_alter_inplace_result check_if_supported_inplace_alter(
+        TABLE* altered_table, Alter_inplace_info* ha_alter_info) override;
+    bool inplace_alter_table(TABLE* altered_table,
+                             Alter_inplace_info* ha_alter_info) override;
+
     int write_row(const uchar* buf) override;
     int update_row(const uchar* old_data, const uchar* new_data) override;
     int delete_row(const uchar* buf) override;

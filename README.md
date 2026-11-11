@@ -217,7 +217,8 @@ Tables created by an older build of the plugin must be re-created.
 | FOREIGN KEYs through a copying `ALTER TABLE` | A table's own keys are kept, following renamed columns (a table other tables' keys name is refused, see [Known differences](#known-differences)); the copy is checked whole once its rows are in (1452), so the order they are copied in does not matter; dropping a key column is refused |
 | `DROP TABLE` of a referenced parent | Refused with 1451, as InnoDB does (not with `foreign_key_checks = 0`); `DROP DATABASE` drops its own children first |
 | `RENAME TABLE` | Yes (children's FOREIGN KEYs follow the parent) |
-| `ALTER TABLE` ADD / DROP / CHANGE COLUMN, ADD / DROP INDEX | Yes (copying ALTER) |
+| `ALTER TABLE` ADD / DROP / CHANGE COLUMN, ADD / DROP INDEX | Yes |
+| `ALTER TABLE` in place (`ALGORITHM=INPLACE`) | One column added at the end (with a constant default), dropped or renamed, non-unique indexes added and dropped, defaults changed (`INSTANT`); any other ALTER, or one changing more than one column, copies the table |
 | `TRUNCATE TABLE` | Yes |
 | `AUTO_INCREMENT` | Yes (see [Known differences](#known-differences)) |
 | Generated columns (VIRTUAL / STORED) | Refused (1910) |
@@ -292,7 +293,8 @@ the list stays current.
 - **A copying `ALTER TABLE` of a table another table's FOREIGN KEY names**
   is refused (1296): MariaDB swaps the copy in by renames, and a rename
   takes the keys to the old table
-  ([stoolap#987](https://github.com/stoolap/stoolap/issues/987)).
+  ([stoolap#987](https://github.com/stoolap/stoolap/issues/987)). An
+  ALTER done in place keeps the table, and runs.
 - **A row whose FOREIGN KEY names that row itself** is deleted, or its
   key moved together with the value naming it, as that leaves no row
   naming a missing one; InnoDB refuses both (1451), also under RESTRICT.

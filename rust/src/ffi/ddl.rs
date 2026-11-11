@@ -14,7 +14,8 @@ use std::panic;
 
 use stoolap::core::{Error, Result};
 
-use super::types::StoolapDB;
+use super::types::{StoolapDB, StoolapValue};
+use super::value::ffi_value_to_rust;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 use crate::ddl::{self, Column, ForeignKey, Key};
 use crate::session::Session;
@@ -306,6 +307,88 @@ pub unsafe extern "C" fn stoolap_rename_table(
             text(to, "table name")?,
             swap != 0,
         )?;
+        Ok(STOOLAP_OK)
+    })
+}
+
+/// One change an in-place ALTER makes to a table's columns: `STOOLAP_ALTER_*`
+pub const STOOLAP_ALTER_ADD_COLUMN: i32 = 1;
+pub const STOOLAP_ALTER_DROP_COLUMN: i32 = 2;
+pub const STOOLAP_ALTER_RENAME_COLUMN: i32 = 3;
+
+/// Changes a column of `table` in place: adds `name` at the end (`kind`,
+/// `nullable`, its rows holding `default`), drops it, or renames it to
+/// `new_name`, as `op` says.
+///
+/// # Safety
+///
+/// `db` must be a valid `StoolapDB`, the strings NUL-terminated UTF-8
+/// (`new_name` for a rename), `default` a valid value for an add.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_alter_column(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    op: i32,
+    name: *const c_char,
+    new_name: *const c_char,
+    kind: i32,
+    nullable: i32,
+    default: *const StoolapValue,
+) -> i32 {
+    on_session(db, "stoolap_alter_column", |session| {
+        let table = text(table, "table name")?;
+        let name = text(name, "column name")?;
+        match op {
+            STOOLAP_ALTER_ADD_COLUMN => {
+                let default = default
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("no default"))?;
+                ddl::add_column(
+                    session,
+                    table,
+                    name,
+                    kind,
+                    nullable != 0,
+                    &ffi_value_to_rust(default)?,
+                )?
+            }
+            STOOLAP_ALTER_DROP_COLUMN => ddl::drop_column(session, table, name)?,
+            STOOLAP_ALTER_RENAME_COLUMN => {
+                ddl::rename_column(session, table, name, text(new_name, "column name")?)?
+            }
+            _ => return Err(Error::internal("unknown column change")),
+        }
+        Ok(STOOLAP_OK)
+    })
+}
+
+/// Creates (`create`) or drops the index of `table`'s non-unique key `key`,
+/// over `columns` when created.
+///
+/// # Safety
+///
+/// As `stoolap_drop_table`, `columns` `ncolumns` strings.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_alter_index(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    key: *const c_char,
+    create: i32,
+    columns: *const *const c_char,
+    ncolumns: i32,
+) -> i32 {
+    on_session(db, "stoolap_alter_index", |session| {
+        let table = text(table, "table name")?;
+        let key = text(key, "key name")?;
+        if create != 0 {
+            let columns = slice(columns, ncolumns)?
+                .iter()
+                .map(|&c| text(c, "key column"))
+                .collect::<Result<Vec<_>>>()?;
+            ddl::create_index(session, table, key, &columns)?;
+        } else {
+            ddl::drop_index(session, table, key)?;
+        }
         Ok(STOOLAP_OK)
     })
 }
