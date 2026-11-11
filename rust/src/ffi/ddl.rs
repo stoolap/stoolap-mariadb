@@ -286,7 +286,8 @@ pub unsafe extern "C" fn stoolap_drop_table(
     })
 }
 
-/// Renames table `from` to `to`.
+/// Renames table `from` to `to`; `swap` when a copying ALTER renames its
+/// table away (refused when another table's key names it).
 ///
 /// # Safety
 ///
@@ -296,9 +297,15 @@ pub unsafe extern "C" fn stoolap_rename_table(
     db: *mut StoolapDB,
     from: *const c_char,
     to: *const c_char,
+    swap: i32,
 ) -> i32 {
     on_session(db, "stoolap_rename_table", |session| {
-        ddl::rename_table(session, text(from, "table name")?, text(to, "table name")?)?;
+        ddl::rename_table(
+            session,
+            text(from, "table name")?,
+            text(to, "table name")?,
+            swap != 0,
+        )?;
         Ok(STOOLAP_OK)
     })
 }

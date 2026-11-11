@@ -42,6 +42,9 @@ public:
                HA_CREATE_INFO* create_info) override;
     int delete_table(const char* name) override;
     int rename_table(const char* from, const char* to) override;
+    // A table a FOREIGN KEY names keeps its engine (1217, as InnoDB): the
+    // other engine's copy would leave the keys with the old table
+    bool can_switch_engines() override;
 
     int write_row(const uchar* buf) override;
     int update_row(const uchar* old_data, const uchar* new_data) override;

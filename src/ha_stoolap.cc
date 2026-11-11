@@ -919,12 +919,25 @@ int ha_stoolap::delete_table(const char* name) {
     return 0;
 }
 
+bool ha_stoolap::can_switch_engines() {
+    StoolapDB* db = get_thd_ctx(ha_thd())->db();
+    return !db || stoolap_writes_through_sql(db, stoolap_table_.c_str()) == 0;
+}
+
 int ha_stoolap::rename_table(const char* from, const char* to) {
     const std::string flat_from = stoolap_table_from_path(from);
     const std::string flat_to = stoolap_table_from_path(to);
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
-    if (stoolap_rename_table(db, flat_from.c_str(), flat_to.c_str()) !=
+    // A copying ALTER, into this engine or another, renames the table to a
+    // temporary name (#sql-backup-...) before the copy takes its place
+    const int command = thd_sql_command(ha_thd());
+    const std::string_view to_name(to);
+    const bool swap =
+        (command == SQLCOM_ALTER_TABLE || command == SQLCOM_CREATE_INDEX ||
+         command == SQLCOM_DROP_INDEX) &&
+        to_name.substr(to_name.rfind('/') + 1).rfind("#sql", 0) == 0;
+    if (stoolap_rename_table(db, flat_from.c_str(), flat_to.c_str(), swap) !=
         STOOLAP_OK) {
         auto verr = fetch_db_error(db);
         sql_print_error("stoolap: RENAME TABLE failed: %s", verr.message);
