@@ -392,3 +392,19 @@ pub unsafe extern "C" fn stoolap_alter_index(
         Ok(STOOLAP_OK)
     })
 }
+
+/// The version of `table`'s definition (`ddl::table_version`); 0 when it
+/// cannot be read.
+///
+/// # Safety
+///
+/// As `stoolap_drop_table`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_table_version(db: *mut StoolapDB, table: *const c_char) -> u64 {
+    let mut version = 0;
+    on_session(db, "stoolap_table_version", |session| {
+        version = ddl::table_version(session, text(table, "table name")?)?;
+        Ok(STOOLAP_OK)
+    });
+    version
+}

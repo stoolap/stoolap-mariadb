@@ -744,8 +744,16 @@ int32_t stoolap_alter_column(StoolapDB* db, const char* table, int32_t op,
                              const StoolapValue* default_value);
 
 /**
+ * The version of `table`'s definition in stoolap (its columns and
+ * indexes, hashed), which an in-place ALTER changes; 0 when it cannot be
+ * read.
+ */
+uint64_t stoolap_table_version(StoolapDB* db, const char* table);
+
+/**
  * Create (`create`) the index of `table`'s non-unique key `key` over
- * `columns`, or drop it if it is there.
+ * `columns`, unless it has one, or drop the ones it has, by the names they
+ * were created with (a RENAME TABLE keeps them).
  */
 int32_t stoolap_alter_index(StoolapDB* db, const char* table, const char* key,
                             int32_t create, const char* const* columns,

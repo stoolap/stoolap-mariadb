@@ -167,12 +167,38 @@ INSERT INTO ia VALUES (1, 10, 'x'), (2, 20, 'y');
     h.assert_ok("and goes ahead once it ends",
                 "ALTER TABLE ia ADD COLUMN k INT, ALGORITHM=INPLACE")
 
+    h.section("What the copy refuses")
+    h.assert_err("a COMPRESSED column is not added in place",
+                 "ALTER TABLE ia ADD COLUMN m TEXT COMPRESSED, "
+                 "ALGORITHM=INPLACE", NO_INPLACE)
+    h.assert_err("and is refused", "ALTER TABLE ia ADD COLUMN m TEXT "
+                 "COMPRESSED", "COMPRESSED BLOB / TEXT")
+    c, cur = h.open_session()
+    try:
+        cur.execute("SET SESSION sql_mode = 'STRICT_ALL_TABLES,NO_ZERO_DATE'")
+        try:
+            cur.execute("ALTER TABLE ia ADD COLUMN m DATE NOT NULL")
+            h._fail("a NOT NULL DATE under NO_ZERO_DATE is refused (1292)",
+                    "no error")
+        except mysql.connector.Error as e:
+            h.assert_eq("a NOT NULL DATE under NO_ZERO_DATE is refused "
+                        "(1292), as InnoDB refuses it", 1292, e.errno)
+    finally:
+        c.close()
+
     h.section("With a rename, and a TEMPORARY table")
     h.assert_ok("a column added and the table renamed",
                 "ALTER TABLE ia ADD COLUMN l INT DEFAULT 6, RENAME TO ib, "
                 "ALGORITHM=INPLACE")
     h.assert_scalar("the renamed table holds both",
                     "SELECT COUNT(*), SUM(l) FROM ib", "5\t30")
+    # Its indexes keep the names they were created with
+    h.assert_ok("an index of the renamed table dropped",
+                "ALTER TABLE ib DROP INDEX kb, ALGORITHM=INPLACE")
+    h.assert_ok("and added again",
+                "ALTER TABLE ib ADD INDEX kb (cc), ALGORITHM=INPLACE")
+    h.assert_scalar("reads by it",
+                    "SELECT id FROM ib FORCE INDEX (kb) WHERE cc = 'c5'", "4")
     # MariaDB copies a TEMPORARY table, as it does for InnoDB
     h.assert_ok("a TEMPORARY table shadowing it",
                 "CREATE TEMPORARY TABLE ib (id INT NOT NULL PRIMARY KEY, "

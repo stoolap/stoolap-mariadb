@@ -158,6 +158,22 @@ int stoolap_rollback_cb(handlerton* /*hton*/, THD* thd, bool all) {
     return 0;
 }
 
+// DDL recovery of an in-place ALTER that a crash cut short: 0 when the
+// stoolap table took the change (its definition's version is not the one
+// taken before it, `create_id`), so MariaDB installs the new .frm; else
+// it keeps the old one.
+int stoolap_check_version_cb(handlerton* /*hton*/, const char* path,
+                             const LEX_CUSTRING* /*version*/,
+                             ulonglong create_id) {
+    stoolap_mariadb::DbPtr db = g_engine.clone_handle();
+    const uint64_t now =
+        db ? stoolap_table_version(
+                 db.get(),
+                 stoolap_mariadb::stoolap_table_from_path(path).c_str())
+           : 0;
+    return now && now != create_id ? 0 : 1;
+}
+
 int stoolap_close_connection_cb(handlerton* /*hton*/, THD* thd) {
     auto* ctx = static_cast<stoolap_mariadb::ThdContext*>(
         thd_get_ha_data(thd, stoolap_hton));
@@ -699,6 +715,7 @@ int stoolap_init_func(void* p) {
     // HTON_CAN_RECREATE would route TRUNCATE through DROP+CREATE; we expose
     // a real truncate that runs stoolap's native TRUNCATE instead.
     stoolap_hton->flags = 0;
+    stoolap_hton->check_version = stoolap_check_version_cb;
     stoolap_hton->commit = stoolap_commit_cb;
     stoolap_hton->rollback = stoolap_rollback_cb;
     stoolap_hton->close_connection = stoolap_close_connection_cb;
@@ -1000,13 +1017,18 @@ bool added_default(TABLE* altered, Field* f, InplacePlan* plan) {
 // Plans an in-place ALTER of `table` into `altered`; false when it copies
 bool plan_inplace(TABLE* table, TABLE* altered, Alter_inplace_info* info,
                   InplacePlan* plan) {
-    if (info->handler_flags & ~kInplaceOps) return false;
+    // A NOT NULL column with no value for the rows there (a zero date
+    // under NO_ZERO_DATE): the copy refuses a table that has rows
+    if ((info->handler_flags & ~kInplaceOps) || info->error_if_not_empty)
+        return false;
     std::vector<bool> kept(table->s->fields, false);
     int changes = 0;
     uint i = 0, next = 0;
     List_iterator_fast<Create_field> it(info->alter_info->create_list);
     while (const Create_field* cf = it++) {
         Field* f = altered->field[i];
+        // As refuse_unsupported_columns, which the copy's create() runs
+        if ((f->flags & BLOB_FLAG) && f->compression_method()) return false;
         if (!cf->field) {
             // At the end: stoolap adds a column there, and the plugin
             // writes a row's values in MariaDB's column order
@@ -1063,8 +1085,19 @@ enum_alter_inplace_result ha_stoolap::check_if_supported_inplace_alter(
     return HA_ALTER_INPLACE_EXCLUSIVE_LOCK;
 }
 
-bool ha_stoolap::inplace_alter_table(TABLE* altered_table,
-                                     Alter_inplace_info* ha_alter_info) {
+ulonglong ha_stoolap::table_version() const {
+    auto* ctx = ha_thd() ? get_thd_ctx(ha_thd()) : nullptr;
+    StoolapDB* db = ctx ? ctx->db() : nullptr;
+    return db ? stoolap_table_version(db, stoolap_table_.c_str()) : 0;
+}
+
+// The change runs at commit, past every wait MariaDB can still fail or
+// be killed in: nothing rolls a stoolap DDL statement back.
+bool ha_stoolap::commit_inplace_alter_table(TABLE* altered_table,
+                                            Alter_inplace_info* ha_alter_info,
+                                            bool commit) {
+    ha_alter_info->group_commit_ctx = nullptr;  // as handler's own
+    if (!commit) return false;
     InplacePlan plan;
     if (!plan_inplace(table, altered_table, ha_alter_info, &plan)) {
         my_error(ER_ALTER_OPERATION_NOT_SUPPORTED, MYF(0), "ALGORITHM=INPLACE",

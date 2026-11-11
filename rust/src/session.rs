@@ -26,7 +26,7 @@ use stoolap::core::{Error, IsolationLevel, Result, Row};
 use stoolap::executor::{CachedPlanRef, ExecutionContext, Executor};
 use stoolap::parser::ast::{RollbackStatement, Statement};
 use stoolap::storage::mvcc::registry::StatementView;
-use stoolap::storage::traits::{QueryResult, Table, Transaction};
+use stoolap::storage::traits::{Engine, QueryResult, Table, Transaction};
 
 pub struct Session {
     exec: Executor,
@@ -213,6 +213,34 @@ impl Session {
 
     pub fn rollback(&self) -> Result<()> {
         self.take()?.rollback()
+    }
+
+    /// The stoolap names of `table`'s indexes, its primary key's aside
+    pub fn table_indexes(&self, table: &str) -> Result<Vec<String>> {
+        Ok(self
+            .exec
+            .engine()
+            .list_table_indexes(table)?
+            .into_keys()
+            .collect())
+    }
+
+    /// `table`'s columns as stoolap holds them now: name, type, nullable
+    pub fn table_columns(&self, table: &str) -> Result<Vec<(String, String, bool)>> {
+        Ok(self
+            .exec
+            .engine()
+            .get_table_schema(table)?
+            .columns
+            .iter()
+            .map(|c| {
+                (
+                    c.name_lower.clone(),
+                    format!("{:?}", c.data_type),
+                    c.nullable,
+                )
+            })
+            .collect())
     }
 
     /// Runs `f` on the read handle on `table` of the open transaction,

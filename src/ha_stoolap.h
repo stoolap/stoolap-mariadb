@@ -47,11 +47,15 @@ public:
     bool can_switch_engines() override;
 
     // In place: one column added at the end, dropped or renamed, and
-    // non-unique indexes added and dropped (see plan_inplace)
+    // non-unique indexes added and dropped (see plan_inplace), at commit
     enum_alter_inplace_result check_if_supported_inplace_alter(
         TABLE* altered_table, Alter_inplace_info* ha_alter_info) override;
-    bool inplace_alter_table(TABLE* altered_table,
-                             Alter_inplace_info* ha_alter_info) override;
+    bool commit_inplace_alter_table(TABLE* altered_table,
+                                    Alter_inplace_info* ha_alter_info,
+                                    bool commit) override;
+    // The definition's version in stoolap, which an in-place ALTER
+    // changes: DDL recovery asks it (stoolap_check_version_cb)
+    ulonglong table_version() const override;
 
     int write_row(const uchar* buf) override;
     int update_row(const uchar* old_data, const uchar* new_data) override;
