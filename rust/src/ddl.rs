@@ -12,7 +12,8 @@
 //! for an engine that does not claim them, so the plugin hands over the
 //! ones its parser read, their parent tables under stoolap's names.
 
-use stoolap::api::ParamVec;
+use stoolap::api::{Database, ParamVec};
+use stoolap::core::schema::ROWID_NAME;
 use stoolap::core::{Error, Result};
 
 use crate::session::Session;
@@ -40,6 +41,44 @@ pub struct Key {
 
 pub fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// What a column MariaDB names `_rowid_` (in any case) is called in
+/// stoolap, which keeps that name for a row's identity: the name with a
+/// character no MariaDB identifier holds, as `stoolap_column_name`
+/// (src/stoolap_bridge.h) writes it
+const ROWID_SUFFIX: char = '\u{F0000}';
+
+/// Gives each column an older build stored as `_rowid_` the name the
+/// plugin now writes for it. Stoolap opens such a table for DDL alone; the
+/// plugin, which turns every MariaDB `_rowid_` into that name, reads it
+/// again once renamed. A rename that fails leaves its table refusing reads,
+/// and is reported.
+pub fn rename_reserved_columns(db: &Database) {
+    for schema in db.engine().get_all_schemas() {
+        for column in &schema.columns {
+            if !column.name.eq_ignore_ascii_case(ROWID_NAME) {
+                continue;
+            }
+            let sql = format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                quote(&schema.table_name),
+                quote(&column.name),
+                quote(&format!("{}{}", column.name, ROWID_SUFFIX))
+            );
+            match db.execute(&sql, ()) {
+                Ok(_) => eprintln!(
+                    "stoolap: renamed column {} of table {} to the name the \
+                     plugin reads it by",
+                    column.name, schema.table_name
+                ),
+                Err(e) => eprintln!(
+                    "stoolap: cannot rename column {} of table {}: {e}",
+                    column.name, schema.table_name
+                ),
+            }
+        }
+    }
 }
 
 /// The most bytes a table name takes in stoolap, which names a file after
