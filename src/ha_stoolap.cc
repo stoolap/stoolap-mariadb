@@ -710,6 +710,7 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
 
 int stoolap_init_func(void* p) {
     stoolap_hton = static_cast<handlerton*>(p);
+    stoolap_mariadb::g_table_names_keep_case = lower_case_table_names == 0;
     stoolap_hton->db_type = DB_TYPE_AUTOASSIGN;
     stoolap_hton->create = stoolap_create_handler;
     // HTON_CAN_RECREATE would route TRUNCATE through DROP+CREATE; we expose

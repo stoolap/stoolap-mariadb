@@ -148,11 +148,18 @@ inline std::string fit_table_name(std::string flat) {
     return flat;
 }
 
+// Whether MariaDB tells table names apart by letter case
+// (lower_case_table_names = 0), set at plugin init
+extern bool g_table_names_keep_case;
+
 // Stoolap's name for the table at MariaDB's path "./db/tbl" (a file path:
 // its names as tablename_to_filename encodes them). `_` becomes `_0` and
 // `/` becomes `_1`, so distinct (db, tbl) pairs never collide (a naive
 // `/` -> `__` meets db=`p`,tbl=`q__r` and db=`p__q`,tbl=`r`); one past
-// stoolap's name limit is shortened (fit_table_name).
+// stoolap's name limit is shortened (fit_table_name). Stoolap matches
+// table names in lower case, so where MariaDB keeps `T` and `t` apart (and
+// the file names of non-ASCII ones, `@7W` and `@7w`) an uppercase letter
+// becomes `_3` and the letter in lower case.
 inline std::string stoolap_table_from_path(const char* mariadb_path) {
     if (!mariadb_path) return std::string();
     std::string_view s(mariadb_path);
@@ -164,7 +171,10 @@ inline std::string stoolap_table_from_path(const char* mariadb_path) {
             out.append("_0");
         else if (c == '/')
             out.append("_1");
-        else
+        else if (g_table_names_keep_case && c >= 'A' && c <= 'Z') {
+            out.append("_3");
+            out.push_back(static_cast<char>(c - 'A' + 'a'));
+        } else
             out.push_back(c);
     }
     return fit_table_name(std::move(out));

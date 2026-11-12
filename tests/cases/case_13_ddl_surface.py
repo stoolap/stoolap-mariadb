@@ -157,3 +157,40 @@ CREATE TABLE nn (
     h.assert_scalar("renamed read",
                     f"SELECT v FROM `{u}`.`{u[2:]}x` WHERE id = 1", "200")
     h.exec_script(f"DROP DATABASE `{u}`")
+    # Under lower_case_table_names = 0 MariaDB tells names apart by letter
+    # case, as do the file names of non-ASCII ones (`Β` is @7W, `ϐ` @7w);
+    # stoolap matches names in lower case, so each is its own table there
+    # only by its escaped uppercase letters
+    if h.sql("SELECT @@lower_case_table_names").strip() == "0":
+        h.exec_script(f"""
+CREATE DATABASE lc;
+CREATE DATABASE LC;
+CREATE TABLE lc.Users (id INT PRIMARY KEY, v INT) ENGINE={h.engine};
+CREATE TABLE lc.users (id INT PRIMARY KEY, v INT) ENGINE={h.engine};
+CREATE TABLE LC.users (id INT PRIMARY KEY, v INT) ENGINE={h.engine};
+CREATE TABLE lc.`Β` (id INT PRIMARY KEY) ENGINE={h.engine};
+CREATE TABLE lc.`ϐ` (id INT PRIMARY KEY) ENGINE={h.engine};
+INSERT INTO lc.Users VALUES (1, 10);
+INSERT INTO lc.users VALUES (1, 20);
+INSERT INTO LC.users VALUES (1, 30);
+INSERT INTO lc.`Β` VALUES (1);
+""")
+        for t, v in (("lc.Users", "10"), ("lc.users", "20"),
+                     ("LC.users", "30")):
+            h.assert_scalar(f"{t} keeps its own row",
+                            f"SELECT v FROM {t} WHERE id = 1", v)
+        h.assert_scalar("pushed join of names in two cases",
+                        "SELECT a.v + b.v FROM lc.Users a JOIN lc.users b "
+                        "ON a.id = b.id", "30")
+        h.assert_scalar("a non-ASCII name's own table",
+                        "SELECT COUNT(*) FROM lc.`ϐ`", "0")
+        h.assert_ok("DROP of one", "DROP TABLE lc.users")
+        h.assert_ok("DROP of a name MariaDB has not",
+                    "DROP TABLE IF EXISTS lc.uSers")
+        h.assert_scalar("the other keeps its rows",
+                        "SELECT v FROM lc.Users WHERE id = 1", "10")
+        h.assert_ok("RENAME into the dropped name's case",
+                    "RENAME TABLE lc.Users TO lc.users")
+        h.assert_scalar("renamed table read",
+                        "SELECT v FROM lc.users WHERE id = 1", "10")
+        h.exec_script("DROP DATABASE lc; DROP DATABASE LC")

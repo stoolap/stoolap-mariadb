@@ -175,5 +175,6 @@ const char* status_label(int32_t code) {
 
 PushdownStats g_stats{};
 std::atomic<bool> g_perf_trace_enabled{false};
+bool g_table_names_keep_case = false;
 
 }  // namespace stoolap_mariadb
