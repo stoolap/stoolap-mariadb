@@ -288,3 +288,30 @@ INSERT INTO oa WITH RECURSIVE s(n) AS
                     "SELECT COUNT(*) FROM oa WHERE id = 7", "0")
     h.assert_scalar("every other row survived",
                     "SELECT COUNT(*) FROM oa", "999999")
+
+    h.section("An online ALTER to another engine keeps direct writes")
+    # MariaDB asks only the new table's engine whether the ALTER may run
+    # online: from STOOLAP to InnoDB it does, and the UPDATE / DELETE made
+    # meanwhile reach the copy only from row events, which the row pump
+    # writes and a direct UPDATE / DELETE did not.
+    h.exec_script(f"""
+CREATE TABLE ob (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)
+    ENGINE={h.engine};
+SET max_recursive_iterations = 1000000;
+INSERT INTO ob WITH RECURSIVE s(n) AS
+    (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 1000000)
+    SELECT n, 0 FROM s;
+""")
+    alter = h.run_async("ALTER TABLE ob ENGINE=InnoDB, ALGORITHM=COPY, "
+                        "LOCK=NONE;")
+    time.sleep(0.15)
+    h.run_client("UPDATE ob SET v = 5 WHERE id > 4 AND id < 6;"
+                 "DELETE FROM ob WHERE id > 6 AND id < 8;")
+    out = alter.wait()
+    h.assert_eq("the ALTER succeeded", "", out.strip())
+    h.assert_scalar("the UPDATEd row kept its change",
+                    "SELECT v FROM ob WHERE id = 5", "5")
+    h.assert_scalar("the DELETEd row stayed deleted",
+                    "SELECT COUNT(*) FROM ob WHERE id = 7", "0")
+    h.assert_scalar("every other row survived",
+                    "SELECT COUNT(*) FROM ob", "999999")

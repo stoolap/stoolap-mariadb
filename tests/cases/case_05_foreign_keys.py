@@ -519,3 +519,20 @@ INSERT INTO dc VALUES (1, 1);
                     "SELECT COUNT(*) FROM information_schema.tables "
                     f"WHERE table_schema = '{h.db}' "
                     "AND table_name IN ('dp', 'dc')", "0")
+
+    h.section("A TEMPORARY table of a child's name is not the child")
+    h.exec_script(f"""
+CREATE TABLE tp (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+CREATE TABLE tc (id INT NOT NULL PRIMARY KEY, pid INT,
+  FOREIGN KEY (pid) REFERENCES tp (id)) ENGINE={h.engine};
+INSERT INTO tp VALUES (1);
+INSERT INTO tc VALUES (1, 1);
+""")
+    h.assert_ok("a TEMPORARY tc hides the child",
+                "CREATE TEMPORARY TABLE tc (id INT) ENGINE=MEMORY")
+    h.assert_ok("foreign_key_checks off", "SET foreign_key_checks = 0")
+    h.assert_err("dropping the parent with the TEMPORARY tc is refused",
+                 "DROP TABLE tp, tc", r"\b1451\b")
+    h.assert_ok("foreign_key_checks back on", "SET foreign_key_checks = 1")
+    h.assert_scalar("the child keeps its row", "SELECT COUNT(*) FROM tc", "1")
+    h.assert_scalar("and the parent its", "SELECT COUNT(*) FROM tp", "1")

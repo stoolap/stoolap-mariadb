@@ -170,6 +170,12 @@ bool can_direct_modify(THD* thd, const Item* where) {
 
     if (sel->table_list.elements != 1)
         return false;  // multi-table UPDATE/DELETE
+    // An online ALTER TABLE copying this table to another engine replays
+    // the writes made meanwhile from their row events, which only the row
+    // pump writes. Set before a writer gets its MDL and kept until the
+    // statement ends, so every call in the statement answers alike.
+    const TABLE* target = sel->get_table_list()->table;
+    if (!target || target->s->online_alter_binlog) return false;
     if (sel->order_list.elements || sel->limit_params.select_limit)
         return false;  // ORDER BY / LIMIT
     // One row by its primary key: the row pump's (one_row_by_key), told
