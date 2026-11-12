@@ -117,9 +117,9 @@ fn stored_len(c: char) -> usize {
 /// `name`, or when stoolap cannot hold it, its first characters, `_2` and
 /// a hash of the whole lowercased (FNV-1a, 64 bits): stoolap matches table
 /// names lowercased, so names in other letter case shorten to one it
-/// matches too. The escaping never writes `_2`, so no name that fits meets
-/// a shortened one; the hash must not change, a file-backed table keeps
-/// its name.
+/// matches too. The escaping never writes `_2` (only `_0`, `_1` and
+/// `_3`), so no name that fits meets a shortened one; the hash must not
+/// change, a file-backed table keeps its name.
 pub fn fit_name(name: String) -> String {
     const TAIL: usize = 2 + 16;
     if name.chars().map(stored_len).sum::<usize>() <= MAX_TABLE_NAME {
