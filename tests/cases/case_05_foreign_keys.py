@@ -429,3 +429,35 @@ INSERT INTO ac VALUES (1, 1), (2, 2);
     h.assert_ok("delete a parent row", "DELETE FROM ap WHERE id = 1")
     h.assert_scalar("ON DELETE SET NULL ran",
                     "SELECT COUNT(*) FROM ac WHERE pid IS NULL", "1")
+    # A UNIQUE key on a FOREIGN KEY's column serves the key's lookups
+    # (stoolap#1006): at CREATE, inline or as its own key, and added later
+    h.exec_script(f"""
+CREATE TABLE up (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+INSERT INTO up VALUES (1), (2);
+""")
+    for name, column in (("uc1", "pid INT UNIQUE"),
+                         ("uc2", "pid INT, UNIQUE KEY (pid)")):
+        h.assert_ok(f"CREATE {name}: UNIQUE and FOREIGN KEY on one column",
+                    f"CREATE TABLE {name} (id INT NOT NULL PRIMARY KEY, "
+                    f"{column}, FOREIGN KEY (pid) REFERENCES up (id)) "
+                    f"ENGINE={h.engine}")
+        h.assert_ok(f"{name} takes a row", f"INSERT INTO {name} VALUES (1, 1)")
+        h.assert_err(f"{name} keeps the column unique",
+                     f"INSERT INTO {name} VALUES (2, 1)", r"\b1062\b")
+        h.assert_err(f"{name} keeps the key",
+                     f"INSERT INTO {name} VALUES (2, 5)", r"\b1452\b")
+    h.exec_script(f"""
+CREATE TABLE uc3 (id INT NOT NULL PRIMARY KEY, pid INT,
+  FOREIGN KEY (pid) REFERENCES up (id)) ENGINE={h.engine};
+INSERT INTO uc3 VALUES (1, 1);
+""")
+    h.assert_ok("UNIQUE added on a FOREIGN KEY's column",
+                "ALTER TABLE uc3 ADD UNIQUE KEY (pid)")
+    h.assert_err("the added key is unique",
+                 "INSERT INTO uc3 VALUES (2, 1)", r"\b1062\b")
+    h.assert_ok("and dropped again", "ALTER TABLE uc3 DROP INDEX pid")
+    h.assert_ok("the column takes a repeat", "INSERT INTO uc3 VALUES (2, 1)")
+    h.assert_err("the key outlives the dropped UNIQUE",
+                 "INSERT INTO uc3 VALUES (3, 5)", r"\b1452\b")
+    h.assert_err("and still guards the parent",
+                 "DELETE FROM up WHERE id = 1", r"\b1451\b")
