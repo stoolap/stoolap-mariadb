@@ -210,7 +210,8 @@ Tables created by an older build of the plugin must be re-created.
 | Character sets other than utf8 | Yes (stored as hex; not pushed) |
 | `PRIMARY KEY`, `UNIQUE`, single-column or composite | Yes |
 | `KEY` / `CREATE INDEX`, single-column or composite | Yes (one Stoolap index over all parts) |
-| `PRIMARY KEY` / `UNIQUE` on a case-insensitive collation | Refused (Stoolap compares bytes: use a `_bin` collation) |
+| `UNIQUE` on a case-insensitive collation (`_ci`, `VARCHAR` / `CHAR`) | Yes: kept on a hidden column of each value's collation key (its `WEIGHT_STRING`), so it refuses what the collation holds equal; exact lookups by the key read it |
+| `PRIMARY KEY` on a case-insensitive collation, `UNIQUE` on a case-insensitive `TEXT` | Refused (Stoolap compares bytes: use a `_bin` collation) |
 | `PRIMARY KEY` / `UNIQUE` over a column prefix (`a(3)`) | Refused (Stoolap enforces whole values) |
 | `FOREIGN KEY` | Yes: single-column, to a PRIMARY KEY or UNIQUE column, of another table or its own; RESTRICT, NO ACTION, CASCADE, SET NULL |
 | Composite `FOREIGN KEY` | Refused |
@@ -218,7 +219,7 @@ Tables created by an older build of the plugin must be re-created.
 | `DROP TABLE` of a referenced parent | Refused with 1451, as InnoDB does (not with `foreign_key_checks = 0`); `DROP DATABASE` drops its own children first |
 | `RENAME TABLE` | Yes (children's FOREIGN KEYs follow the parent) |
 | `ALTER TABLE` ADD / DROP / CHANGE COLUMN, ADD / DROP INDEX | Yes |
-| `ALTER TABLE` in place (`ALGORITHM=INPLACE`) | One column added at the end (with a constant default), dropped or renamed, non-unique indexes added and dropped, defaults changed (`INSTANT`); any other ALTER, or one changing more than one column, copies the table |
+| `ALTER TABLE` in place (`ALGORITHM=INPLACE`) | One column added at the end (with a constant default), dropped or renamed, non-unique indexes added and dropped, defaults changed (`INSTANT`); any other ALTER, or one changing more than one column, copies the table, as does a column change of a table with a case-insensitive `UNIQUE` key |
 | `TRUNCATE TABLE` | Yes |
 | `AUTO_INCREMENT` | Yes (see [Known differences](#known-differences)) |
 | Generated columns (VIRTUAL / STORED) | Refused (1910) |
@@ -304,6 +305,9 @@ the list stays current.
 - **On a table a FOREIGN KEY names that has no primary key**, the row
   pump cannot name a row: an UPDATE with ORDER BY / LIMIT fails (1296),
   and an UPDATE of a UNIQUE column is checked as a set.
+- **A FOREIGN KEY to a case-insensitive `UNIQUE` column** is refused
+  (1296): Stoolap keeps that key on the hidden key column, so it finds no
+  UNIQUE index on the column the key names.
 - **`HA_READ_PREFIX_LAST`** (MAX with a prefix bound) is not supported.
 - **`LOCK TABLES` with `autocommit = 0`** runs the statements after
   COMMIT in autocommit.

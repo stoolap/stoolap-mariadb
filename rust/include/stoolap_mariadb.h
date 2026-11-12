@@ -405,8 +405,9 @@ typedef int32_t (*StoolapStoreFn)(void* ctx, int32_t field,
  * with STOOLAP_READ_DESC in `flags`), or in no set order when `norder` is
  * 0. `encode(ctx, ...)` gives the bound values the key's fields do not
  * read themselves. STOOLAP_DONE when no row can be within the bounds (no
- * read opens). `table_columns` is the column count MariaDB knows; a table
- * that differs is refused.
+ * read opens). `table_columns` is the column count the plugin knows (the
+ * table's own and its collation key columns); a table that differs is
+ * refused.
  */
 int32_t stoolap_read(
     StoolapDB* db,

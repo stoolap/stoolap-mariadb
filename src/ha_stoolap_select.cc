@@ -213,6 +213,8 @@ bool can_direct_modify(THD* thd, const Item* where) {
         // dropping scale. Encoded targets would store the value as
         // written. The row-pump path is faithful: it writes through
         // Field::store and extract_field.
+        // A column stoolap keeps a collation key for: stoolap cannot
+        // compute the key, the row pump writes it (collation_key)
         List_iterator<Item> tit(sel->item_list);
         Item* tgt;
         while ((tgt = tit++)) {
@@ -221,6 +223,12 @@ bool can_direct_modify(THD* thd, const Item* where) {
                 auto* fi = static_cast<Item_field*>(tgt);
                 if (fi->field && field_not_as_written(fi->field)) {
                     return false;
+                }
+                if (fi->field && fi->field->table) {
+                    const auto keyed = stoolap_mariadb::collation_keyed_fields(
+                        fi->field->table->s);
+                    for (uint k : keyed)
+                        if (k == fi->field->field_index) return false;
                 }
             }
         }

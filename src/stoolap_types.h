@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace stoolap_mariadb {
 
@@ -275,6 +276,105 @@ inline void store_text(Field* f, const char* s, size_t n) {
     }
     // Anything else (a DECIMAL's string) reads as before.
     f->store(s, n, cs);
+}
+
+// A string column whose collation does not compare its bytes (a `_ci`
+// one): stoolap compares TEXT bytewise, so a UNIQUE key over it is kept
+// on a column of its collation keys instead (collation_key).
+inline bool collation_keyed_type(const Field* f) {
+    if (!f || !f->has_charset()) return false;
+    switch (f->real_type()) {
+        case MYSQL_TYPE_VARCHAR:
+        case MYSQL_TYPE_VAR_STRING:
+        case MYSQL_TYPE_STRING:
+            break;
+        default:
+            return false;
+    }
+    const CHARSET_INFO* cs = f->charset();
+    return cs && cs != &my_charset_bin && !(cs->state & MY_CS_BINSORT);
+}
+
+// The fields of `share` stoolap keeps a collation key column for, in field
+// order: those of collation_keyed_type a UNIQUE key (not the primary key)
+// names. The key column of the n-th is stoolap column fields + n.
+inline std::vector<uint> collation_keyed_fields(const TABLE_SHARE* share) {
+    std::vector<bool> keyed(share->fields, false);
+    for (uint i = 0; i < share->keys; ++i) {
+        const KEY& k = share->key_info[i];
+        if (i == share->primary_key || !(k.flags & HA_NOSAME)) continue;
+        for (uint j = 0; j < k.user_defined_key_parts; ++j) {
+            const Field* f = k.key_part[j].field;
+            if (f && collation_keyed_type(f)) keyed[f->field_index] = true;
+        }
+    }
+    std::vector<uint> out;
+    for (uint i = 0; i < share->fields; ++i)
+        if (keyed[i]) out.push_back(i);
+    return out;
+}
+
+// `f`'s collation key: values the collation holds equal have equal keys,
+// others differ. It is WEIGHT_STRING(f AS CHAR(n)) for n past the weights
+// any value takes (a character takes at most cs->strxfrm_multiply, the
+// UCA tables' limit), every key padded to the same length, less the tail
+// it shares with the empty string's key (`pad`): the keys still differ
+// where the padded ones did. With one level of weights the padded key is
+// the value's weights then the space's, so it is computed for the value
+// alone, its trailing space weights cut under PAD SPACE (`pad` holds the
+// space's). In uppercase hex, as stoolap TEXT. False when the value may
+// take more weights than the key holds.
+inline bool collation_key(Field* f, std::string& out, std::string& buf,
+                          std::string& pad) {
+    const CHARSET_INFO* cs = f->charset();
+    const uint per_char = cs->strxfrm_multiply ? cs->strxfrm_multiply : 1;
+    char tmp[MAX_FIELD_WIDTH];
+    String value(tmp, sizeof(tmp), cs);
+    const String* v = f->val_str(&value);
+    const auto* src = reinterpret_cast<const uchar*>(v->ptr());
+    const bool one_level = cs->levels_for_order <= 1;
+    // A character takes a byte at least: the value's bytes bound its
+    // characters, the column's characters every value's
+    const uint chars = one_level ? static_cast<uint>(v->length())
+                                 : static_cast<uint>(f->char_length());
+    const uint nweights = chars * per_char + 1;
+    const size_t len = cs->strnxfrmlen(size_t{nweights} * cs->mbmaxlen);
+    const uint flags = one_level ? 0 : MY_STRXFRM_PAD_WITH_SPACE;
+    if (pad.empty()) {
+        // The space's weights, or the empty string's padded key
+        const size_t plen = one_level ? cs->strnxfrmlen(cs->mbmaxlen) : len;
+        pad.resize(plen);
+        pad.resize(cs->strnxfrm(reinterpret_cast<uchar*>(pad.data()), plen,
+                                one_level ? 1 : nweights,
+                                reinterpret_cast<const uchar*>(" "),
+                                one_level ? 1 : 0, flags));
+    }
+    if (buf.size() < len) buf.resize(len);
+    const size_t n = cs->strnxfrm(reinterpret_cast<uchar*>(buf.data()), len,
+                                  nweights, src, v->length(), flags);
+    // A value whose weights reach the end of the key may have lost some
+    size_t keep = n;
+    if (!one_level) {
+        if (n != pad.size()) return false;
+        while (keep && buf[keep - 1] == pad[keep - 1])
+            --keep;
+        if (keep == n) return false;
+    } else if (n >= len) {
+        return false;
+    } else if (!(cs->state & MY_CS_NOPAD) && !pad.empty()) {
+        const size_t u = pad.size();
+        while (keep >= u &&
+               std::memcmp(buf.data() + keep - u, pad.data(), u) == 0)
+            keep -= u;
+    }
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    out.resize(keep * 2);
+    for (size_t i = 0; i < keep; ++i) {
+        const auto b = static_cast<uchar>(buf[i]);
+        out[2 * i] = kHex[b >> 4];
+        out[2 * i + 1] = kHex[b & 15];
+    }
+    return true;
 }
 
 }  // namespace stoolap_mariadb

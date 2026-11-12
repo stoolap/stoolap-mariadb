@@ -45,6 +45,14 @@ def _check(h, srv, label, t_rows, c_rows):
                            f"{t_rows[-1][0]}"))
     h.assert_eq(f"{label}: child rows", c_rows,
                 _rows(cur, "SELECT id, pid FROM c ORDER BY id"))
+    # A _ci UNIQUE key, kept on its collation key column
+    h.assert_eq(f"{label}: by the _ci UNIQUE key", [(1,)],
+                _rows(cur, "SELECT id FROM u WHERE email = 'A@X.COM'"))
+    try:
+        cur.execute("INSERT INTO u VALUES (9, 'a@X.com')")
+        h._fail(f"{label}: the _ci UNIQUE key holds", "no error")
+    except mysql.connector.Error as e:
+        h.assert_eq(f"{label}: the _ci UNIQUE key holds", 1062, e.errno)
     try:
         cur.execute("INSERT INTO c VALUES (999, 999)")
         h._fail(f"{label}: the FOREIGN KEY holds", "no error")
@@ -72,6 +80,9 @@ def run(h):
             "INSERT INTO t (v, n) VALUES ('a', 1), ('b', 2), ('b', 3)",
             "INSERT INTO p VALUES (1), (2)",
             "INSERT INTO c VALUES (10, 1), (20, 2)",
+            "CREATE TABLE u (id INT PRIMARY KEY, email VARCHAR(50) UNIQUE) "
+            "ENGINE=STOOLAP",
+            "INSERT INTO u VALUES (1, 'a@x.com'), (2, 'b@x.com')",
             "UPDATE t SET n = 20 WHERE id = 2",
             "DELETE FROM t WHERE id = 1",
         ]:

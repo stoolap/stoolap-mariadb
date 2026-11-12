@@ -32,15 +32,14 @@ INSERT INTO d VALUES (1, '2026-04-28 12:00:00.123456');
                  f"CREATE TABLE u (id INT) ENGINE={h.engine}",
                  r"already exists")
 
-    h.section("ci-collation UNIQUE / PRIMARY KEY refused at CREATE")
+    h.section("ci-collation PRIMARY KEY refused at CREATE, UNIQUE kept")
     h.assert_err("ci VARCHAR PRIMARY KEY refused",
                  f"CREATE TABLE rfk_pk (s VARCHAR(20) PRIMARY KEY) ENGINE={h.engine}",
                  r"case-insensitive collation")
-    h.assert_err("ci VARCHAR UNIQUE refused",
-                 f"""CREATE TABLE rfk_uq (id INT NOT NULL PRIMARY KEY,
+    h.assert_ok("ci VARCHAR UNIQUE accepted",
+                f"""CREATE TABLE rfk_uq (id INT NOT NULL PRIMARY KEY,
                                        s VARCHAR(20),
-                                       UNIQUE (s)) ENGINE={h.engine}""",
-                 r"case-insensitive collation")
+                                       UNIQUE (s)) ENGINE={h.engine}""")
     h.assert_ok("_bin VARCHAR UNIQUE accepted",
                 f"""CREATE TABLE rfk_bin (id INT NOT NULL PRIMARY KEY,
                                         s VARCHAR(20) COLLATE utf8mb4_bin,
