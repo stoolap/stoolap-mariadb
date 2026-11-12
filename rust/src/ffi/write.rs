@@ -184,6 +184,35 @@ pub unsafe extern "C" fn stoolap_writes_through_sql(
     }
 }
 
+/// 1 when a foreign key (the table's own included) names `table` as
+/// parent, 0 when none does.
+///
+/// # Safety
+///
+/// `db` must be a valid `StoolapDB`, `table` a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_is_referenced(db: *mut StoolapDB, table: *const c_char) -> i32 {
+    let Some(handle) = db.as_mut() else {
+        return STOOLAP_ERROR;
+    };
+    handle.last_error = None;
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        Ok::<_, Error>(handle.session.is_referenced(table_name(table)?))
+    }));
+    match result {
+        Ok(Ok(referenced)) => referenced as i32,
+        Ok(Err(e)) => {
+            handle.set_error(&e.to_string());
+            super::error::note_error(&e);
+            STOOLAP_ERROR
+        }
+        Err(_) => {
+            handle.set_error("panic during stoolap_is_referenced");
+            STOOLAP_ERROR
+        }
+    }
+}
+
 /// Checks every row of `table` against its foreign keys: the rows a
 /// copying ALTER wrote unchecked. `STOOLAP_OK`, or the first row's
 /// violation.

@@ -148,6 +148,17 @@ bool stoolap_thd_lock_fk_parents(THD* thd, const char* child_db,
     return true;
 }
 
+bool stoolap_thd_dropped_tables(THD* thd, std::vector<std::string>* paths) {
+    if (!thd || !thd->lex || thd->lex->sql_command != SQLCOM_DROP_TABLE)
+        return false;
+    // A permanent table holds its MDL ticket; a TEMPORARY one of its name,
+    // which the DROP takes instead, holds none
+    for (const TABLE_LIST* t = thd->lex->query_tables; t; t = t->next_global)
+        if (t->mdl_request.ticket)
+            paths->push_back(file_name(t->db) + '/' + file_name(t->table_name));
+    return true;
+}
+
 bool stoolap_thd_altered_table(
     THD* thd, std::string* path,
     std::vector<std::pair<std::string, std::string>>* renames,

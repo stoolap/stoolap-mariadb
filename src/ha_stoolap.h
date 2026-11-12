@@ -29,6 +29,7 @@ public:
 
     ulonglong table_flags() const override;
     ulong index_flags(uint inx, uint part, bool all_parts) const override;
+    bool referenced_by_foreign_key() const noexcept override;
 
     uint max_supported_keys() const override { return 16; }
     uint max_supported_key_length() const override { return 1024; }

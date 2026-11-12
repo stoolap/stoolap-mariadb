@@ -801,10 +801,21 @@ ulonglong ha_stoolap::table_flags() const {
     // HA_PRIMARY_KEY_REQUIRED_FOR_{DELETE,POSITION}: our SQL builder
     // identifies rows by PK; without these flags the optimizer may strip
     // PK columns from read_set and UPDATE/DELETE would target the wrong row.
+    // HA_NO_ONLINE_ALTER: an online copying ALTER replays concurrent writes
+    // from their row events, and a direct UPDATE / DELETE writes none, so
+    // its change was lost (or a deleted row came back) in the copy.
     return HA_REC_NOT_IN_SEQ | HA_NULL_IN_KEY | HA_BINLOG_ROW_CAPABLE |
            HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
            HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
-           HA_CAN_DIRECT_UPDATE_AND_DELETE;
+           HA_CAN_DIRECT_UPDATE_AND_DELETE | HA_NO_ONLINE_ALTER;
+}
+
+bool ha_stoolap::referenced_by_foreign_key() const noexcept {
+    // REPLACE turns a duplicate row's delete + insert into an update unless
+    // a key names the table: the update would skip the keys' ON DELETE
+    // actions and restrictions. An error answers yes, the safe way.
+    StoolapDB* db = get_thd_ctx(ha_thd())->db();
+    return !db || stoolap_is_referenced(db, stoolap_table_.c_str()) != 0;
 }
 
 ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
@@ -944,16 +955,22 @@ int ha_stoolap::delete_table(const char* name) {
     const std::string flat = stoolap_table_from_path(name);
     StoolapDB* db = ddl_db();
     if (!db) return HA_ERR_OUT_OF_MEM;
-    // A parent other tables' foreign keys name is refused, as InnoDB does,
-    // but under foreign_key_checks = 0. DROP DATABASE drops its tables one
-    // by one, a parent maybe before its children: the database's own go
-    // with it.
+    // A parent other tables' foreign keys name is refused, as InnoDB does.
+    // DROP DATABASE drops its tables one by one, a parent maybe before its
+    // children: the database's own go with it. Under foreign_key_checks =
+    // 0 so do the children the DROP TABLE names; InnoDB drops the parent
+    // alone too, keeping the children's keys, which stoolap cannot keep
+    // without their table, so that is refused.
     THD* thd = ha_thd();
     const bool check_fks =
         !thd || !thd_test_options(thd, OPTION_NO_FOREIGN_KEY_CHECKS);
     std::vector<std::string> dropping;
     std::vector<const char*> dropping_names;
-    if (thd && thd_sql_command(thd) == SQLCOM_DROP_DB) {
+    std::vector<std::string> listed;
+    if (!check_fks && stoolap_thd_dropped_tables(thd, &listed)) {
+        for (const auto& path : listed)
+            dropping.push_back(stoolap_table_from_path(path.c_str()));
+    } else if (thd && thd_sql_command(thd) == SQLCOM_DROP_DB) {
         // The tables still in the database's directory, by their .frm (a
         // long name's stoolap form keeps no prefix to tell them by)
         const std::string_view path(name);
@@ -968,9 +985,9 @@ int ha_stoolap::delete_table(const char* name) {
             }
             closedir(d);
         }
-        for (const auto& t : dropping)
-            dropping_names.push_back(t.c_str());
     }
+    for (const auto& t : dropping)
+        dropping_names.push_back(t.c_str());
     if (stoolap_drop_table(db, flat.c_str(), check_fks, dropping_names.data(),
                            static_cast<int32_t>(dropping_names.size())) !=
         STOOLAP_OK) {

@@ -461,3 +461,78 @@ INSERT INTO uc3 VALUES (1, 1);
                  "INSERT INTO uc3 VALUES (3, 5)", r"\b1452\b")
     h.assert_err("and still guards the parent",
                  "DELETE FROM up WHERE id = 1", r"\b1451\b")
+
+    h.section("REPLACE of a parent row deletes it under the keys")
+    # REPLACE updates a duplicate row in place unless a key names the
+    # table; the update skipped ON DELETE CASCADE and RESTRICT.
+    h.exec_script(f"""
+CREATE TABLE rp (id INT NOT NULL PRIMARY KEY, v INT) ENGINE={h.engine};
+CREATE TABLE rc (id INT NOT NULL PRIMARY KEY, pid INT,
+  FOREIGN KEY (pid) REFERENCES rp (id) ON DELETE CASCADE) ENGINE={h.engine};
+CREATE TABLE rp2 (id INT NOT NULL PRIMARY KEY, v INT) ENGINE={h.engine};
+CREATE TABLE rc2 (id INT NOT NULL PRIMARY KEY, pid INT,
+  FOREIGN KEY (pid) REFERENCES rp2 (id)) ENGINE={h.engine};
+CREATE TABLE rs (id INT NOT NULL PRIMARY KEY, par INT,
+  FOREIGN KEY (par) REFERENCES rs (id) ON DELETE CASCADE) ENGINE={h.engine};
+INSERT INTO rp VALUES (1, 1), (2, 2);
+INSERT INTO rc VALUES (10, 1), (20, 2);
+INSERT INTO rp2 VALUES (1, 1);
+INSERT INTO rc2 VALUES (10, 1);
+INSERT INTO rs VALUES (1, NULL), (2, 1);
+""")
+    h.assert_ok("REPLACE a parent row", "REPLACE INTO rp VALUES (1, 100)")
+    h.assert_scalar("the parent row is replaced",
+                    "SELECT v FROM rp WHERE id = 1", "100")
+    h.assert_scalar("ON DELETE CASCADE took its child",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM rc", "20")
+    h.assert_err("a restricting key refuses the REPLACE",
+                 "REPLACE INTO rp2 VALUES (1, 100)", r"\b1451\b")
+    h.assert_scalar("and leaves the parent row",
+                    "SELECT v FROM rp2 WHERE id = 1", "1")
+    h.assert_ok("REPLACE a self-referenced row",
+                "REPLACE INTO rs VALUES (1, NULL)")
+    h.assert_scalar("its own key took the row naming it",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM rs", "1")
+
+    h.section("DROP of a parent under foreign_key_checks = 0")
+    # A DROP ... CASCADE took the child's key for good; stoolap keeps no
+    # key naming a missing table, so a parent whose child stays is kept.
+    h.exec_script(f"""
+CREATE TABLE dp (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+CREATE TABLE dc (id INT NOT NULL PRIMARY KEY, pid INT,
+  FOREIGN KEY (pid) REFERENCES dp (id)) ENGINE={h.engine};
+INSERT INTO dp VALUES (1);
+INSERT INTO dc VALUES (1, 1);
+""")
+    h.assert_ok("foreign_key_checks off", "SET foreign_key_checks = 0")
+    h.assert_err("a parent whose child stays is refused",
+                 "DROP TABLE dp", r"\b1451\b")
+    h.assert_ok("foreign_key_checks back on", "SET foreign_key_checks = 1")
+    h.assert_scalar("the parent stays", "SELECT COUNT(*) FROM dp", "1")
+    h.assert_err("and so does the child's key",
+                 "INSERT INTO dc VALUES (2, 99)", r"\b1452\b")
+    h.assert_ok("foreign_key_checks off", "SET foreign_key_checks = 0")
+    h.assert_ok("listed with its child, the parent goes first",
+                "DROP TABLE dp, dc")
+    h.assert_ok("foreign_key_checks back on", "SET foreign_key_checks = 1")
+    h.assert_scalar("both are gone",
+                    "SELECT COUNT(*) FROM information_schema.tables "
+                    f"WHERE table_schema = '{h.db}' "
+                    "AND table_name IN ('dp', 'dc')", "0")
+
+    h.section("A TEMPORARY table of a child's name is not the child")
+    h.exec_script(f"""
+CREATE TABLE tp (id INT NOT NULL PRIMARY KEY) ENGINE={h.engine};
+CREATE TABLE tc (id INT NOT NULL PRIMARY KEY, pid INT,
+  FOREIGN KEY (pid) REFERENCES tp (id)) ENGINE={h.engine};
+INSERT INTO tp VALUES (1);
+INSERT INTO tc VALUES (1, 1);
+""")
+    h.assert_ok("a TEMPORARY tc hides the child",
+                "CREATE TEMPORARY TABLE tc (id INT) ENGINE=MEMORY")
+    h.assert_ok("foreign_key_checks off", "SET foreign_key_checks = 0")
+    h.assert_err("dropping the parent with the TEMPORARY tc is refused",
+                 "DROP TABLE tp, tc", r"\b1451\b")
+    h.assert_ok("foreign_key_checks back on", "SET foreign_key_checks = 1")
+    h.assert_scalar("the child keeps its row", "SELECT COUNT(*) FROM tc", "1")
+    h.assert_scalar("and the parent its", "SELECT COUNT(*) FROM tp", "1")
