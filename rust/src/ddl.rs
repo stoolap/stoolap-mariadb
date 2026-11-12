@@ -469,10 +469,12 @@ pub fn rename_column(session: &Session, table: &str, from: &str, to: &str) -> Re
 }
 
 /// Drops `table` if it is there. A parent other tables' foreign keys name
-/// is refused, as InnoDB refuses it, unless `check_fks` is false; the
-/// children among `dropping` (DROP DATABASE: the database's tables) go
-/// with it, dropped first, each with its own children among them: Stoolap
-/// refuses to drop a table whose rows another table's rows reference.
+/// is refused, as InnoDB refuses it (and, unlike InnoDB, when `check_fks`
+/// is false too: stoolap keeps no key naming a missing table); the
+/// children among `dropping` (DROP DATABASE: the database's tables; under
+/// foreign_key_checks = 0, a DROP TABLE's) go with it, dropped first, each
+/// with its own children among them: Stoolap refuses to drop a table whose
+/// rows another table's rows reference.
 pub fn drop_table(
     session: &Session,
     table: &str,
@@ -499,20 +501,31 @@ fn drop_tree(
         }
         if dropping.contains(&child) {
             drop_tree(session, &child, check_fks, dropping, dropped)?;
-        } else if check_fks {
+        } else {
+            // Unchecked, InnoDB keeps the child's key naming no table;
+            // stoolap cannot, and a DROP ... CASCADE would take the key for
+            // good. A key error (not NotSupported) keeps MariaDB from
+            // dropping the .frm anyway
+            let message = if check_fks {
+                format!("cannot drop table '{table}': still referenced by table '{child}'")
+            } else {
+                format!(
+                    "cannot drop table '{table}' under foreign_key_checks = 0: a FOREIGN \
+                     KEY of table '{child}' names it, which stoolap cannot keep without \
+                     the table; drop '{child}' first or in the same statement"
+                )
+            };
             return Err(Error::foreign_key_violation(
                 &child,
                 column,
                 table,
                 parent_column,
-                format!("cannot drop table '{table}': still referenced by table '{child}'"),
+                message,
             ));
         }
     }
-    // Unchecked, the other tables' keys into it go with it
-    let cascade = if check_fks { "" } else { " CASCADE" };
     session.run(
-        &format!("DROP TABLE IF EXISTS {}{cascade}", quote(table)),
+        &format!("DROP TABLE IF EXISTS {}", quote(table)),
         ParamVec::new(),
     )?;
     Ok(())

@@ -483,6 +483,12 @@ int32_t stoolap_end_statement(StoolapDB* db, int32_t commit);
 int32_t stoolap_writes_through_sql(StoolapDB* db, const char* table);
 
 /**
+ * 1 when a foreign key (the table's own included) names `table` as parent,
+ * 0 when none does; STOOLAP_ERROR.
+ */
+int32_t stoolap_is_referenced(StoolapDB* db, const char* table);
+
+/**
  * Check every row of `table` against its foreign keys (the rows a copying
  * ALTER wrote `unchecked`): STOOLAP_OK, or the first violation.
  */

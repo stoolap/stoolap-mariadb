@@ -40,6 +40,10 @@ bool stoolap_thd_altered_table(
     std::vector<std::pair<std::string, std::string>>* renames,
     std::vector<std::string>* dropped);
 
+// The tables a DROP TABLE statement names, by their file paths
+// ("db/table"); false for any other statement.
+bool stoolap_thd_dropped_tables(THD* thd, std::vector<std::string>* paths);
+
 bool stoolap_thd_foreign_keys(THD* thd, const char* child_db,
                               size_t child_db_length,
                               std::vector<StoolapThdForeignKey>* out);

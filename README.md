@@ -296,6 +296,14 @@ the list stays current.
   takes the keys to the old table
   ([stoolap#987](https://github.com/stoolap/stoolap/issues/987)). An
   ALTER done in place keeps the table, and runs.
+- **A parent whose child stays is not dropped under
+  `foreign_key_checks = 0`** (1451). InnoDB drops it and keeps the child's
+  key naming no table, which stoolap cannot keep. Listed with its children
+  in one `DROP TABLE`, it is dropped.
+- **A copying `ALTER TABLE` does not run online**: `LOCK=NONE` is refused
+  (1846), and writes wait for the ALTER. MariaDB replays the writes made
+  during an online ALTER from their row events, which a direct UPDATE or
+  DELETE does not write.
 - **A row whose FOREIGN KEY names that row itself** is deleted, or its
   key moved together with the value naming it, as that leaves no row
   naming a missing one; InnoDB refuses both (1451), also under RESTRICT.

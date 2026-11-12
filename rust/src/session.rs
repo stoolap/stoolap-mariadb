@@ -318,6 +318,15 @@ impl Session {
                 .is_empty())
     }
 
+    /// Whether a foreign key (its own included) names `table` as parent
+    pub fn is_referenced(&self, table: &str) -> bool {
+        !self
+            .exec
+            .engine()
+            .find_referencing_fks(&table.to_lowercase())
+            .is_empty()
+    }
+
     /// `table`'s column names, in order
     pub fn column_names(&self, table: &str) -> Result<Vec<String>> {
         use stoolap::storage::traits::Engine;
