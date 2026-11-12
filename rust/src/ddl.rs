@@ -486,8 +486,10 @@ fn drop_tree(
             ));
         }
     }
+    // Unchecked, the other tables' keys into it go with it
+    let cascade = if check_fks { "" } else { " CASCADE" };
     session.run(
-        &format!("DROP TABLE IF EXISTS {}", quote(table)),
+        &format!("DROP TABLE IF EXISTS {}{cascade}", quote(table)),
         ParamVec::new(),
     )?;
     Ok(())
