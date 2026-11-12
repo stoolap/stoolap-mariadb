@@ -199,6 +199,14 @@ inline std::string stoolap_column_name(std::string_view name) {
     return out;
 }
 
+// Stoolap's name for the collation key column of the column MariaDB names
+// `name` (stoolap_types.h, collation_key): its own name and a character
+// past the Basic Multilingual Plane, which no MariaDB identifier holds
+// (U+F0001; stoolap_column_name takes U+F0000)
+inline std::string stoolap_key_column_name(std::string_view name) {
+    return stoolap_column_name(name) + "\xF3\xB0\x80\x81";
+}
+
 // Hot-path read with memory_order_relaxed; bool read + branch, free off.
 extern std::atomic<bool> g_perf_trace_enabled;
 

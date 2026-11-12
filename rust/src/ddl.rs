@@ -153,6 +153,29 @@ pub fn create_table(
     foreign_keys: &[ForeignKey],
     if_not_exists: bool,
 ) -> Result<Vec<String>> {
+    // A column kept by its collation key (the plugin's key column beside
+    // it) is one stoolap's ON UPDATE CASCADE / SET NULL / SET DEFAULT and
+    // ON DELETE SET NULL / SET DEFAULT would write without its key
+    for fk in foreign_keys {
+        let key = format!("{}{KEY_COLUMN_SUFFIX}", fk.column).to_lowercase();
+        let writes = |action| {
+            matches!(
+                action,
+                STOOLAP_FK_CASCADE | STOOLAP_FK_SET_NULL | STOOLAP_FK_SET_DEFAULT
+            )
+        };
+        if columns.iter().any(|c| c.name.to_lowercase() == key)
+            && (writes(fk.on_update)
+                || (fk.on_delete != STOOLAP_FK_CASCADE && writes(fk.on_delete)))
+        {
+            return Err(Error::NotSupported(format!(
+                "column '{}' has a case-insensitive UNIQUE key, which stoolap keeps by \
+                 collation keys its FOREIGN KEY actions do not write: give the key \
+                 RESTRICT or NO ACTION (ON DELETE CASCADE too), or the column a _bin collation",
+                fk.column
+            )));
+        }
+    }
     let column_name = |i: usize| -> Result<&str> {
         columns
             .get(i)
@@ -521,6 +544,10 @@ pub struct ForeignKey {
     pub on_delete: i32,
     pub on_update: i32,
 }
+
+/// The tail of the plugin's name for a column's collation key column
+/// (stoolap_key_column_name in src/stoolap_bridge.h)
+pub const KEY_COLUMN_SUFFIX: char = '\u{F0001}';
 
 /// MariaDB's ON DELETE / ON UPDATE actions (enum_fk_option)
 pub const STOOLAP_FK_UNDEF: i32 = 0;

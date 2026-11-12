@@ -193,6 +193,18 @@ private:
 
     std::string stoolap_table_;
 
+    // The _ci fields stoolap keeps a collation key column for, the n-th's
+    // after the table's own (stoolap_mariadb::collation_keyed_fields), the
+    // key of the empty string for each (collation_key), and the stoolap
+    // table's column count.
+    std::vector<uint> keyed_;
+    std::vector<std::string> key_pads_;
+    int32_t stoolap_columns() const {
+        return static_cast<int32_t>(table->s->fields + keyed_.size());
+    }
+    // `f`'s key column, the field it names in a write's encode callback
+    StoolapField key_field(uint n);
+
     // get_dup_key() resets errkey then calls info(HA_STATUS_ERRKEY); we
     // stash the most recent dup key here. Reset to MAX_KEY on each write.
     uint last_dup_key_ = MAX_KEY;
@@ -241,6 +253,10 @@ private:
     // into (the start bound takes record[1]).
     std::vector<StoolapField> key_parts_;
     uint key_parts_index_ = MAX_KEY;
+    // The parts an exact lookup binds on their collation key column
+    // (index_read_map), and those key_parts_ was built for
+    uint32_t bound_keyed_ = 0;
+    uint32_t key_parts_keyed_ = 0;
     const std::vector<StoolapField>& index_parts();
     std::vector<uchar> bound_rec_;
     uchar* bound_record();

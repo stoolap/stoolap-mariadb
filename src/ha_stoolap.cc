@@ -483,7 +483,9 @@ int32_t stoolap_column_kind(const Field* f) {
     }
 }
 
-// Returns the offending field name when any PK/UNIQUE part is a ci string
+// Returns the offending field name when a PRIMARY KEY part, or a UNIQUE
+// part stoolap keeps no collation key column for (collation_keyed_type),
+// is a string of a collation that does not compare its bytes
 // (stoolap's TEXT equality is byte-wise; ci_general would accept 'a'/'A').
 std::string ci_string_unique_part(TABLE* form) {
     auto is_ci_string = [](Field* f) -> bool {
@@ -509,7 +511,9 @@ std::string ci_string_unique_part(TABLE* form) {
         if (!(k.flags & HA_NOSAME)) continue;  // PRIMARY and UNIQUE only
         for (uint j = 0; j < k.user_defined_key_parts; ++j) {
             Field* f = k.key_part[j].field;
-            if (is_ci_string(f)) {
+            if (is_ci_string(f) &&
+                (i == form->s->primary_key ||
+                 !stoolap_mariadb::collation_keyed_type(f))) {
                 return std::string(f->field_name.str, f->field_name.length);
             }
         }
@@ -557,11 +561,13 @@ bool refuse_unenforceable_keys(TABLE* form) {
     // duplicates is worse than failing at CREATE.
     if (std::string bad = ci_string_unique_part(form); !bad.empty()) {
         my_printf_error(ER_GET_ERRMSG,
-                        "stoolap: PRIMARY KEY / UNIQUE on column '%s' uses "
-                        "a case-insensitive collation, but stoolap compares "
-                        "TEXT bytewise. Use a `_bin` collation (e.g. "
-                        "utf8mb4_bin) on the column, or drop the "
-                        "constraint.",
+                        "stoolap: PRIMARY KEY, or UNIQUE on a BLOB / TEXT, "
+                        "a CHAR under a NO PAD collation or under a Czech or "
+                        "big5 collation, on column '%s' uses a "
+                        "collation that does not compare bytes (such as a "
+                        "case-insensitive one), but stoolap compares TEXT "
+                        "bytewise. Use a `_bin` collation (e.g. utf8mb4_bin) "
+                        "on the column, or a UNIQUE key on a VARCHAR.",
                         MYF(0), bad.c_str());
         return true;
     }
@@ -595,10 +601,15 @@ bool refuse_unsupported_columns(TABLE* form) {
 int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
                          bool if_not_exists, bool with_fks, bool temporary,
                          const char* what) {
+    // After the table's own columns, one of collation keys for each _ci
+    // column a UNIQUE key names: the key is kept on it. `columns` points
+    // into `names`, which never grows past its reserve
+    const std::vector<uint> keyed =
+        stoolap_mariadb::collation_keyed_fields(form->s);
     std::vector<StoolapColumnDef> columns;
-    columns.reserve(form->s->fields);
+    columns.reserve(form->s->fields + keyed.size());
     std::vector<std::string> names;
-    names.reserve(form->s->fields);
+    names.reserve(form->s->fields + keyed.size());
     for (uint i = 0; i < form->s->fields; ++i) {
         const Field* f = form->field[i];
         const int32_t kind = stoolap_column_kind(f);
@@ -613,16 +624,29 @@ int create_stoolap_table(StoolapDB* db, const std::string& tbl, TABLE* form,
         columns.push_back({names.back().c_str(), kind, f->real_maybe_null(),
                            (f->flags & AUTO_INCREMENT_FLAG) != 0});
     }
+    std::vector<int32_t> key_column(form->s->fields, -1);
+    for (size_t n = 0; n < keyed.size(); ++n) {
+        const Field* f = form->field[keyed[n]];
+        key_column[keyed[n]] = static_cast<int32_t>(form->s->fields + n);
+        names.push_back(stoolap_mariadb::stoolap_key_column_name(
+            std::string_view(f->field_name.str, f->field_name.length)));
+        columns.push_back({names.back().c_str(), STOOLAP_COL_TEXT,
+                           f->real_maybe_null(), false});
+    }
     std::vector<std::vector<int32_t>> parts(form->s->keys);
     std::vector<StoolapKeyDef> keys;
     for (uint i = 0; i < form->s->keys; ++i) {
         const KEY& k = form->key_info[i];
-        for (uint j = 0; j < k.user_defined_key_parts; ++j)
-            parts[i].push_back(
-                static_cast<int32_t>(k.key_part[j].field->field_index));
         const int32_t kind = i == form->s->primary_key ? STOOLAP_KEYDEF_PRIMARY
                              : (k.flags & HA_NOSAME)   ? STOOLAP_KEYDEF_UNIQUE
                                                        : STOOLAP_KEYDEF_INDEX;
+        for (uint j = 0; j < k.user_defined_key_parts; ++j) {
+            const uint f = k.key_part[j].field->field_index;
+            parts[i].push_back(kind == STOOLAP_KEYDEF_UNIQUE &&
+                                       key_column[f] >= 0
+                                   ? key_column[f]
+                                   : static_cast<int32_t>(f));
+        }
         keys.push_back({k.name.str, parts[i].data(),
                         static_cast<int32_t>(parts[i].size()), kind});
     }
@@ -840,6 +864,8 @@ StoolapDB* ha_stoolap::db_ensure() {
 
 int ha_stoolap::open(const char* name, int /*mode*/, uint /*test_if_locked*/) {
     stoolap_table_ = stoolap_table_from_path(name);
+    keyed_ = stoolap_mariadb::collation_keyed_fields(table->s);
+    key_pads_.assign(keyed_.size(), std::string());
 
     // Reconcile: MariaDB may have a .frm while stoolap is missing the table
     // (fresh datadir, wipe, DSN switch). CREATE TABLE IF NOT EXISTS no-ops
@@ -1065,6 +1091,10 @@ bool plan_inplace(TABLE* table, TABLE* altered, Alter_inplace_info* info,
         plan->op = STOOLAP_ALTER_DROP_COLUMN;
         plan->name = stoolap_column_name(std::string_view(n.str, n.length));
     }
+    // The collation key columns follow the table's own, named for theirs:
+    // a column change copies (the in-place ALTERs keep the UNIQUE keys)
+    if (plan->op && !stoolap_mariadb::collation_keyed_fields(table->s).empty())
+        return false;
     for (uint k = 0; k < info->index_drop_count; ++k)
         plan->drop_keys.push_back(info->index_drop_buffer[k]);
     for (uint k = 0; k < info->index_add_count; ++k)
@@ -1295,7 +1325,14 @@ struct RecordSource {
     const uchar* at;
     int err = 0;
     std::string holder;
+    // A field past the table's names the collation key column of
+    // keyed[field - fields]
+    const std::vector<uint>* keyed = nullptr;
+    std::vector<std::string>* pads = nullptr;
+    std::string key_buf;
     explicit RecordSource(TABLE* t) : table(t), at(t->record[0]) {}
+    RecordSource(TABLE* t, std::vector<uint>* k, std::vector<std::string>* p)
+        : table(t), at(t->record[0]), keyed(k), pads(p) {}
     ~RecordSource() {
         move_fields(table, static_cast<my_ptrdiff_t>(table->record[0] - at));
     }
@@ -1307,6 +1344,22 @@ int32_t encode_cell(void* ctx, int32_t field, const uint8_t* record,
     if (record != src->at) {
         move_fields(src->table, static_cast<my_ptrdiff_t>(record - src->at));
         src->at = record;
+    }
+    const uint fields = src->table->s->fields;
+    if (static_cast<uint>(field) >= fields && src->keyed) {
+        const size_t n = static_cast<uint>(field) - fields;
+        Field* f = src->table->field[(*src->keyed)[n]];
+        if (f->is_null()) {
+            out->value_type = STOOLAP_TYPE_NULL;
+        } else if (!stoolap_mariadb::collation_key(f, src->holder, src->key_buf,
+                                                   (*src->pads)[n])) {
+            src->err = HA_ERR_TO_BIG_ROW;
+        } else {
+            out->value_type = STOOLAP_TYPE_TEXT;
+            out->v.text.ptr = src->holder.data();
+            out->v.text.len = static_cast<int64_t>(src->holder.size());
+        }
+        return src->err;
     }
     if (!extract_field(src->table->field[field], *out, src->holder))
         src->err = HA_ERR_UNSUPPORTED;
@@ -1387,9 +1440,9 @@ int ha_stoolap::flush_bulk_buffer(bool partial) {
     StoolapDB* db = direct_write_db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
     int64_t affected = 0;
-    const int rc = stoolap_insert_buffer(
-        db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
-        row_buffer_.get(), alter_copy_, &affected);
+    const int rc =
+        stoolap_insert_buffer(db, stoolap_table_.c_str(), stoolap_columns(),
+                              row_buffer_.get(), alter_copy_, &affected);
     cur_row_id_valid_ = false;
     if (rc != STOOLAP_OK) {
         invalidate_records_cache();
@@ -1429,7 +1482,7 @@ int ha_stoolap::write_row(const uchar* buf) {
     }
 
     const auto& fields = insert_fields();
-    RecordSource src(table);
+    RecordSource src(table, &keyed_, &key_pads_);
     if (bulk_active_) {
         const int64_t n = stoolap_row_buffer_add(
             row_buffer_.get(), fields.data(),
@@ -1455,9 +1508,9 @@ int ha_stoolap::write_row(const uchar* buf) {
     if (!db) return HA_ERR_INTERNAL_ERROR;
     int64_t affected = 0;
     const int rc = stoolap_insert_record(
-        db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
-        fields.data(), static_cast<int32_t>(fields.size()), buf, &encode_cell,
-        &src, alter_copy_, &affected);
+        db, stoolap_table_.c_str(), stoolap_columns(), fields.data(),
+        static_cast<int32_t>(fields.size()), buf, &encode_cell, &src,
+        alter_copy_, &affected);
     cur_row_id_valid_ = false;
     if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "INSERT");
     apply_count_delta(affected);
@@ -1466,11 +1519,26 @@ int ha_stoolap::write_row(const uchar* buf) {
 
 // Every field, as a direct insert reads the record.
 const std::vector<StoolapField>& ha_stoolap::insert_fields() {
-    if (write_fields_.empty())
+    if (write_fields_.empty()) {
         for (uint i = 0; i < table->s->fields; ++i)
             write_fields_.push_back(stoolap_mariadb::record_field(
                 table, i, static_cast<int32_t>(i)));
+        for (uint n = 0; n < keyed_.size(); ++n)
+            write_fields_.push_back(key_field(n));
+    }
     return write_fields_;
+}
+
+// The collation key column of keyed_[n]: it reads that field's place in
+// the record (a write sees whether it changed) and its value comes from
+// the encode callback, as field `fields + n`.
+StoolapField ha_stoolap::key_field(uint n) {
+    const uint at = static_cast<uint>(table->s->fields + n);
+    StoolapField d = stoolap_mariadb::record_field(table, keyed_[n],
+                                                   static_cast<int32_t>(at));
+    d.kind = STOOLAP_FIELD_STORE;
+    d.field = static_cast<int32_t>(at);
+    return d;
 }
 
 // The fields write_set names, as a direct update reads the records.
@@ -1487,6 +1555,9 @@ const std::vector<StoolapField>& ha_stoolap::refresh_update_fields() {
         if (w[i / 32] & (uint32_t(1) << (i % 32)))
             update_fields_.push_back(stoolap_mariadb::record_field(
                 table, i, static_cast<int32_t>(i)));
+    for (uint n = 0; n < keyed_.size(); ++n)
+        if (w[keyed_[n] / 32] & (uint32_t(1) << (keyed_[n] % 32)))
+            update_fields_.push_back(key_field(n));
     update_words_ = w;
     return update_fields_;
 }
@@ -1583,13 +1654,12 @@ int ha_stoolap::update_row(const uchar* old_data, const uchar* new_data) {
     const auto& read = refresh_checked_fields();
     StoolapDB* db = direct_write_db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
-    RecordSource src(table);
+    RecordSource src(table, &keyed_, &key_pads_);
     int64_t affected = 0;
     const int rc = stoolap_update_record(
-        db, stoolap_table_.c_str(), static_cast<int32_t>(table->s->fields),
-        cur_row_id_, cur_row_id_valid_, fields.data(),
-        static_cast<int32_t>(fields.size()), keys.data(),
-        static_cast<int32_t>(keys.size()), read.data(),
+        db, stoolap_table_.c_str(), stoolap_columns(), cur_row_id_,
+        cur_row_id_valid_, fields.data(), static_cast<int32_t>(fields.size()),
+        keys.data(), static_cast<int32_t>(keys.size()), read.data(),
         static_cast<int32_t>(read.size()), old_data, new_data, &encode_cell,
         &src, &affected);
     if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "UPDATE");
@@ -1605,7 +1675,7 @@ int ha_stoolap::delete_row(const uchar* buf) {
     const auto& read = refresh_checked_fields();
     StoolapDB* db = direct_write_db();
     if (!db) return HA_ERR_INTERNAL_ERROR;
-    RecordSource src(table);
+    RecordSource src(table, &keyed_, &key_pads_);
     int64_t affected = 0;
     const int rc = stoolap_delete_record(
         db, stoolap_table_.c_str(), cur_row_id_, cur_row_id_valid_, keys.data(),
@@ -1835,7 +1905,6 @@ void ha_stoolap::refresh_projection() {
 int ha_stoolap::open_read(const StoolapKeyBound* bounds, int32_t nbounds,
                           const int32_t* order, int32_t norder, bool desc) {
     refresh_projection();
-    const uint fields = table->s->fields;
 
     auto* ctx = get_thd_ctx(ha_thd());
     StoolapDB* db = ctx->db();
@@ -1852,10 +1921,10 @@ int ha_stoolap::open_read(const StoolapKeyBound* bounds, int32_t nbounds,
     stoolap_mariadb::g_stats.buffered_scans.fetch_add(
         1, std::memory_order_relaxed);
     const std::vector<StoolapField>* keys = nbounds ? &index_parts() : nullptr;
-    RecordSource src(table);
+    RecordSource src(table, &keyed_, &key_pads_);
     const int rc = stoolap_read(
-        db, stoolap_table_.c_str(), static_cast<int32_t>(fields),
-        read_fields_.data(), static_cast<int32_t>(read_fields_.size()),
+        db, stoolap_table_.c_str(), stoolap_columns(), read_fields_.data(),
+        static_cast<int32_t>(read_fields_.size()),
         keys ? keys->data() : nullptr,
         keys ? static_cast<int32_t>(keys->size()) : 0, bounds, nbounds, order,
         norder, flags, &encode_cell, &src, cursor);
@@ -1872,16 +1941,23 @@ int ha_stoolap::open_read(const StoolapKeyBound* bounds, int32_t nbounds,
 }
 
 // The active index's parts, as a read's bounds describe them.
+// A part in bound_keyed_ is its field's collation key column.
 const std::vector<StoolapField>& ha_stoolap::index_parts() {
-    if (key_parts_index_ != active_index) {
+    if (key_parts_index_ != active_index || key_parts_keyed_ != bound_keyed_) {
         key_parts_.clear();
         const KEY& ki = table->key_info[active_index];
         for (uint i = 0; i < ki.user_defined_key_parts; ++i) {
             const uint f = ki.key_part[i].fieldnr - 1;
-            key_parts_.push_back(stoolap_mariadb::record_field(
-                table, f, static_cast<int32_t>(f)));
+            uint n = 0;
+            while (n < keyed_.size() && keyed_[n] != f)
+                ++n;
+            key_parts_.push_back(bound_keyed_ & (uint32_t(1) << i)
+                                     ? key_field(n)
+                                     : stoolap_mariadb::record_field(
+                                           table, f, static_cast<int32_t>(f)));
         }
         key_parts_index_ = active_index;
+        key_parts_keyed_ = bound_keyed_;
     }
     return key_parts_;
 }
@@ -1953,8 +2029,7 @@ int ha_stoolap::rnd_pos(uchar* buf, uchar* pos) {
         if (!db) return HA_ERR_INTERNAL_ERROR;
         StoolapCursor* cursor = read_cursor();
         if (!cursor) return HA_ERR_OUT_OF_MEM;
-        if (stoolap_read_row(db, stoolap_table_.c_str(),
-                             static_cast<int32_t>(table->s->fields),
+        if (stoolap_read_row(db, stoolap_table_.c_str(), stoolap_columns(),
                              read_fields_.data(),
                              static_cast<int32_t>(read_fields_.size()), id,
                              cursor) != STOOLAP_OK) {
@@ -2114,6 +2189,22 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
         }
     }
 
+    // A UNIQUE key's _ci part is looked up by its collation key, equal
+    // for the values the collation holds equal (collation_key): no filter
+    if (find_flag == HA_READ_KEY_EXACT && !trust_bin &&
+        active_index != table->s->primary_key && (key_info.flags & HA_NOSAME))
+        for (uint i = 0; i < nparts; ++i) {
+            const KEY_PART_INFO& kp = key_info.key_part[i];
+            if (!(filter_mask & (uint32_t(1) << i)) ||
+                (kp.key_part_flag & HA_PART_KEY_SEG))
+                continue;
+            for (uint n = 0; n < keyed_.size(); ++n)
+                if (keyed_[n] == kp.field->field_index) {
+                    filter_mask &= ~(uint32_t(1) << i);
+                    bound_keyed_ |= uint32_t(1) << i;
+                }
+        }
+
     // Order when the caller wants sorted rows or reads backward, except
     // for an exact lookup bound by a unique key (one row at most).
     const bool exact_unique_lookup =
@@ -2142,9 +2233,11 @@ int ha_stoolap::index_read_map(uchar* buf, const uchar* key,
                                 filter_mask,
                                 pad_mask,
                                 STOOLAP_BOUND_KEY};
-    if (int err = open_read(&bound, 1, ir_order_.data(),
-                            static_cast<int32_t>(ir_order_.size()), desc))
-        return err;
+    const int read_err =
+        open_read(&bound, 1, ir_order_.data(),
+                  static_cast<int32_t>(ir_order_.size()), desc);
+    bound_keyed_ = 0;
+    if (read_err) return read_err;
 
     if (filter_mask) {
         key_filter_active_ = true;
