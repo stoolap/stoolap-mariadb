@@ -823,16 +823,26 @@ ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
     // byte-compare matches MariaDB's expected order.
     // ci string parts: drop everything (return 0) so the optimizer falls
     // back to a full scan where MariaDB applies its own collation per row.
-    // _bin string parts: full flags (byte compare agrees).
+    // _bin string parts: full flags when NO PAD (byte compare agrees).
+    // DESC parts and BIT(64): drop everything (stoolap's order differs).
     // DECIMAL/ENUM/SET: drop everything; ref access would build numeric-vs-
     // text predicates against stoolap's TEXT storage.
     // HA_KEY_SCAN_NOT_ROR disables index_merge_intersect (our scans aren't
     // in rowid order; we have no rowid concept).
     if (inx < table_share->keys &&
         part < table_share->key_info[inx].user_defined_key_parts) {
-        Field* f = table_share->key_info[inx].key_part[part].field;
+        const KEY_PART_INFO& kp = table_share->key_info[inx].key_part[part];
+        // A DESC part: MariaDB reads the index expecting it descending,
+        // and stoolap's index ascends
+        if (kp.key_part_flag & HA_REVERSE_SORT) return 0;
+        Field* f = kp.field;
         if (f) {
             switch (f->real_type()) {
+                case MYSQL_TYPE_BIT:
+                    // A BIT(64) with its top bit set is a negative i64 in
+                    // stoolap, ordered before the others
+                    if (f->field_length == 64) return 0;
+                    break;
                 case MYSQL_TYPE_VARCHAR:
                 case MYSQL_TYPE_VAR_STRING:
                 case MYSQL_TYPE_STRING:
@@ -847,7 +857,10 @@ ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
                         !stoolap_mariadb::hex_keeps_order(f))
                         return 0;
                     CHARSET_INFO* cs = f->charset();
-                    if (cs && (cs->state & MY_CS_BINSORT)) {
+                    // A PAD SPACE one compares 'a' as 'a ', after 'a\t';
+                    // stoolap's index orders it by byte, before
+                    if (cs && (cs->state & MY_CS_BINSORT) &&
+                        (cs == &my_charset_bin || (cs->state & MY_CS_NOPAD))) {
                         return HA_READ_NEXT | HA_READ_RANGE | HA_READ_ORDER |
                                HA_KEY_SCAN_NOT_ROR;
                     }
