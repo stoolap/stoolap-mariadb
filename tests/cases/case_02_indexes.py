@@ -430,3 +430,37 @@ INSERT INTO ixs VALUES (1, 'a'), (2, 'a\\t'), (3, 'b'), (4, 'a\\n');
                 "UPDATE ixs SET id = id + 10 ORDER BY v LIMIT 1")
     h.assert_scalar("updates the first row",
                     "SELECT GROUP_CONCAT(id ORDER BY id) FROM ixs", "1,3,4,12")
+    # A range over a key with a DESC or BIT(64) part past the first: its
+    # bounds hold MariaDB's order, (1,5) to (2,1) for b DESC, so stoolap
+    # cannot bound by them.
+    h.exec_script(f"""
+CREATE TABLE ixc (id INT NOT NULL PRIMARY KEY, a INT, b INT, v BIT(64),
+                  KEY kd (a, b DESC), KEY kb (a, v))
+    ENGINE={h.engine};
+INSERT INTO ixc VALUES (1, 1, 1, 3), (2, 1, 5, 0xFFFFFFFFFFFFFFF0),
+    (3, 2, 1, 3), (4, 2, 5, 0xFFFFFFFFFFFFFFF0), (5, 1, 3, 4);
+""")
+    h.assert_scalar("(a, b DESC): a range with b's values",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ixc FORCE INDEX (kd) "
+                    "WHERE a BETWEEN 1 AND 2 AND b IN (1, 5) FOR UPDATE",
+                    "1,2,3,4")
+    h.assert_scalar("(a, BIT(64)): a range with v's values",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ixc FORCE INDEX (kb) "
+                    "WHERE a BETWEEN 1 AND 2 "
+                    "AND v IN (3, 0xFFFFFFFFFFFFFFF0) FOR UPDATE",
+                    "1,2,3,4")
+    # MariaDB reads equalities through these keys too: none may offer an
+    # intersection by row id order, which stoolap's scans do not keep.
+    h.exec_script(f"""
+CREATE TABLE ixr (id INT NOT NULL PRIMARY KEY, x INT, y BIT(64),
+                  KEY kx (x DESC), KEY ky (y))
+    ENGINE={h.engine};
+INSERT INTO ixr VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, 2, 2);
+""")
+    h.assert_eq("no rowid-ordered scan on a DESC or BIT(64) key", "[false, false]",
+                h.sql_with_session(
+                    ["SET optimizer_trace = 'enabled=on'",
+                     "SELECT COUNT(*) FROM ixr FORCE INDEX (kx, ky) "
+                     "WHERE x = 1 AND y = 1 FOR UPDATE"],
+                    "SELECT JSON_EXTRACT(trace, '$**.rowid_ordered') "
+                    "FROM information_schema.optimizer_trace"))
