@@ -484,9 +484,9 @@ int32_t stoolap_column_kind(const Field* f) {
 }
 
 // Returns the offending field name when a PRIMARY KEY part, or a UNIQUE
-// part stoolap keeps no collation key column for (a BLOB / TEXT), is a ci
-// string (stoolap's TEXT equality is byte-wise; ci_general would accept
-// 'a'/'A').
+// part stoolap keeps no collation key column for (collation_keyed_type),
+// is a string of a collation that does not compare its bytes
+// (stoolap's TEXT equality is byte-wise; ci_general would accept 'a'/'A').
 std::string ci_string_unique_part(TABLE* form) {
     auto is_ci_string = [](Field* f) -> bool {
         if (!f || !f->has_charset()) return false;
@@ -562,10 +562,12 @@ bool refuse_unenforceable_keys(TABLE* form) {
     if (std::string bad = ci_string_unique_part(form); !bad.empty()) {
         my_printf_error(ER_GET_ERRMSG,
                         "stoolap: PRIMARY KEY, or UNIQUE on a BLOB / TEXT, "
-                        "on column '%s' uses a case-insensitive collation, "
-                        "but stoolap compares TEXT bytewise. Use a `_bin` "
-                        "collation (e.g. utf8mb4_bin) on the column, or a "
-                        "UNIQUE key on a VARCHAR.",
+                        "a CHAR under a NO PAD collation or under a Czech or "
+                        "big5 collation, on column '%s' uses a "
+                        "collation that does not compare bytes (such as a "
+                        "case-insensitive one), but stoolap compares TEXT "
+                        "bytewise. Use a `_bin` collation (e.g. utf8mb4_bin) "
+                        "on the column, or a UNIQUE key on a VARCHAR.",
                         MYF(0), bad.c_str());
         return true;
     }

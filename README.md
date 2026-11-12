@@ -211,7 +211,7 @@ Tables created by an older build of the plugin must be re-created.
 | `PRIMARY KEY`, `UNIQUE`, single-column or composite | Yes |
 | `KEY` / `CREATE INDEX`, single-column or composite | Yes (one Stoolap index over all parts) |
 | `UNIQUE` on a case-insensitive collation (`_ci`, `VARCHAR` / `CHAR`) | Yes: kept on a hidden column of each value's collation key (its `WEIGHT_STRING`), so it refuses what the collation holds equal; exact lookups by the key read it |
-| `PRIMARY KEY` on a case-insensitive collation, `UNIQUE` on a case-insensitive `TEXT` | Refused (Stoolap compares bytes: use a `_bin` collation) |
+| `PRIMARY KEY` on a case-insensitive collation; `UNIQUE` on a case-insensitive `TEXT`, a `CHAR` under a `NO PAD` collation, or under a Czech or big5 collation | Refused (Stoolap compares bytes: use a `_bin` collation) |
 | `PRIMARY KEY` / `UNIQUE` over a column prefix (`a(3)`) | Refused (Stoolap enforces whole values) |
 | `FOREIGN KEY` | Yes: single-column, to a PRIMARY KEY or UNIQUE column, of another table or its own; RESTRICT, NO ACTION, CASCADE, SET NULL |
 | Composite `FOREIGN KEY` | Refused |
@@ -308,6 +308,9 @@ the list stays current.
 - **A FOREIGN KEY to a case-insensitive `UNIQUE` column** is refused
   (1296): Stoolap keeps that key on the hidden key column, so it finds no
   UNIQUE index on the column the key names.
+- **A FOREIGN KEY on a case-insensitive `UNIQUE` column** with ON UPDATE
+  CASCADE / SET NULL or ON DELETE SET NULL is refused (1296): Stoolap's
+  actions would write the column without its hidden key.
 - **`HA_READ_PREFIX_LAST`** (MAX with a prefix bound) is not supported.
 - **`LOCK TABLES` with `autocommit = 0`** runs the statements after
   COMMIT in autocommit.

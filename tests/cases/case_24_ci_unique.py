@@ -26,6 +26,16 @@ def _errno(h, sql):
         return e.errno
 
 
+def _lookup(h, sql):
+    """The ids `sql` reads, or the errno it fails with (both engines
+    refuse a literal the column's character set cannot compare)"""
+    try:
+        h.cur.execute(sql)
+        return h.cur.fetchall()
+    except mysql.connector.Error as e:
+        return e.errno
+
+
 def _assert_dup(h, label, sql, key):
     try:
         h.cur.execute(sql)
@@ -120,6 +130,35 @@ CREATE TABLE ck (id INT NOT NULL PRIMARY KEY, c CHAR(10) UNIQUE,
     _assert_dup(h, "NO PAD still ignores case",
                 "INSERT INTO ck (id, np) VALUES (6, 'A')", "np")
 
+    h.exec_stmt(f"CREATE TABLE cw (id INT NOT NULL PRIMARY KEY, "
+                f"s VARCHAR(10) CHARACTER SET ucs2 UNIQUE, "
+                f"t VARCHAR(10) CHARACTER SET utf16 UNIQUE) ENGINE={h.engine}")
+    h.exec_stmt("INSERT INTO cw VALUES (1, 'a', 'a')")
+    _assert_dup(h, "ucs2: a trailing space, the space in its character set",
+                "INSERT INTO cw (id, s) VALUES (2, 'a ')", "s")
+    _assert_dup(h, "utf16 too", "INSERT INTO cw (id, t) VALUES (3, 'A ')", "t")
+    h.exec_stmt(f"CREATE TABLE cq (id INT NOT NULL PRIMARY KEY, "
+                f"s CHAR(3) UNIQUE) ENGINE={h.engine}")
+    h.exec_stmt("INSERT INTO cq VALUES (1, 'a')")
+    h.exec_stmt("SET SESSION sql_mode = CONCAT(@@sql_mode, "
+                "',PAD_CHAR_TO_FULL_LENGTH')")
+    _assert_dup(h, "a CHAR's key does not follow PAD_CHAR_TO_FULL_LENGTH",
+                "INSERT INTO cq VALUES (2, 'A')", "s")
+    h.assert_scalar("nor does its lookup",
+                    "SELECT id FROM cq WHERE s = 'A'", "1")
+    h.exec_stmt("SET SESSION sql_mode = REPLACE(@@sql_mode, "
+                "'PAD_CHAR_TO_FULL_LENGTH', '')")
+    for what, column in [
+            ("a CHAR under NO PAD",
+             "s CHAR(3) COLLATE utf8mb4_unicode_nopad_ci"),
+            ("a Czech collation",
+             "s VARCHAR(3) CHARACTER SET cp1250 COLLATE cp1250_czech_cs"),
+            ("big5", "s VARCHAR(3) CHARACTER SET big5")]:
+        h.assert_err(f"UNIQUE on {what} is refused",
+                     f"CREATE TABLE cr (id INT NOT NULL PRIMARY KEY, "
+                     f"{column} UNIQUE) ENGINE={h.engine}",
+                     r"does not compare bytes")
+
     h.section("Composite and added keys")
     h.exec_stmt(f"CREATE TABLE cc (id INT NOT NULL PRIMARY KEY, a VARCHAR(20), "
                 f"b INT, UNIQUE KEY ab (a, b)) ENGINE={h.engine}")
@@ -165,6 +204,28 @@ INSERT INTO cp VALUES (1, 'a');
     _assert_dup(h, "an UPDATE into a taken value",
                 "UPDATE cp SET code = 'B' WHERE id = 2", "code")
 
+    h.section("FOREIGN KEY actions that write the column are refused")
+    h.exec_stmt(f"CREATE TABLE cfp (id INT NOT NULL PRIMARY KEY, "
+                f"code VARCHAR(10) COLLATE utf8mb4_bin UNIQUE) "
+                f"ENGINE={h.engine}")
+    for action in ["ON UPDATE CASCADE", "ON UPDATE SET NULL",
+                   "ON DELETE SET NULL"]:
+        h.assert_err(action,
+                     f"CREATE TABLE cfc (id INT NOT NULL PRIMARY KEY, "
+                     f"pc VARCHAR(10) UNIQUE, FOREIGN KEY (pc) REFERENCES "
+                     f"cfp (code) {action}) ENGINE={h.engine}",
+                     r"FOREIGN KEY actions do not write")
+    h.assert_ok("ON DELETE CASCADE takes the row, key and all",
+                f"CREATE TABLE cfc (id INT NOT NULL PRIMARY KEY, "
+                f"pc VARCHAR(10) UNIQUE, FOREIGN KEY (pc) REFERENCES "
+                f"cfp (code) ON DELETE CASCADE) ENGINE={h.engine}")
+    h.exec_stmt(f"CREATE TABLE cfd (id INT NOT NULL PRIMARY KEY, "
+                f"pc VARCHAR(10), FOREIGN KEY (pc) REFERENCES cfp (code) "
+                f"ON UPDATE CASCADE) ENGINE={h.engine}")
+    h.assert_err("a UNIQUE key added on a column whose key cascades",
+                 "ALTER TABLE cfd ADD UNIQUE KEY (pc)",
+                 r"FOREIGN KEY actions do not write")
+
     h.section("Accepted and refused as InnoDB does, row by row")
     random.seed(24)
     alphabet = (list("aAbBeE éÉßıiIİåÅ") +
@@ -173,26 +234,43 @@ INSERT INTO cp VALUES (1, 'a');
     values = ["".join(random.choice(alphabet)
                       for _ in range(random.randint(0, 4)))
               for _ in range(300)]
-    collations = ["utf8mb4_general_ci", "utf8mb4_unicode_ci",
-                  "utf8mb4_uca1400_ai_ci", "utf8mb4_uca1400_as_ci",
-                  "utf8mb4_unicode_520_nopad_ci", "utf8mb4_turkish_ci",
-                  "utf8mb4_german2_ci", "utf8mb4_0900_ai_ci"]
-    for coll in collations:
+    columns = [("VARCHAR(10)", "utf8mb4", c) for c in [
+        "utf8mb4_general_ci", "utf8mb4_unicode_ci", "utf8mb4_uca1400_ai_ci",
+        "utf8mb4_uca1400_as_ci", "utf8mb4_unicode_520_nopad_ci",
+        "utf8mb4_turkish_ci", "utf8mb4_german2_ci", "utf8mb4_0900_ai_ci"]]
+    columns += [("VARCHAR(10)", "ucs2", "ucs2_general_ci"),
+                ("VARCHAR(10)", "utf16", "utf16_unicode_ci"),
+                ("CHAR(6)", "utf8mb4", "utf8mb4_general_ci"),
+                ("CHAR(6)", "utf8mb4", "utf8mb4_uca1400_as_ci"),
+                ("CHAR(6)", "latin1", "latin1_german2_ci")]
+    for n, (typ, cs, coll) in enumerate(columns):
         tables = {}
         for engine in (h.engine, "InnoDB"):
-            t = f"cd_{engine.lower()}_{coll}"
+            t = f"cd{n}_{engine.lower()}"
             h.exec_stmt(f"CREATE TABLE {t} (id INT NOT NULL PRIMARY KEY, "
-                        f"v VARCHAR(10) COLLATE {coll} UNIQUE) ENGINE={engine}")
+                        f"v {typ} CHARACTER SET {cs} COLLATE {coll} UNIQUE) "
+                        f"ENGINE={engine}")
             tables[engine] = t
         diffs = []
         for i, v in enumerate(values):
+            # Every other row under PAD_CHAR_TO_FULL_LENGTH
+            h.exec_stmt("SET SESSION sql_mode = 'STRICT_TRANS_TABLES" +
+                        (",PAD_CHAR_TO_FULL_LENGTH'" if i % 2 else "'"))
             lit = v.replace("\\", "\\\\").replace("'", "''")
             got = {e: _errno(h, f"INSERT INTO {t} VALUES ({i}, '{lit}')")
                    for e, t in tables.items()}
             if got[h.engine] != got["InnoDB"]:
                 diffs.append((v, got))
+        h.exec_stmt("SET SESSION sql_mode = 'STRICT_TRANS_TABLES'")
+        for v in values[:60]:
+            lit = v.replace("\\", "\\\\").replace("'", "''")
+            got = {e: _lookup(h, f"SELECT GROUP_CONCAT(id ORDER BY id) "
+                                 f"FROM {t} WHERE v = _utf8mb4'{lit}'")
+                   for e, t in tables.items()}
+            if got[h.engine] != got["InnoDB"]:
+                diffs.append(("lookup " + repr(v), got))
         if diffs:
-            h._fail(f"{coll}: {len(diffs)} rows differ from InnoDB",
+            h._fail(f"{typ} {coll}: {len(diffs)} rows differ from InnoDB",
                     *[f"{v!r}: {g}" for v, g in diffs[:5]])
         else:
-            h._pass(f"{coll}: every row as in InnoDB")
+            h._pass(f"{typ} {coll}: every row and lookup as in InnoDB")

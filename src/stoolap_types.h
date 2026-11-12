@@ -292,7 +292,14 @@ inline bool collation_keyed_type(const Field* f) {
             return false;
     }
     const CHARSET_INFO* cs = f->charset();
-    return cs && cs != &my_charset_bin && !(cs->state & MY_CS_BINSORT);
+    // The Czech collations' keys take no weight count, which the padded
+    // key needs, and big5's give values MariaDB holds apart the same
+    // weights. A CHAR under NO PAD has InnoDB's UNIQUE and MariaDB's `=`
+    // disagree (on ignorable characters). Their UNIQUE keys stay refused
+    return cs && cs != &my_charset_bin && !(cs->state & MY_CS_BINSORT) &&
+           !(cs->state & MY_CS_STRNXFRM_BAD_NWEIGHTS) &&
+           std::strcmp(cs->cs_name.str, "big5") != 0 &&
+           !(f->real_type() == MYSQL_TYPE_STRING && (cs->state & MY_CS_NOPAD));
 }
 
 // The fields of `share` stoolap keeps a collation key column for, in field
@@ -328,30 +335,45 @@ inline bool collation_key(Field* f, std::string& out, std::string& buf,
                           std::string& pad) {
     const CHARSET_INFO* cs = f->charset();
     const uint per_char = cs->strxfrm_multiply ? cs->strxfrm_multiply : 1;
+    // The value, a CHAR without its padding whatever the session's
+    // PAD_CHAR_TO_FULL_LENGTH (val_str keeps it then); its collation pads
+    // with spaces (collation_keyed_type)
+    const uchar* src;
+    size_t srclen;
     char tmp[MAX_FIELD_WIDTH];
     String value(tmp, sizeof(tmp), cs);
-    const String* v = f->val_str(&value);
-    const auto* src = reinterpret_cast<const uchar*>(v->ptr());
+    if (f->real_type() == MYSQL_TYPE_STRING) {
+        src = f->ptr;
+        srclen = cs->lengthsp(reinterpret_cast<const char*>(f->ptr),
+                              f->field_length);
+    } else {
+        const String* v = f->val_str(&value);
+        src = reinterpret_cast<const uchar*>(v->ptr());
+        srclen = v->length();
+    }
     const bool one_level = cs->levels_for_order <= 1;
     // A character takes a byte at least: the value's bytes bound its
     // characters, the column's characters every value's
-    const uint chars = one_level ? static_cast<uint>(v->length())
+    const uint chars = one_level ? static_cast<uint>(srclen)
                                  : static_cast<uint>(f->char_length());
     const uint nweights = chars * per_char + 1;
     const size_t len = cs->strnxfrmlen(size_t{nweights} * cs->mbmaxlen);
     const uint flags = one_level ? 0 : MY_STRXFRM_PAD_WITH_SPACE;
     if (pad.empty()) {
-        // The space's weights, or the empty string's padded key
+        // The space's weights (the space in the column's character set),
+        // or the empty string's padded key
+        uchar space[8];
+        const int sn = cs->wc_mb(' ', space, space + sizeof(space));
         const size_t plen = one_level ? cs->strnxfrmlen(cs->mbmaxlen) : len;
         pad.resize(plen);
-        pad.resize(cs->strnxfrm(reinterpret_cast<uchar*>(pad.data()), plen,
-                                one_level ? 1 : nweights,
-                                reinterpret_cast<const uchar*>(" "),
-                                one_level ? 1 : 0, flags));
+        pad.resize(cs->strnxfrm(
+            reinterpret_cast<uchar*>(pad.data()), plen,
+            one_level ? 1 : nweights, space,
+            one_level && sn > 0 ? static_cast<size_t>(sn) : 0, flags));
     }
     if (buf.size() < len) buf.resize(len);
     const size_t n = cs->strnxfrm(reinterpret_cast<uchar*>(buf.data()), len,
-                                  nweights, src, v->length(), flags);
+                                  nweights, src, srclen, flags);
     // A value whose weights reach the end of the key may have lost some
     size_t keep = n;
     if (!one_level) {

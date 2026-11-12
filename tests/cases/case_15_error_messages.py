@@ -35,7 +35,7 @@ INSERT INTO d VALUES (1, '2026-04-28 12:00:00.123456');
     h.section("ci-collation PRIMARY KEY refused at CREATE, UNIQUE kept")
     h.assert_err("ci VARCHAR PRIMARY KEY refused",
                  f"CREATE TABLE rfk_pk (s VARCHAR(20) PRIMARY KEY) ENGINE={h.engine}",
-                 r"case-insensitive collation")
+                 r"does not compare bytes")
     h.assert_ok("ci VARCHAR UNIQUE accepted",
                 f"""CREATE TABLE rfk_uq (id INT NOT NULL PRIMARY KEY,
                                        s VARCHAR(20),
