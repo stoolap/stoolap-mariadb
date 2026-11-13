@@ -375,3 +375,92 @@ INSERT INTO irs_drv VALUES (1), (2), (3);
                     "SELECT SUM(t.a + t.b) FROM irs_drv d JOIN irs t "
                     "ON t.id = d.k", "6060")
     h.assert_scalar("eq_ref probe, narrow again", probe, "60")
+
+    h.section("Index order MariaDB cannot take from stoolap's index")
+    # stoolap's index ascends, and keeps a BIT(64) with its top bit set as
+    # a negative integer: MariaDB reads neither by range or in order.
+    h.exec_script(f"""
+CREATE TABLE ixd (id INT NOT NULL PRIMARY KEY, a INT, KEY (a DESC))
+    ENGINE={h.engine};
+INSERT INTO ixd VALUES (1, 1), (2, 5), (3, 9), (4, 3);
+CREATE TABLE ixb (id INT NOT NULL PRIMARY KEY, v BIT(64), KEY (v))
+    ENGINE={h.engine};
+INSERT INTO ixb VALUES (1, 3), (2, 0xFFFFFFFFFFFFFFF0), (3, 9);
+""")
+    h.assert_scalar("a DESC key: a range",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ixd WHERE a > 4",
+                    "2,3")
+    h.assert_scalar("a DESC key: ORDER BY ... DESC LIMIT",
+                    "SELECT id FROM ixd FORCE INDEX (a) "
+                    "ORDER BY a DESC LIMIT 1", "3")
+    h.assert_ok("a DESC key: UPDATE ... ORDER BY ... DESC LIMIT",
+                "UPDATE ixd SET a = 100 ORDER BY a DESC LIMIT 1")
+    h.assert_scalar("updates the top row",
+                    "SELECT id FROM ixd WHERE a = 100", "3")
+    h.assert_scalar("BIT(64): a range",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ixb WHERE v > 5",
+                    "2,3")
+    h.assert_scalar("BIT(64): index order",
+                    "SELECT GROUP_CONCAT(id) FROM "
+                    "(SELECT id FROM ixb FORCE INDEX (v) ORDER BY v LIMIT 3) t",
+                    "1,3,2")
+    h.assert_scalar("BIT(64): MAX",
+                    "SELECT MAX(v) = 0xFFFFFFFFFFFFFFF0 FROM ixb", "1")
+    h.assert_ok("DELETE the rows past 5", "DELETE FROM ixb WHERE v > 5")
+    h.assert_scalar("leaves the row below",
+                    "SELECT GROUP_CONCAT(id) FROM ixb", "1")
+    # A PAD SPACE _bin collation compares 'a' as 'a ', after 'a\t';
+    # stoolap's index orders it by byte, before.
+    h.exec_script(f"""
+CREATE TABLE ixs (id INT NOT NULL PRIMARY KEY,
+                  v VARCHAR(10) COLLATE utf8mb4_bin, KEY (v))
+    ENGINE={h.engine};
+INSERT INTO ixs VALUES (1, 'a'), (2, 'a\\t'), (3, 'b'), (4, 'a\\n');
+""")
+    h.assert_scalar("PAD SPACE _bin: index order",
+                    "SELECT GROUP_CONCAT(id) FROM "
+                    "(SELECT id FROM ixs FORCE INDEX (v) ORDER BY v LIMIT 4) t",
+                    "2,4,1,3")
+    h.assert_scalar("PAD SPACE _bin: MIN",
+                    "SELECT HEX(MIN(v)) FROM ixs", "6109")
+    h.assert_scalar("PAD SPACE _bin: a range",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ixs "
+                    "WHERE v < 'a'", "2,4")
+    h.assert_ok("PAD SPACE _bin: UPDATE ... ORDER BY ... LIMIT",
+                "UPDATE ixs SET id = id + 10 ORDER BY v LIMIT 1")
+    h.assert_scalar("updates the first row",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ixs", "1,3,4,12")
+    # A range over a key with a DESC or BIT(64) part past the first: its
+    # bounds hold MariaDB's order, (1,5) to (2,1) for b DESC, so stoolap
+    # cannot bound by them.
+    h.exec_script(f"""
+CREATE TABLE ixc (id INT NOT NULL PRIMARY KEY, a INT, b INT, v BIT(64),
+                  KEY kd (a, b DESC), KEY kb (a, v))
+    ENGINE={h.engine};
+INSERT INTO ixc VALUES (1, 1, 1, 3), (2, 1, 5, 0xFFFFFFFFFFFFFFF0),
+    (3, 2, 1, 3), (4, 2, 5, 0xFFFFFFFFFFFFFFF0), (5, 1, 3, 4);
+""")
+    h.assert_scalar("(a, b DESC): a range with b's values",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ixc FORCE INDEX (kd) "
+                    "WHERE a BETWEEN 1 AND 2 AND b IN (1, 5) FOR UPDATE",
+                    "1,2,3,4")
+    h.assert_scalar("(a, BIT(64)): a range with v's values",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ixc FORCE INDEX (kb) "
+                    "WHERE a BETWEEN 1 AND 2 "
+                    "AND v IN (3, 0xFFFFFFFFFFFFFFF0) FOR UPDATE",
+                    "1,2,3,4")
+    # MariaDB reads equalities through these keys too: none may offer an
+    # intersection by row id order, which stoolap's scans do not keep.
+    h.exec_script(f"""
+CREATE TABLE ixr (id INT NOT NULL PRIMARY KEY, x INT, y BIT(64),
+                  KEY kx (x DESC), KEY ky (y))
+    ENGINE={h.engine};
+INSERT INTO ixr VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, 2, 2);
+""")
+    h.assert_eq("no rowid-ordered scan on a DESC or BIT(64) key", "[false, false]",
+                h.sql_with_session(
+                    ["SET optimizer_trace = 'enabled=on'",
+                     "SELECT COUNT(*) FROM ixr FORCE INDEX (kx, ky) "
+                     "WHERE x = 1 AND y = 1 FOR UPDATE"],
+                    "SELECT JSON_EXTRACT(trace, '$**.rowid_ordered') "
+                    "FROM information_schema.optimizer_trace"))

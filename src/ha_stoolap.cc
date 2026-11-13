@@ -818,19 +818,33 @@ bool ha_stoolap::referenced_by_foreign_key() const noexcept {
     return !db || stoolap_is_referenced(db, stoolap_table_.c_str()) != 0;
 }
 
+// A key part stoolap's index orders unlike MariaDB: a DESC one (stoolap's
+// index ascends) or a BIT(64) (one with its top bit set is a negative i64
+// in stoolap, ordered before the others)
+static bool key_part_reordered(const KEY_PART_INFO& kp) {
+    return (kp.key_part_flag & HA_REVERSE_SORT) ||
+           (kp.field && kp.field->real_type() == MYSQL_TYPE_BIT &&
+            kp.field->field_length == 64);
+}
+
 ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
     // Numeric/timestamp/boolean parts: full range-scan + ordered iter; their
     // byte-compare matches MariaDB's expected order.
-    // ci string parts: drop everything (return 0) so the optimizer falls
-    // back to a full scan where MariaDB applies its own collation per row.
-    // _bin string parts: full flags (byte compare agrees).
-    // DECIMAL/ENUM/SET: drop everything; ref access would build numeric-vs-
-    // text predicates against stoolap's TEXT storage.
-    // HA_KEY_SCAN_NOT_ROR disables index_merge_intersect (our scans aren't
-    // in rowid order; we have no rowid concept).
+    // ci string parts: drop range and order so the optimizer falls back to
+    // a full scan where MariaDB applies its own collation per row.
+    // _bin string parts: full flags when NO PAD (byte compare agrees).
+    // DESC parts and BIT(64) (key_part_reordered): drop range and order.
+    // DECIMAL/ENUM/SET: drop range and order; ref access would build
+    // numeric-vs-text predicates against stoolap's TEXT storage.
+    // HA_KEY_SCAN_NOT_ROR, on every part, disables index_merge_intersect
+    // (our scans aren't in rowid order; we have no rowid concept): MariaDB
+    // still reads equalities through a key without HA_READ_RANGE.
+    constexpr ulong kNoRange = HA_KEY_SCAN_NOT_ROR;
     if (inx < table_share->keys &&
         part < table_share->key_info[inx].user_defined_key_parts) {
-        Field* f = table_share->key_info[inx].key_part[part].field;
+        const KEY_PART_INFO& kp = table_share->key_info[inx].key_part[part];
+        if (key_part_reordered(kp)) return kNoRange;
+        Field* f = kp.field;
         if (f) {
             switch (f->real_type()) {
                 case MYSQL_TYPE_VARCHAR:
@@ -845,18 +859,21 @@ ulong ha_stoolap::index_flags(uint inx, uint part, bool /*all_parts*/) const {
                     if (stoolap_mariadb::field_enc(f) ==
                             stoolap_mariadb::Enc::HEX &&
                         !stoolap_mariadb::hex_keeps_order(f))
-                        return 0;
+                        return kNoRange;
                     CHARSET_INFO* cs = f->charset();
-                    if (cs && (cs->state & MY_CS_BINSORT)) {
+                    // A PAD SPACE one compares 'a' as 'a ', after 'a\t';
+                    // stoolap's index orders it by byte, before
+                    if (cs && (cs->state & MY_CS_BINSORT) &&
+                        (cs == &my_charset_bin || (cs->state & MY_CS_NOPAD))) {
                         return HA_READ_NEXT | HA_READ_RANGE | HA_READ_ORDER |
                                HA_KEY_SCAN_NOT_ROR;
                     }
-                    return 0;
+                    return kNoRange;
                 }
                 case MYSQL_TYPE_NEWDECIMAL:
                 case MYSQL_TYPE_ENUM:
                 case MYSQL_TYPE_SET:
-                    return 0;
+                    return kNoRange;
                 default:
                     break;
             }
@@ -2323,13 +2340,15 @@ int ha_stoolap::read_range_first(const key_range* start_key,
 
     // Ranges stoolap cannot compare as MariaDB does go to
     // read_range_filtered: a prefix part, a ci or PAD SPACE collation
-    // (key_part_needs_filter), a hex encoding out of order; NEWDECIMAL /
+    // (key_part_needs_filter), a hex encoding out of order, a DESC part or
+    // a BIT(64) (key_part_reordered); NEWDECIMAL /
     // ENUM / SET too (encoded bound semantics not re-validated).
     const bool trust_bin = stoolap_thd_trust_binary_strings(ha_thd());
     auto contains_unsafe_part = [&](const key_range* range) {
         if (!range) return false;
         for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
             if (!(range->keypart_map & (key_part_map(1) << i))) break;
+            if (key_part_reordered(key_info.key_part[i])) return true;
             Field* f = key_info.key_part[i].field;
             switch (f->real_type()) {
                 case MYSQL_TYPE_VARCHAR:
