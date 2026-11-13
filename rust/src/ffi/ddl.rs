@@ -448,25 +448,31 @@ pub unsafe extern "C" fn stoolap_auto_increment_note(
     })
 }
 
-/// Takes `count` AUTO_INCREMENT ids of `table`, `step` apart, each `offset`
-/// modulo `step`; the first in `*first` (`Session::reserve_auto_increment`).
+/// Takes `*count` AUTO_INCREMENT ids of `table`, `step` apart, each
+/// `offset` modulo `step`; the first in `*first` and how many in `*count`
+/// (`Session::reserve_auto_increment`).
 ///
 /// # Safety
 ///
-/// As `stoolap_drop_table`; `first` a valid pointer.
+/// As `stoolap_drop_table`; `count` and `first` valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_auto_increment_reserve(
     db: *mut StoolapDB,
     table: *const c_char,
-    count: u64,
+    count: *mut u64,
     step: u64,
     offset: u64,
     first: *mut u64,
 ) -> i32 {
     on_session(db, "stoolap_auto_increment_reserve", |session| {
-        let id = session.reserve_auto_increment(text(table, "table name")?, count, step, offset)?;
+        let wanted = count.as_ref().copied().unwrap_or(1);
+        let (id, taken) =
+            session.reserve_auto_increment(text(table, "table name")?, wanted, step, offset)?;
         if let Some(first) = first.as_mut() {
             *first = id;
+        }
+        if let Some(count) = count.as_mut() {
+            *count = taken;
         }
         Ok(STOOLAP_OK)
     })

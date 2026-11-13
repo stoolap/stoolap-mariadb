@@ -352,16 +352,17 @@ impl Session {
 
     /// Takes `count` ids from `table`'s counter for MariaDB to generate,
     /// `step` apart and each `offset` modulo `step` (auto_increment_increment
-    /// and _offset), past every id handed out: the first. The counter
-    /// moves a step past the last, as InnoDB's, so no other session takes
-    /// them
+    /// and _offset), past every id handed out: the first and how many,
+    /// fewer than `count` when the rest pass i64::MAX (MariaDB's count is
+    /// an estimate). The counter moves a step past the last, as InnoDB's,
+    /// so no other session takes them
     pub fn reserve_auto_increment(
         &self,
         table: &str,
         count: u64,
         step: u64,
         offset: u64,
-    ) -> Result<u64> {
+    ) -> Result<(u64, u64)> {
         // Reservations read the counter and raise it under one lock: two
         // raising from the same value would take the same ids
         static RESERVING: Mutex<()> = Mutex::new(());
@@ -378,16 +379,14 @@ impl Session {
             let first = next
                 .checked_add((offset % step + step - next % step) % step)
                 .ok_or_else(exhausted)?;
-            let last = (count.max(1) - 1)
-                .checked_mul(step)
-                .and_then(|span| first.checked_add(span))
-                .filter(|&last| last <= i64::MAX as u64)
-                .ok_or_else(exhausted)?;
+            let room = (i64::MAX as u64).checked_sub(first).ok_or_else(exhausted)?;
+            let count = count.clamp(1, room / step + 1);
+            let last = first + (count - 1) * step;
             // An insert of an explicit id past it raised the counter since
             // it was read: read it again
             let claimed = last.saturating_add(step - 1).min(i64::MAX as u64);
             if store.set_auto_increment_counter(claimed as i64) {
-                return Ok(first);
+                return Ok((first, count));
             }
         }
     }

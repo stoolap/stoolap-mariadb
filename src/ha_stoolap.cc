@@ -1567,7 +1567,10 @@ int ha_stoolap::write_row(const uchar* buf) {
     // A PRIMARY KEY's id raises stoolap's counter when stoolap takes the
     // row: a buffered row's (bulk_active_), before the flush, as the next
     // row's reservation reads the counter. Each id past the ones the
-    // statement raised it to or reserved, once (ai_noted_).
+    // statement raised it to or reserved, once (ai_noted_). A row stoolap
+    // refuses as a duplicate in a statement that goes on (IGNORE, REPLACE,
+    // ON DUPLICATE KEY UPDATE) raises it too, as InnoDB's (ai_explicit).
+    uint64_t ai_explicit = 0;
     if (table->found_next_number_field) {
         Field* aifield = table->found_next_number_field;
         const longlong sv = aifield->val_int();
@@ -1576,7 +1579,9 @@ int ha_stoolap::write_row(const uchar* buf) {
             const uint64_t v = static_cast<uint64_t>(sv);
             if (!ai_is_primary_key(table->s)) {
                 g_engine.ai_note_explicit(stoolap_table_, v);
-            } else if (bulk_active_ && v > ai_noted_) {
+            } else if (!bulk_active_) {
+                ai_explicit = v;
+            } else if (v > ai_noted_) {
                 StoolapDB* db = get_thd_ctx(ha_thd())->db();
                 if (!db || stoolap_auto_increment_note(
                                db, stoolap_table_.c_str(), v) != STOOLAP_OK)
@@ -1617,7 +1622,15 @@ int ha_stoolap::write_row(const uchar* buf) {
         static_cast<int32_t>(fields.size()), buf, &encode_cell, &src,
         alter_copy_, &affected);
     cur_row_id_valid_ = false;
-    if (rc != STOOLAP_OK) return src.err ? src.err : write_error(db, "INSERT");
+    if (rc != STOOLAP_OK) {
+        if (src.err) return src.err;
+        const int err = write_error(db, "INSERT");
+        if (err == HA_ERR_FOUND_DUPP_KEY && ai_explicit &&
+            stoolap_thd_needs_per_row_dup_handling(ha_thd()))
+            stoolap_auto_increment_note(db, stoolap_table_.c_str(),
+                                        ai_explicit);
+        return err;
+    }
     apply_count_delta(affected);
     return 0;
 }
@@ -2695,10 +2708,10 @@ void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,
     const uint64_t step = increment ? static_cast<uint64_t>(increment) : 1;
     if (ai_is_primary_key(table->s)) {
         uint64_t first = 0;
+        uint64_t count = static_cast<uint64_t>(*nb_reserved_values);
         StoolapDB* db = get_thd_ctx(ha_thd())->db();
         if (!db || stoolap_auto_increment_reserve(
-                       db, stoolap_table_.c_str(),
-                       static_cast<uint64_t>(*nb_reserved_values), step,
+                       db, stoolap_table_.c_str(), &count, step,
                        static_cast<uint64_t>(offset), &first) != STOOLAP_OK) {
             sql_print_error("stoolap: AUTO_INCREMENT of '%s' failed: %s",
                             stoolap_table_.c_str(),
@@ -2706,6 +2719,12 @@ void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,
             return;
         }
         *first_value = static_cast<ulonglong>(first);
+        // Fewer than the estimate near the end of the range: MariaDB asks
+        // again past them
+        *nb_reserved_values = static_cast<ulonglong>(count);
+        // The reserved ids are past the counter already
+        const uint64_t last = first + (count - 1) * step;
+        if (last > ai_noted_) ai_noted_ = last;
         return;
     }
     const uint64_t offset_mod =
@@ -2716,9 +2735,6 @@ void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,
                             static_cast<uint64_t>(*nb_reserved_values), step,
                             offset_mod, &first)) {
         *first_value = static_cast<ulonglong>(first);
-        // The reserved ids are past the counter already
-        const uint64_t last = first + (*nb_reserved_values - 1) * step;
-        if (last > ai_noted_) ai_noted_ = last;
         return;
     }
 

@@ -287,7 +287,9 @@ the list stays current.
 
 - **`ALTER TABLE ... AUTO_INCREMENT = N`** below the next id copies the
   table (stoolap's counter only rises) and reports the copied rows as
-  affected; the counter it leaves is InnoDB's.
+  affected; the counter it leaves is InnoDB's. One that runs in place
+  after waiting out a transaction's ids past `N` keeps the counter past
+  them even when they were rolled back (InnoDB takes `MAX + 1`).
 - **AUTO_INCREMENT on a column other than the PRIMARY KEY** is recomputed
   from `MAX(col) + 1` after DDL.
 - **`utf8mb4_bin` UNIQUE** ignores PAD SPACE (`'a'` and `'a '` are both
