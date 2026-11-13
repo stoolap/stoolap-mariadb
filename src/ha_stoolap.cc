@@ -954,12 +954,15 @@ StoolapDB* ha_stoolap::ddl_db() {
     return d;
 }
 
-// Whether the table's AUTO_INCREMENT column is its PRIMARY KEY: stoolap's
-// INTEGER PRIMARY KEY, whose inserts keep stoolap's id counter, which
-// then hands out the ids (stoolap_auto_increment_*)
+// Whether the table's AUTO_INCREMENT column is its PRIMARY KEY, an integer
+// alone: stoolap's INTEGER PRIMARY KEY, whose inserts keep stoolap's id
+// counter, which then hands out the ids (stoolap_auto_increment_*).
+// Stoolap keeps a composite one as a UNIQUE key, its counter for row ids.
 static bool ai_is_primary_key(const TABLE_SHARE* s) {
     return s->found_next_number_field && s->primary_key != MAX_KEY &&
-           s->next_number_index == s->primary_key;
+           s->next_number_index == s->primary_key &&
+           s->key_info[s->primary_key].user_defined_key_parts == 1 &&
+           (*s->found_next_number_field)->cmp_type() == INT_RESULT;
 }
 
 int ha_stoolap::create(const char* name, TABLE* form, HA_CREATE_INFO* info) {
@@ -1106,7 +1109,9 @@ bool plan_inplace(TABLE* table, TABLE* altered, Alter_inplace_info* info,
         if (info->create_info->used_fields != HA_CREATE_USED_AUTO ||
             !ai_is_primary_key(table->s))
             return false;
-        plan->auto_increment = info->create_info->auto_increment_value;
+        // 0 is 1, the largest id plus one
+        plan->auto_increment =
+            std::max<ulonglong>(info->create_info->auto_increment_value, 1);
         ops &= ~ALTER_CHANGE_CREATE_OPTION;
     }
     // A NOT NULL column with no value for the rows there (a zero date
@@ -1464,6 +1469,7 @@ void ha_stoolap::start_bulk_insert(ha_rows /*rows*/, uint /*flags*/) {
     bulk_active_ = false;
     bulk_owns_tx_ = false;
     bulk_rows_ = 0;
+    ai_noted_ = 0;
     // A copying ALTER writes only its copy
     const int command = thd_sql_command(ha_thd());
     alter_copy_ = command == SQLCOM_ALTER_TABLE ||
@@ -1558,13 +1564,25 @@ int ha_stoolap::write_row(const uchar* buf) {
     // Keep AI allocator in sync with explicit-id INSERTs (cross-connection).
     // Skip non-positive: signed -2 casts to ULLONG_MAX-1 and the next
     // generated insert fails ER_AUTOINC_READ_FAILED.
-    if (table->found_next_number_field && !ai_is_primary_key(table->s)) {
+    // A PRIMARY KEY's id raises stoolap's counter when stoolap takes the
+    // row: a buffered row's (bulk_active_), before the flush, as the next
+    // row's reservation reads the counter. Each id past the ones the
+    // statement raised it to or reserved, once (ai_noted_).
+    if (table->found_next_number_field) {
         Field* aifield = table->found_next_number_field;
         const longlong sv = aifield->val_int();
         const bool unsigned_col = (aifield->flags & UNSIGNED_FLAG) != 0;
         if (unsigned_col || sv > 0) {
-            const ulonglong v = static_cast<ulonglong>(sv);
-            g_engine.ai_note_explicit(stoolap_table_, static_cast<uint64_t>(v));
+            const uint64_t v = static_cast<uint64_t>(sv);
+            if (!ai_is_primary_key(table->s)) {
+                g_engine.ai_note_explicit(stoolap_table_, v);
+            } else if (bulk_active_ && v > ai_noted_) {
+                StoolapDB* db = get_thd_ctx(ha_thd())->db();
+                if (!db || stoolap_auto_increment_note(
+                               db, stoolap_table_.c_str(), v) != STOOLAP_OK)
+                    return HA_ERR_INTERNAL_ERROR;
+                ai_noted_ = v;
+            }
         }
     }
 
@@ -2698,6 +2716,9 @@ void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,
                             static_cast<uint64_t>(*nb_reserved_values), step,
                             offset_mod, &first)) {
         *first_value = static_cast<ulonglong>(first);
+        // The reserved ids are past the counter already
+        const uint64_t last = first + (*nb_reserved_values - 1) * step;
+        if (last > ai_noted_) ai_noted_ = last;
         return;
     }
 

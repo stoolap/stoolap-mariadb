@@ -338,6 +338,18 @@ impl Session {
             .get_auto_increment_counter())
     }
 
+    /// Raises `table`'s counter to `id`, an explicit id of a row stoolap
+    /// has not taken yet (a buffered insert's)
+    pub fn note_auto_increment(&self, table: &str, id: u64) -> Result<()> {
+        if let Ok(id) = i64::try_from(id) {
+            self.exec
+                .engine()
+                .get_version_store(table)?
+                .set_auto_increment_counter(id);
+        }
+        Ok(())
+    }
+
     /// Takes `count` ids from `table`'s counter for MariaDB to generate,
     /// `step` apart and each `offset` modulo `step` (auto_increment_increment
     /// and _offset), past every id handed out: the first. The counter

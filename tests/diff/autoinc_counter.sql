@@ -55,3 +55,19 @@ INSERT INTO c (a) VALUES (4), (5);
 SET SESSION auto_increment_increment = 1, auto_increment_offset = 1;
 INSERT INTO c (a) VALUES (6);
 SELECT id, a FROM c ORDER BY id;
+-- An explicit id earlier in a multi-row INSERT: the rows after it go past it
+CREATE TABLE m (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, a INT) ENGINE={E};
+INSERT INTO m (id) VALUES (1), (NULL);
+INSERT INTO m (id) VALUES (100), (NULL), (50), (NULL);
+SELECT id FROM m ORDER BY id;
+-- AUTO_INCREMENT = 0: the largest id plus one
+DELETE FROM m WHERE id > 50;
+-- known-diff: lowering copies the table (stoolap's counter only rises): the copied rows count as affected
+ALTER TABLE m AUTO_INCREMENT = 0;
+INSERT INTO m (a) VALUES (1);
+SELECT id FROM m ORDER BY id;
+-- A composite PRIMARY KEY's AUTO_INCREMENT part
+CREATE TABLE k (id INT NOT NULL AUTO_INCREMENT, g INT NOT NULL, PRIMARY KEY (id, g)) ENGINE={E};
+INSERT INTO k VALUES (100, 1);
+INSERT INTO k (g) VALUES (2), (3);
+SELECT id, g FROM k ORDER BY id;

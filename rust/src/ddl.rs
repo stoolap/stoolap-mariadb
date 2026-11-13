@@ -453,10 +453,11 @@ pub fn drop_column(session: &Session, table: &str, name: &str) -> Result<()> {
 /// Raises `table`'s id counter so its next AUTO_INCREMENT id is `next`
 /// (CREATE TABLE ... AUTO_INCREMENT = n; a copying ALTER's new table,
 /// whose copied rows then raise it past their largest id, as InnoDB keeps
-/// the larger of the two)
+/// the larger of the two). A counter already there stays: an in-place
+/// ALTER that waited out an insert past `next` leaves the id after it
 pub fn set_auto_increment(session: &Session, table: &str, next: u64) -> Result<()> {
     let next = next.min(i64::MAX as u64);
-    if next <= 1 {
+    if next <= 1 || session.auto_increment_counter(table)? >= next as i64 - 1 {
         return Ok(());
     }
     session.run(

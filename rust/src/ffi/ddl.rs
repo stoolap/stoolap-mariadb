@@ -430,6 +430,24 @@ pub unsafe extern "C" fn stoolap_auto_increment_next(
     })
 }
 
+/// Raises `table`'s id counter to `id`, the explicit id of a row the
+/// plugin buffers (`Session::note_auto_increment`).
+///
+/// # Safety
+///
+/// As `stoolap_drop_table`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_auto_increment_note(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    id: u64,
+) -> i32 {
+    on_session(db, "stoolap_auto_increment_note", |session| {
+        session.note_auto_increment(text(table, "table name")?, id)?;
+        Ok(STOOLAP_OK)
+    })
+}
+
 /// Takes `count` AUTO_INCREMENT ids of `table`, `step` apart, each `offset`
 /// modulo `step`; the first in `*first` (`Session::reserve_auto_increment`).
 ///
