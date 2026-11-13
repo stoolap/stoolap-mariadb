@@ -61,6 +61,33 @@ def _check(h, srv, label, t_rows, c_rows):
     c.close()
 
 
+_AI_SETUP = [
+    "CREATE TABLE a1 (id INT AUTO_INCREMENT PRIMARY KEY, a INT) "
+    "ENGINE=STOOLAP",
+    "INSERT INTO a1 (a) VALUES (1), (2), (3)",
+    "DELETE FROM a1 WHERE id = 3",
+    "CREATE TABLE a2 (id INT AUTO_INCREMENT PRIMARY KEY, a INT) "
+    "ENGINE=STOOLAP AUTO_INCREMENT = 100",
+    "CREATE TABLE a3 (id INT AUTO_INCREMENT PRIMARY KEY, a INT) "
+    "ENGINE=STOOLAP",
+    "INSERT INTO a3 (a) VALUES (1)",
+    "ALTER TABLE a3 AUTO_INCREMENT = 50",
+]
+
+
+def _check_ai(h, srv, label, expected):
+    """Each AUTO_INCREMENT table's next id, its row deleted again after"""
+    c = _connect(srv)
+    cur = c.cursor()
+    got = []
+    for t in ("a1", "a2", "a3"):
+        cur.execute(f"INSERT INTO {t} (a) VALUES (0)")
+        got.append(cur.lastrowid)
+        cur.execute(f"DELETE FROM {t} WHERE id = {cur.lastrowid}")
+    h.assert_eq(f"{label}: AUTO_INCREMENT counters", expected, tuple(got))
+    c.close()
+
+
 def run(h):
     srv = h.server.sibling("restart", f"file://{STOOLAP_DIR}")
     shutil.rmtree(srv.data, ignore_errors=True)
@@ -110,12 +137,21 @@ def run(h):
             "DELETE FROM c WHERE id = 10",
         ]:
             cur.execute(stmt)
+        # AUTO_INCREMENT counters a deleted top id, CREATE ... AUTO_INCREMENT
+        # and ALTER ... AUTO_INCREMENT set, in their own connection: the
+        # transaction above stays open
+        ai = _connect(srv)
+        ai_cur = ai.cursor()
+        for stmt in _AI_SETUP:
+            ai_cur.execute(stmt)
+        ai.close()
         srv.stop(kill=True)
         c.close()
         srv.start()
         t_rows = [(2, "c", 20), (3, "b", 3), (new_id, "b", 4)]
         c_rows = [(10, 1)]
         _check(h, srv, "after a crash", t_rows, c_rows)
+        _check_ai(h, srv, "after a crash", (4, 100, 50))
 
         h.section("The tables take writes and DDL after recovery")
         c = _connect(srv)
@@ -137,6 +173,7 @@ def run(h):
                     [(2, 7), (3, 3), (new_id, 4)],
                     _rows(cur, f"SELECT id, w FROM t WHERE id <= {new_id} "
                                "ORDER BY id"))
+        _check_ai(h, srv, "after a restart", (5, 101, 51))
         cur.execute(f"DROP DATABASE {DB}")
         c.close()
     finally:

@@ -954,6 +954,14 @@ StoolapDB* ha_stoolap::ddl_db() {
     return d;
 }
 
+// Whether the table's AUTO_INCREMENT column is its PRIMARY KEY: stoolap's
+// INTEGER PRIMARY KEY, whose inserts keep stoolap's id counter, which
+// then hands out the ids (stoolap_auto_increment_*)
+static bool ai_is_primary_key(const TABLE_SHARE* s) {
+    return s->found_next_number_field && s->primary_key != MAX_KEY &&
+           s->next_number_index == s->primary_key;
+}
+
 int ha_stoolap::create(const char* name, TABLE* form, HA_CREATE_INFO* info) {
     const std::string tbl = stoolap_table_from_path(name);
     if (refuse_unenforceable_keys(form) || refuse_unsupported_columns(form))
@@ -965,6 +973,16 @@ int ha_stoolap::create(const char* name, TABLE* form, HA_CREATE_INFO* info) {
                                        "CREATE TABLE"))
         return err;
     g_engine.mark_reconciled(tbl);
+    // AUTO_INCREMENT = n, or a copying ALTER's: the old table's next id
+    // (info(HA_STATUS_AUTO)) or the one the ALTER sets
+    if (ai_is_primary_key(form->s) && info->auto_increment_value > 1 &&
+        stoolap_auto_increment_set(db, tbl.c_str(),
+                                   info->auto_increment_value) != STOOLAP_OK) {
+        auto verr = fetch_db_error(db);
+        sql_print_error("stoolap: AUTO_INCREMENT of '%s' failed: %s",
+                        tbl.c_str(), verr.message);
+        return report_stoolap_error(verr);
+    }
     return 0;
 }
 
@@ -1040,6 +1058,8 @@ struct InplacePlan {
     std::string default_text;
     std::vector<const KEY*> drop_keys;
     std::vector<const KEY*> add_keys;
+    // AUTO_INCREMENT = n of the PRIMARY KEY's counter, 0 for none
+    ulonglong auto_increment = 0;
 };
 
 // The ALTER operations done in place; any other copies the table
@@ -1078,10 +1098,20 @@ bool added_default(TABLE* altered, Field* f, InplacePlan* plan) {
 // Plans an in-place ALTER of `table` into `altered`; false when it copies
 bool plan_inplace(TABLE* table, TABLE* altered, Alter_inplace_info* info,
                   InplacePlan* plan) {
+    alter_table_operations ops = info->handler_flags;
+    // AUTO_INCREMENT = n alone of the table's options: the PRIMARY KEY's
+    // counter, raised in place (check_if_supported_inplace_alter copies a
+    // table whose counter it would lower, which stoolap's cannot)
+    if (ops & ALTER_CHANGE_CREATE_OPTION) {
+        if (info->create_info->used_fields != HA_CREATE_USED_AUTO ||
+            !ai_is_primary_key(table->s))
+            return false;
+        plan->auto_increment = info->create_info->auto_increment_value;
+        ops &= ~ALTER_CHANGE_CREATE_OPTION;
+    }
     // A NOT NULL column with no value for the rows there (a zero date
     // under NO_ZERO_DATE): the copy refuses a table that has rows
-    if ((info->handler_flags & ~kInplaceOps) || info->error_if_not_empty)
-        return false;
+    if ((ops & ~kInplaceOps) || info->error_if_not_empty) return false;
     std::vector<bool> kept(table->s->fields, false);
     int changes = 0;
     uint i = 0, next = 0;
@@ -1144,8 +1174,20 @@ enum_alter_inplace_result ha_stoolap::check_if_supported_inplace_alter(
     InplacePlan plan;
     if (!plan_inplace(table, altered_table, ha_alter_info, &plan))
         return HA_ALTER_INPLACE_NOT_SUPPORTED;
+    // Below the counter's next id: the copy takes the larger of it and
+    // the largest id plus one, as InnoDB does
+    if (plan.auto_increment) {
+        StoolapDB* db = get_thd_ctx(ha_thd())->db();
+        uint64_t next = 0;
+        if (!db ||
+            stoolap_auto_increment_next(db, stoolap_table_.c_str(), &next) !=
+                STOOLAP_OK ||
+            plan.auto_increment < next)
+            return HA_ALTER_INPLACE_NOT_SUPPORTED;
+    }
     // Nothing for stoolap to change: a default, which MariaDB writes
-    if (!plan.op && plan.drop_keys.empty() && plan.add_keys.empty())
+    if (!plan.op && plan.drop_keys.empty() && plan.add_keys.empty() &&
+        !plan.auto_increment)
         return HA_ALTER_INPLACE_INSTANT;
     return HA_ALTER_INPLACE_EXCLUSIVE_LOCK;
 }
@@ -1175,6 +1217,17 @@ bool ha_stoolap::commit_inplace_alter_table(TABLE* altered_table,
         return true;
     }
     const char* tbl = stoolap_table_.c_str();
+    if (plan.auto_increment &&
+        stoolap_auto_increment_set(db, tbl, plan.auto_increment) !=
+            STOOLAP_OK) {
+        auto verr = fetch_db_error(db);
+        sql_print_error("stoolap: AUTO_INCREMENT of '%s' failed: %s", tbl,
+                        verr.message);
+        const int rc = report_stoolap_error(verr);
+        if (rc != HA_ERR_GENERIC && rc != HA_ERR_UNSUPPORTED)
+            print_error(rc, MYF(0));
+        return true;
+    }
     if (plan.op &&
         stoolap_alter_column(db, tbl, plan.op, plan.name.c_str(),
                              plan.new_name.c_str(), plan.kind, plan.nullable,
@@ -1505,7 +1558,7 @@ int ha_stoolap::write_row(const uchar* buf) {
     // Keep AI allocator in sync with explicit-id INSERTs (cross-connection).
     // Skip non-positive: signed -2 casts to ULLONG_MAX-1 and the next
     // generated insert fails ER_AUTOINC_READ_FAILED.
-    if (table->found_next_number_field) {
+    if (table->found_next_number_field && !ai_is_primary_key(table->s)) {
         Field* aifield = table->found_next_number_field;
         const longlong sv = aifield->val_int();
         const bool unsigned_col = (aifield->flags & UNSIGNED_FLAG) != 0;
@@ -2608,8 +2661,10 @@ void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,
                                     ulonglong nb_desired_values,
                                     ulonglong* first_value,
                                     ulonglong* nb_reserved_values) {
-    // Reserve ids process-wide: per-connection caches collide under
-    // concurrent sessions + explicit high-id inserts. Reserving with
+    // A PRIMARY KEY's ids come from stoolap's id counter. Another
+    // AUTO_INCREMENT column's are reserved process-wide (per-connection
+    // caches collide under concurrent sessions + explicit high-id
+    // inserts), from MAX + 1 after DDL. Reserving with
     // step=increment makes our cursor jump past every id MariaDB
     // logically issues in this batch (offset/increment is the multi-
     // writer replication ladder).
@@ -2620,6 +2675,21 @@ void ha_stoolap::get_auto_increment(ulonglong offset, ulonglong increment,
     if (!auto_field) return;
 
     const uint64_t step = increment ? static_cast<uint64_t>(increment) : 1;
+    if (ai_is_primary_key(table->s)) {
+        uint64_t first = 0;
+        StoolapDB* db = get_thd_ctx(ha_thd())->db();
+        if (!db || stoolap_auto_increment_reserve(
+                       db, stoolap_table_.c_str(),
+                       static_cast<uint64_t>(*nb_reserved_values), step,
+                       static_cast<uint64_t>(offset), &first) != STOOLAP_OK) {
+            sql_print_error("stoolap: AUTO_INCREMENT of '%s' failed: %s",
+                            stoolap_table_.c_str(),
+                            db ? stoolap_errmsg(db) : "no session");
+            return;
+        }
+        *first_value = static_cast<ulonglong>(first);
+        return;
+    }
     const uint64_t offset_mod =
         (step > 0) ? static_cast<uint64_t>(offset) % step : 0;
 
@@ -2951,6 +3021,16 @@ int ha_stoolap::info(uint flag) {
     if (flag & HA_STATUS_ERRKEY) {
         // get_dup_key() calls us to re-publish the violated key.
         errkey = last_dup_key_;
+    }
+
+    // SHOW CREATE TABLE, information_schema and a copying ALTER, which
+    // hands it to the new table
+    if ((flag & HA_STATUS_AUTO) && table && ai_is_primary_key(table->s)) {
+        StoolapDB* db = ha_thd() ? get_thd_ctx(ha_thd())->db() : nullptr;
+        uint64_t next = 0;
+        if (db && stoolap_auto_increment_next(db, stoolap_table_.c_str(),
+                                              &next) == STOOLAP_OK)
+            stats.auto_increment_value = static_cast<ulonglong>(next);
     }
 
     // Cache-only refresh on purpose: info() fires several times per

@@ -773,7 +773,7 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 [[package]]
 name = "stoolap"
 version = "0.4.2"
-source = "git+https://github.com/stoolap/stoolap?branch=main#af7af5e4baa46c7732227152e520e4f2110d0fef"
+source = "git+https://github.com/stoolap/stoolap?branch=main#2cfa3667c471b96ca9446c3a08bb2e9b4f964796"
 dependencies = [
  "ahash",
  "chrono",

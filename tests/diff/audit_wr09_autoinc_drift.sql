@@ -1,4 +1,3 @@
--- known-diff-file: AUTO_INCREMENT: deleted top ids reused, explicit value moves the counter
 CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, u INT, UNIQUE KEY uu (u)) ENGINE={E};
 INSERT INTO t (u) VALUES (1), (2), (3);
 DELETE FROM t WHERE id = 3;

@@ -758,6 +758,25 @@ int32_t stoolap_alter_column(StoolapDB* db, const char* table, int32_t op,
 uint64_t stoolap_table_version(StoolapDB* db, const char* table);
 
 /**
+ * AUTO_INCREMENT of a table whose INTEGER PRIMARY KEY it is, by stoolap's
+ * id counter (the last id handed out: generated, explicit or rolled back;
+ * a delete does not lower it, a restart keeps it).
+ *
+ * stoolap_auto_increment_set raises the counter so the next id is `next`
+ * (CREATE TABLE ... AUTO_INCREMENT = n, a copying ALTER's new table).
+ * stoolap_auto_increment_next gives that next id.
+ * stoolap_auto_increment_reserve takes `count` ids, `step` apart and each
+ * `offset` modulo `step`, past every id handed out; the first in *first.
+ */
+int32_t stoolap_auto_increment_set(StoolapDB* db, const char* table,
+                                   uint64_t next);
+int32_t stoolap_auto_increment_next(StoolapDB* db, const char* table,
+                                    uint64_t* next);
+int32_t stoolap_auto_increment_reserve(StoolapDB* db, const char* table,
+                                       uint64_t count, uint64_t step,
+                                       uint64_t offset, uint64_t* first);
+
+/**
  * Create the index of `table`'s non-unique key `key` over `columns`
  * (`create`), unless an index over them is there, which serves the key
  * too; or drop the non-unique one over them, but a FOREIGN KEY's (`key`

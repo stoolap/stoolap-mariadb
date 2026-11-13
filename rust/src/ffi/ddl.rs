@@ -392,6 +392,68 @@ pub unsafe extern "C" fn stoolap_alter_index(
     })
 }
 
+/// Raises `table`'s id counter so its next AUTO_INCREMENT id is `next`
+/// (`ddl::set_auto_increment`).
+///
+/// # Safety
+///
+/// As `stoolap_drop_table`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_auto_increment_set(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    next: u64,
+) -> i32 {
+    on_session(db, "stoolap_auto_increment_set", |session| {
+        ddl::set_auto_increment(session, text(table, "table name")?, next)?;
+        Ok(STOOLAP_OK)
+    })
+}
+
+/// The next AUTO_INCREMENT id `table`'s counter gives, in `*next`.
+///
+/// # Safety
+///
+/// As `stoolap_drop_table`; `next` a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_auto_increment_next(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    next: *mut u64,
+) -> i32 {
+    on_session(db, "stoolap_auto_increment_next", |session| {
+        let handed_out = session.auto_increment_counter(text(table, "table name")?)?;
+        if let Some(next) = next.as_mut() {
+            *next = handed_out.max(0) as u64 + 1;
+        }
+        Ok(STOOLAP_OK)
+    })
+}
+
+/// Takes `count` AUTO_INCREMENT ids of `table`, `step` apart, each `offset`
+/// modulo `step`; the first in `*first` (`Session::reserve_auto_increment`).
+///
+/// # Safety
+///
+/// As `stoolap_drop_table`; `first` a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_auto_increment_reserve(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    count: u64,
+    step: u64,
+    offset: u64,
+    first: *mut u64,
+) -> i32 {
+    on_session(db, "stoolap_auto_increment_reserve", |session| {
+        let id = session.reserve_auto_increment(text(table, "table name")?, count, step, offset)?;
+        if let Some(first) = first.as_mut() {
+            *first = id;
+        }
+        Ok(STOOLAP_OK)
+    })
+}
+
 /// The version of `table`'s definition (`ddl::table_version`); 0 when it
 /// cannot be read.
 ///

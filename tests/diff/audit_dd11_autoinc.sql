@@ -1,4 +1,3 @@
--- known-diff-file: AUTO_INCREMENT: reseeded from MAX+1 after any DDL; AUTO_INCREMENT=N ignored
 CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, a INT) ENGINE={E};
 INSERT INTO t (a) VALUES (1),(2),(3);
 DELETE FROM t WHERE id = 3;
