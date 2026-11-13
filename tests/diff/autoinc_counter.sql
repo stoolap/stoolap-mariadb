@@ -19,11 +19,9 @@ ALTER TABLE t AUTO_INCREMENT = 50;
 INSERT INTO t (a) VALUES (7);
 -- Lowered: below the deleted ids, above the largest
 DELETE FROM t WHERE id = 50;
--- known-diff: lowering copies the table (stoolap's counter only rises): the copied rows count as affected
 ALTER TABLE t AUTO_INCREMENT = 10;
 INSERT INTO t (a) VALUES (8);
 -- Lowered below the largest: the largest plus one
--- known-diff: lowering copies the table (stoolap's counter only rises): the copied rows count as affected
 ALTER TABLE t AUTO_INCREMENT = 2;
 INSERT INTO t (a) VALUES (9);
 SELECT id, a FROM t ORDER BY id;
@@ -62,7 +60,6 @@ INSERT INTO m (id) VALUES (100), (NULL), (50), (NULL);
 SELECT id FROM m ORDER BY id;
 -- AUTO_INCREMENT = 0: the largest id plus one
 DELETE FROM m WHERE id > 50;
--- known-diff: lowering copies the table (stoolap's counter only rises): the copied rows count as affected
 ALTER TABLE m AUTO_INCREMENT = 0;
 INSERT INTO m (a) VALUES (1);
 SELECT id FROM m ORDER BY id;

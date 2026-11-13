@@ -192,6 +192,33 @@ INSERT INTO iai (a) VALUES (1);
     h.assert_scalar("the next id follows the insert's",
                     "SELECT GROUP_CONCAT(id ORDER BY id) FROM iai", "1,2,100,101")
 
+    h.section("AUTO_INCREMENT = n waits out an insert it lowers past")
+    # The transaction's ids past n roll back while the ALTER waits for it:
+    # InnoDB lowers the counter to n
+    h.exec_script(f"""
+CREATE TABLE ilr (id INT AUTO_INCREMENT PRIMARY KEY, a INT) ENGINE={h.engine};
+INSERT INTO ilr (a) VALUES (1);
+""")
+    w, wcur = h.open_session(autocommit=False)
+    try:
+        wcur.execute("INSERT INTO ilr (a) VALUES (2)")
+        alter = h.run_async("ALTER TABLE ilr AUTO_INCREMENT = 50;",
+                            force=True)
+        time.sleep(0.5)
+        wcur.execute("INSERT INTO ilr VALUES (100, 3)")
+        w.rollback()
+        h.assert_eq("the ALTER goes ahead", "", alter.wait(timeout=30).strip())
+    finally:
+        w.close()
+    h.exec_stmt("INSERT INTO ilr (a) VALUES (4)")
+    h.assert_scalar("the next id is n",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM ilr", "1,50")
+    h.assert_ok("a lowering runs in place",
+                "ALTER TABLE ilr AUTO_INCREMENT = 2, ALGORITHM=INPLACE")
+    h.exec_stmt("INSERT INTO ilr (a) VALUES (5)")
+    h.assert_scalar("past the largest id",
+                    "SELECT MAX(id) FROM ilr", "51")
+
     h.section("What the copy refuses")
     h.assert_err("a COMPRESSED column is not added in place",
                  "ALTER TABLE ia ADD COLUMN m TEXT COMPRESSED, "

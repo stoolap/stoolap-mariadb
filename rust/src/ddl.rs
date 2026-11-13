@@ -450,14 +450,14 @@ pub fn drop_column(session: &Session, table: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Raises `table`'s id counter so its next AUTO_INCREMENT id is `next`
-/// (CREATE TABLE ... AUTO_INCREMENT = n; a copying ALTER's new table,
-/// whose copied rows then raise it past their largest id, as InnoDB keeps
-/// the larger of the two). A counter already there stays: an in-place
-/// ALTER that waited out an insert past `next` leaves the id after it
+/// Sets `table`'s id counter so its next AUTO_INCREMENT id is `next`, or
+/// the largest id a row holds plus one when that is larger, as InnoDB
+/// (CREATE TABLE ... AUTO_INCREMENT = n, a copying ALTER's new table, an
+/// in-place ALTER). stoolap refuses to lower it while a transaction holds
+/// uncommitted rows of the table, which MariaDB's lock on it rules out
 pub fn set_auto_increment(session: &Session, table: &str, next: u64) -> Result<()> {
-    let next = next.min(i64::MAX as u64);
-    if next <= 1 || session.auto_increment_counter(table)? >= next as i64 - 1 {
+    let next = next.clamp(1, i64::MAX as u64);
+    if session.auto_increment_counter(table)? == next as i64 - 1 {
         return Ok(());
     }
     session.run(

@@ -1103,8 +1103,7 @@ bool plan_inplace(TABLE* table, TABLE* altered, Alter_inplace_info* info,
                   InplacePlan* plan) {
     alter_table_operations ops = info->handler_flags;
     // AUTO_INCREMENT = n alone of the table's options: the PRIMARY KEY's
-    // counter, raised in place (check_if_supported_inplace_alter copies a
-    // table whose counter it would lower, which stoolap's cannot)
+    // counter, set in place
     if (ops & ALTER_CHANGE_CREATE_OPTION) {
         if (info->create_info->used_fields != HA_CREATE_USED_AUTO ||
             !ai_is_primary_key(table->s))
@@ -1179,17 +1178,6 @@ enum_alter_inplace_result ha_stoolap::check_if_supported_inplace_alter(
     InplacePlan plan;
     if (!plan_inplace(table, altered_table, ha_alter_info, &plan))
         return HA_ALTER_INPLACE_NOT_SUPPORTED;
-    // Below the counter's next id: the copy takes the larger of it and
-    // the largest id plus one, as InnoDB does
-    if (plan.auto_increment) {
-        StoolapDB* db = get_thd_ctx(ha_thd())->db();
-        uint64_t next = 0;
-        if (!db ||
-            stoolap_auto_increment_next(db, stoolap_table_.c_str(), &next) !=
-                STOOLAP_OK ||
-            plan.auto_increment < next)
-            return HA_ALTER_INPLACE_NOT_SUPPORTED;
-    }
     // Nothing for stoolap to change: a default, which MariaDB writes
     if (!plan.op && plan.drop_keys.empty() && plan.add_keys.empty() &&
         !plan.auto_increment)
