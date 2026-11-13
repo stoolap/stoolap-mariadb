@@ -392,8 +392,8 @@ pub unsafe extern "C" fn stoolap_alter_index(
     })
 }
 
-/// Raises `table`'s id counter so its next AUTO_INCREMENT id is `next`
-/// (`ddl::set_auto_increment`).
+/// Sets `table`'s id counter so its next AUTO_INCREMENT id is `next`, or
+/// past its largest row id (`ddl::set_auto_increment`).
 ///
 /// # Safety
 ///

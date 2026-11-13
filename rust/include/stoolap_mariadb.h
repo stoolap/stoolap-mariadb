@@ -762,8 +762,9 @@ uint64_t stoolap_table_version(StoolapDB* db, const char* table);
  * id counter (the last id handed out: generated, explicit or rolled back;
  * a delete does not lower it, a restart keeps it).
  *
- * stoolap_auto_increment_set raises the counter so the next id is `next`
- * (CREATE TABLE ... AUTO_INCREMENT = n, a copying ALTER's new table).
+ * stoolap_auto_increment_set sets the counter so the next id is `next`, or
+ * the largest id a row holds plus one when larger (CREATE TABLE ...
+ * AUTO_INCREMENT = n, a copying ALTER's new table, an in-place ALTER).
  * stoolap_auto_increment_next gives that next id.
  * stoolap_auto_increment_reserve takes *count ids, `step` apart and each
  * `offset` modulo `step`, past every id handed out; the first in *first,

@@ -72,6 +72,11 @@ _AI_SETUP = [
     "ENGINE=STOOLAP",
     "INSERT INTO a3 (a) VALUES (1)",
     "ALTER TABLE a3 AUTO_INCREMENT = 50",
+    "CREATE TABLE a4 (id INT AUTO_INCREMENT PRIMARY KEY, a INT) "
+    "ENGINE=STOOLAP",
+    "INSERT INTO a4 VALUES (1, 0), (100, 0)",
+    "DELETE FROM a4 WHERE id = 100",
+    "ALTER TABLE a4 AUTO_INCREMENT = 1",
 ]
 
 
@@ -80,7 +85,7 @@ def _check_ai(h, srv, label, expected):
     c = _connect(srv)
     cur = c.cursor()
     got = []
-    for t in ("a1", "a2", "a3"):
+    for t in ("a1", "a2", "a3", "a4"):
         cur.execute(f"INSERT INTO {t} (a) VALUES (0)")
         got.append(cur.lastrowid)
         cur.execute(f"DELETE FROM {t} WHERE id = {cur.lastrowid}")
@@ -151,7 +156,7 @@ def run(h):
         t_rows = [(2, "c", 20), (3, "b", 3), (new_id, "b", 4)]
         c_rows = [(10, 1)]
         _check(h, srv, "after a crash", t_rows, c_rows)
-        _check_ai(h, srv, "after a crash", (4, 100, 50))
+        _check_ai(h, srv, "after a crash", (4, 100, 50, 2))
 
         h.section("The tables take writes and DDL after recovery")
         c = _connect(srv)
@@ -173,7 +178,7 @@ def run(h):
                     [(2, 7), (3, 3), (new_id, 4)],
                     _rows(cur, f"SELECT id, w FROM t WHERE id <= {new_id} "
                                "ORDER BY id"))
-        _check_ai(h, srv, "after a restart", (5, 101, 51))
+        _check_ai(h, srv, "after a restart", (5, 101, 51, 3))
         cur.execute(f"DROP DATABASE {DB}")
         c.close()
     finally:

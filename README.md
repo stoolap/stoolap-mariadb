@@ -285,11 +285,10 @@ Differences from InnoDB that remain. Each has a scenario in `tests/diff/`
 marked `-- known-diff-file:`, which fails once the scenario matches, so
 the list stays current.
 
-- **`ALTER TABLE ... AUTO_INCREMENT = N`** below the next id copies the
-  table (stoolap's counter only rises) and reports the copied rows as
-  affected; the counter it leaves is InnoDB's. One that runs in place
-  after waiting out a transaction's ids past `N` keeps the counter past
-  them even when they were rolled back (InnoDB takes `MAX + 1`).
+- **`ALTER TABLE ... AUTO_INCREMENT = N`** below the next id stops past
+  the ids of rows deleted after stoolap wrote them to disk (file://),
+  until compaction drops them; InnoDB goes down to `MAX + 1`. No scenario
+  in `tests/diff/`: the runner cannot make stoolap write rows to disk.
 - **AUTO_INCREMENT on a column other than the PRIMARY KEY** is recomputed
   from `MAX(col) + 1` after DDL.
 - **`utf8mb4_bin` UNIQUE** ignores PAD SPACE (`'a'` and `'a '` are both
