@@ -327,6 +327,70 @@ impl Session {
             .is_empty()
     }
 
+    /// The last id `table`'s counter handed out: stoolap's id counter,
+    /// which the inserts into an INTEGER PRIMARY KEY raise to their ids
+    /// (generated, explicit, rolled back), never lowered by a delete
+    pub fn auto_increment_counter(&self, table: &str) -> Result<i64> {
+        Ok(self
+            .exec
+            .engine()
+            .get_version_store(table)?
+            .get_auto_increment_counter())
+    }
+
+    /// Raises `table`'s counter to `id`, an explicit id of a row stoolap
+    /// has not taken yet (a buffered insert's)
+    pub fn note_auto_increment(&self, table: &str, id: u64) -> Result<()> {
+        if let Ok(id) = i64::try_from(id) {
+            self.exec
+                .engine()
+                .get_version_store(table)?
+                .set_auto_increment_counter(id);
+        }
+        Ok(())
+    }
+
+    /// Takes `count` ids from `table`'s counter for MariaDB to generate,
+    /// `step` apart and each `offset` modulo `step` (auto_increment_increment
+    /// and _offset), past every id handed out: the first and how many,
+    /// fewer than `count` when the rest pass i64::MAX (MariaDB's count is
+    /// an estimate). The counter moves a step past the last, as InnoDB's,
+    /// so no other session takes them
+    pub fn reserve_auto_increment(
+        &self,
+        table: &str,
+        count: u64,
+        step: u64,
+        offset: u64,
+    ) -> Result<(u64, u64)> {
+        // Reservations read the counter and raise it under one lock: two
+        // raising from the same value would take the same ids
+        static RESERVING: Mutex<()> = Mutex::new(());
+        let store = self.exec.engine().get_version_store(table)?;
+        let step = step.max(1);
+        let exhausted = || {
+            Error::invalid_argument(format!(
+                "AUTO_INCREMENT counter of table '{table}' is exhausted"
+            ))
+        };
+        let _reserving = lock(&RESERVING);
+        loop {
+            let next = store.get_auto_increment_counter().max(0) as u64 + 1;
+            let first = next
+                .checked_add((offset % step + step - next % step) % step)
+                .ok_or_else(exhausted)?;
+            let room = (i64::MAX as u64).checked_sub(first).ok_or_else(exhausted)?;
+            let count = count.clamp(1, room / step + 1);
+            let last = first + (count - 1) * step;
+            // An insert of an explicit id past it raised the counter since
+            // it was read: read it again
+            let claimed = last.saturating_add(step - 1).min(i64::MAX as u64);
+            if store.set_auto_increment_counter(claimed as i64) {
+                return Ok((first, count));
+            }
+        }
+    }
+
     /// `table`'s column names, in order
     pub fn column_names(&self, table: &str) -> Result<Vec<String>> {
         use stoolap::storage::traits::Engine;

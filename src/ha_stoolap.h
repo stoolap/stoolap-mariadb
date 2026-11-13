@@ -265,6 +265,9 @@ private:
     // A bulk insert's rows wait in Rust (row_buffer_, bulk_rows_ of them)
     // until a flush writes them.
     bool bulk_active_ = false;
+    // The id this statement raised stoolap's AUTO_INCREMENT counter to
+    // (write_row), or reserved up to: a buffered row's id past it raises it
+    uint64_t ai_noted_ = 0;
     stoolap_mariadb::RowBufferPtr row_buffer_;
     int64_t bulk_rows_ = 0;
     // A foreign key names the table: its chunked flushes in autocommit

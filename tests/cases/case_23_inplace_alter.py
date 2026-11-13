@@ -6,6 +6,8 @@ does one changing more than one column: stoolap's DDL statements are not
 atomic together.
 """
 
+import time
+
 import mysql.connector
 
 NO_INPLACE = "1845"
@@ -166,6 +168,29 @@ INSERT INTO ia VALUES (1, 10, 'x'), (2, 20, 'y');
         w.close()
     h.assert_ok("and goes ahead once it ends",
                 "ALTER TABLE ia ADD COLUMN k INT, ALGORITHM=INPLACE")
+
+    h.section("AUTO_INCREMENT = n waits out an insert past it")
+    # The ALTER chose to raise the counter in place, then waited for the
+    # transaction, whose insert took the counter past n: InnoDB leaves the
+    # next id after that insert's
+    h.exec_script(f"""
+CREATE TABLE iai (id INT AUTO_INCREMENT PRIMARY KEY, a INT) ENGINE={h.engine};
+INSERT INTO iai (a) VALUES (1);
+""")
+    w, wcur = h.open_session(autocommit=False)
+    try:
+        wcur.execute("INSERT INTO iai (a) VALUES (2)")
+        alter = h.run_async("ALTER TABLE iai AUTO_INCREMENT = 50;",
+                            force=True)
+        time.sleep(0.5)
+        wcur.execute("INSERT INTO iai VALUES (100, 3)")
+        w.commit()
+        h.assert_eq("the ALTER goes ahead", "", alter.wait(timeout=30).strip())
+    finally:
+        w.close()
+    h.exec_stmt("INSERT INTO iai (a) VALUES (4)")
+    h.assert_scalar("the next id follows the insert's",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM iai", "1,2,100,101")
 
     h.section("What the copy refuses")
     h.assert_err("a COMPRESSED column is not added in place",
