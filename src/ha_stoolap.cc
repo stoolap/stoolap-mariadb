@@ -2097,8 +2097,13 @@ int ha_stoolap::rnd_next(uchar* buf) {
     stoolap_mariadb::RecordTarget target{table, 0, &blob_bufs_};
     int64_t id = 0;
     int32_t last = 0;
-    const int rc = stoolap_cursor_next(
-        cursor_.get(), buf, &stoolap_mariadb::store_cell, &target, &id, &last);
+    int rc;
+    {
+        stoolap_mariadb::StoreAsStored as_stored(table->in_use);
+        rc = stoolap_cursor_next(cursor_.get(), buf,
+                                 &stoolap_mariadb::store_cell, &target, &id,
+                                 &last);
+    }
     move_fields(table, -row_diff);
     if (rc == STOOLAP_ROW) {
         cur_row_id_ = id;

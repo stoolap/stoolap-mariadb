@@ -844,9 +844,13 @@ struct PushdownRows {
         stoolap_mariadb::RecordTarget target{table, 0};
         int64_t id = 0;
         int32_t last = 0;
-        const int rc = stoolap_cursor_next(cursor.get(), table->record[0],
-                                           &stoolap_mariadb::store_cell,
-                                           &target, &id, &last);
+        int rc;
+        {
+            stoolap_mariadb::StoreAsStored as_stored(table->in_use);
+            rc = stoolap_cursor_next(cursor.get(), table->record[0],
+                                     &stoolap_mariadb::store_cell, &target, &id,
+                                     &last);
+        }
         if (rc == STOOLAP_ROW) return 0;
         if (rc == STOOLAP_DONE) return HA_ERR_END_OF_FILE;
         return target.err ? target.err : fail(what);
