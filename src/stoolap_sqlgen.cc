@@ -158,6 +158,7 @@ private:
     bool in_optimizer(Item_in_optimizer* o);
     bool order_list(SQL_I_List<ORDER>* lst, bool directions);
     bool limit(SELECT_LEX* sel);
+    bool divide_by_zero_fails() const;
     bool branch(Item* it, Cls result);
     bool branches(Item_func* f, Item** args, uint n);
     bool frame_bound(Window_frame_bound* b);
@@ -462,8 +463,17 @@ bool Gen::select(SELECT_LEX* sel, const std::vector<std::string>* names,
 }
 
 bool Gen::limit(SELECT_LEX* sel) {
-    if (!sel->limit_params.explicit_limit) return true;
     Item* lim = sel->limit_params.select_limit;
+    if (!sel->limit_params.explicit_limit) {
+        // sql_select_limit: MariaDB puts it on the statement's outermost
+        // ORDER BY / LIMIT alone (execute_sqlcom_select), without
+        // explicit_limit; a subquery's own limit (EXISTS) is its business
+        if (!lim || sel != thd_->lex->unit.global_parameters()) return true;
+        if (!lim->const_item() || lim->is_null()) return fail("LIMIT value");
+        const ulonglong n = lim->val_uint();
+        if (n != HA_POS_ERROR) out += " LIMIT " + std::to_string(n);
+        return true;
+    }
     Item* off = sel->limit_params.offset_limit;
     if (!lim || !lim->const_item() || lim->is_null())
         return fail("LIMIT value");
@@ -1164,6 +1174,41 @@ bool Gen::func(Item_func* f) {
     }
 }
 
+// A division by zero fails the statement (1365) where stoolap's gives
+// NULL: under strict ERROR_FOR_DIVISION_BY_ZERO, in a statement that
+// writes rows from it without IGNORE (DELETE only warns)
+bool Gen::divide_by_zero_fails() const {
+    if (!(thd_->variables.sql_mode & MODE_ERROR_FOR_DIVISION_BY_ZERO) ||
+        !thd_->is_strict_mode() || thd_->lex->ignore)
+        return false;
+    switch (thd_->lex->sql_command) {
+        case SQLCOM_UPDATE:
+        case SQLCOM_UPDATE_MULTI:
+        case SQLCOM_INSERT:
+        case SQLCOM_INSERT_SELECT:
+        case SQLCOM_REPLACE:
+        case SQLCOM_REPLACE_SELECT:
+        case SQLCOM_CREATE_TABLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// A number written in the statement (or bound to its parameter), other
+// than zero
+static bool nonzero_literal(Item* it) {
+    if (it->type() != Item::CONST_ITEM) return false;
+    switch (it->cmp_type()) {
+        case INT_RESULT:
+        case REAL_RESULT:
+        case DECIMAL_RESULT:
+            return it->val_real() != 0;
+        default:
+            return false;
+    }
+}
+
 bool Gen::named_func(Item_func* f) {
     Item** a = f->arguments();
     const uint n = f->argument_count();
@@ -1176,6 +1221,8 @@ bool Gen::named_func(Item_func* f) {
         if (n != 2 || !numeric(cls(a[0])) || !numeric(cls(a[1])) ||
             !numeric(rc) || (name == "/" && rc != Cls::REAL))
             return fail("arithmetic");
+        if (name == "/" && divide_by_zero_fails() && !nonzero_literal(a[1]))
+            return fail("division that must fail on zero");
         const std::string op = " " + std::string(name) + " ";
         return binop(a[0], op.c_str(), a[1]);
     }
@@ -1321,6 +1368,9 @@ bool Gen::subquery(SELECT_LEX_UNIT* u) {
 bool Gen::sum(Item_sum* s, bool over_window) {
     Item** a = s->get_args();
     const uint n = s->get_arg_count();
+    // An aggregate of only an outer query's columns is that query's (one
+    // group over its rows); stoolap would aggregate it in the subquery
+    if (s->depended_from()) return fail("an outer query's aggregate");
     switch (s->sum_func()) {
         case Item_sum::COUNT_FUNC:
             if (n != 1) return fail("COUNT arity");
