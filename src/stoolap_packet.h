@@ -36,6 +36,7 @@
 #include "field.h"
 #include "table.h"
 #include "my_global.h"
+#include "sql_class.h"
 #include "stoolap_types.h"
 
 #include <cstdint>
@@ -242,6 +243,23 @@ inline bool store_blob_owned(Field_blob* b, const uint8_t* cell, size_t len,
                reinterpret_cast<uchar*>(own.data()));
     return true;
 }
+
+// For a read's Field::store calls: each value as stoolap holds it, which
+// a write took under the writer's sql_mode, as InnoDB copies its bytes.
+// The reader's date modes (NO_ZERO_DATE, NO_ZERO_IN_DATE, no
+// ALLOW_INVALID_DATES) would zero a date and its strict checks raise 1265.
+class StoreAsStored {
+public:
+    explicit StoreAsStored(THD* thd)
+        : mode_(thd, (thd->variables.sql_mode &
+                      ~(MODE_NO_ZERO_DATE | MODE_NO_ZERO_IN_DATE)) |
+                         MODE_INVALID_DATES),
+          check_(thd, CHECK_FIELD_IGNORE) {}
+
+private:
+    Sql_mode_instant_set mode_;
+    Check_level_instant_set check_;
+};
 
 inline int32_t store_cell(void* ctx, int32_t field, const uint8_t* cell,
                           size_t len) {
