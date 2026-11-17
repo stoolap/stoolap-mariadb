@@ -79,7 +79,22 @@ const ROWID_SUFFIX: char = '\u{F0000}';
 /// again once renamed. A rename that fails leaves its table refusing reads,
 /// and is reported.
 pub fn rename_reserved_columns(db: &Database) {
-    for schema in db.engine().get_all_schemas() {
+    use stoolap::storage::traits::Engine;
+    let tables: Vec<String> = db
+        .query("SHOW TABLES", ())
+        .map(|rows| {
+            rows.filter_map(|row| match row.ok()?.get_value(0) {
+                Some(Value::Text(name)) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    let engine = db.engine();
+    for schema in tables
+        .iter()
+        .filter_map(|t| engine.get_table_schema(t).ok())
+    {
         for column in &schema.columns {
             if !column.name.eq_ignore_ascii_case(ROWID_NAME) {
                 continue;

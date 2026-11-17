@@ -65,11 +65,13 @@ jobs:
             rust-${{ runner.os }}-
 
       - name: Follow stoolap main (nightly)
-        # Cargo.lock pins the stoolap commit PRs build against; the
-        # scheduled run moves it to main's head so upstream changes that
-        # break the crate show up here first.
+        # PRs build against the stoolap release Cargo.toml names; the
+        # scheduled run builds against main's head instead, so upstream
+        # changes that break the crate show up here first.
         if: github.event_name == 'schedule'
-        run: cargo update --manifest-path rust/Cargo.toml -p stoolap
+        run: |
+          printf '\n[patch.crates-io]\nstoolap = { git = "https://github.com/stoolap/stoolap", branch = "main" }\n' >> rust/Cargo.toml
+          cargo update --manifest-path rust/Cargo.toml -p stoolap
 
       - name: Build plugin
         run: |
@@ -150,11 +152,13 @@ jobs:
             rust-${{ runner.os }}-
 
       - name: Follow stoolap main (nightly)
-        # Cargo.lock pins the stoolap commit PRs build against; the
-        # scheduled run moves it to main's head so upstream changes that
-        # break the crate show up here first.
+        # PRs build against the stoolap release Cargo.toml names; the
+        # scheduled run builds against main's head instead, so upstream
+        # changes that break the crate show up here first.
         if: github.event_name == 'schedule'
-        run: cargo update --manifest-path rust/Cargo.toml -p stoolap
+        run: |
+          printf '\n[patch.crates-io]\nstoolap = { git = "https://github.com/stoolap/stoolap", branch = "main" }\n' >> rust/Cargo.toml
+          cargo update --manifest-path rust/Cargo.toml -p stoolap
 
       - name: Build plugin
         run: |

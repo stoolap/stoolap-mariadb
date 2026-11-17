@@ -16,6 +16,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use stoolap::core::{Error, Operator, Result, Row, Value};
+use stoolap::executor::Deadline;
 use stoolap::storage::expression::{
     AndExpr, ComparisonExpr, ConstBoolExpr, Expression, NullCheckExpr, OrExpr,
 };
@@ -97,7 +98,7 @@ impl Pager {
         let got = self.session.with_table(&self.table, |t| {
             let name = t.schema().columns[column].name.clone();
             // MariaDB's order: NULL first ascending, last descending
-            t.collect_rows_ordered_by_index(&name, asc, asc, page, offset)
+            t.collect_rows_ordered_by_index(&name, asc, asc, page, offset, Deadline::NONE)
         })?;
         let rows: Vec<(i64, Row)> = match got {
             Some(rows) => {
@@ -113,7 +114,7 @@ impl Pager {
                 self.done = true;
                 let desc = self.desc;
                 let all = self.session.with_table(&self.table, |t| {
-                    sorted_rows(t.scan(&[], None)?, &[column], desc)
+                    sorted_rows(t.scan(&[], None, Deadline::NONE)?, &[column], desc)
                 })?;
                 match &self.last {
                     None => all,
@@ -202,7 +203,7 @@ impl Cursor {
             return Err(Error::internal("column out of range"));
         }
         let rows: Vec<(i64, Row)> = table
-            .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr())?
+            .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr(), Deadline::NONE)?
             .into_iter()
             .collect();
         Ok(Cursor {
@@ -242,7 +243,11 @@ impl Cursor {
                     .clone()
                     .into_coerce_to_type(schema.columns[*column].data_type)
                 {
-                    let rows = table.fetch_rows_by_ids(&[id], &ConstBoolExpr::true_expr())?;
+                    let rows = table.fetch_rows_by_ids(
+                        &[id],
+                        &ConstBoolExpr::true_expr(),
+                        Deadline::NONE,
+                    )?;
                     return Ok(Cursor {
                         source: Source::Sorted(rows.into_iter().collect::<Vec<_>>().into_iter()),
                         current: None,
@@ -299,14 +304,14 @@ impl Cursor {
 
         // No column list: full rows, which `columns` picks from
         let scanner = match filter.as_deref() {
-            None => table.scan(&[], None)?,
+            None => table.scan(&[], None, Deadline::NONE)?,
             Some(f) => {
                 let plan = table.index_plan(f);
                 let access = match &plan {
                     Some(p) => ScanAccess::Index(p),
                     None => ScanAccess::Seq,
                 };
-                table.scan_access(access, &[], None, Some(f))?
+                table.scan_access(access, &[], None, Some(f), Deadline::NONE)?
             }
         };
 
