@@ -103,12 +103,12 @@ impl Session {
     pub fn run(&self, sql: &str, params: ParamVec) -> Result<Box<dyn QueryResult>> {
         if self.in_transaction() {
             let plan = self.exec.get_or_create_plan(sql)?;
-            return self.run_plan(&plan, params);
+            return self.run_plan(sql, &plan, params);
         }
         if lock(&self.stmt_tx).is_some() {
             let plan = self.exec.get_or_create_plan(sql)?;
             if matches!(*plan.statement, Statement::Select(_)) {
-                return self.run_in_stmt_tx(&plan, params);
+                return self.run_in_stmt_tx(sql, params);
             }
         }
         if params.is_empty() {
@@ -127,7 +127,7 @@ impl Session {
         if self.in_transaction() {
             return self.run(sql, params);
         }
-        let plan = self.exec.get_or_create_plan(sql)?;
+        self.exec.get_or_create_plan(sql)?;
         {
             let mut stmt_tx = lock(&self.stmt_tx);
             if stmt_tx.is_none() {
@@ -135,15 +135,21 @@ impl Session {
             }
         }
         self.stmt_wrote.store(true, Ordering::Relaxed);
-        self.run_in_stmt_tx(&plan, params)
+        self.run_in_stmt_tx(sql, params)
     }
 
     pub fn prepare(&self, sql: &str) -> Result<CachedPlanRef> {
         self.exec.get_or_create_plan(sql)
     }
 
-    /// Runs a prepared plan, in the open transaction when there is one
-    pub fn run_plan(&self, plan: &CachedPlanRef, params: ParamVec) -> Result<Box<dyn QueryResult>> {
+    /// Runs `sql`, whose plan is `plan`, in the open transaction when there
+    /// is one
+    fn run_plan(
+        &self,
+        sql: &str,
+        plan: &CachedPlanRef,
+        params: ParamVec,
+    ) -> Result<Box<dyn QueryResult>> {
         if self.in_transaction() {
             runs_in_transaction(&plan.statement)?;
             if matches!(
@@ -158,16 +164,12 @@ impl Session {
         } else {
             ExecutionContext::with_params(params)
         };
-        self.exec.execute_with_cached_plan(plan, &ctx)
+        self.exec.execute_with_context(sql, &ctx)
     }
 
-    /// Runs `plan` in the statement's own transaction, lent to the
+    /// Runs `sql` in the statement's own transaction, lent to the
     /// executor for the call
-    fn run_in_stmt_tx(
-        &self,
-        plan: &CachedPlanRef,
-        params: ParamVec,
-    ) -> Result<Box<dyn QueryResult>> {
+    fn run_in_stmt_tx(&self, sql: &str, params: ParamVec) -> Result<Box<dyn QueryResult>> {
         let tx = lock(&self.stmt_tx).take().ok_or(Error::TransactionEnded)?;
         self.exec.install_transaction(tx);
         let ctx = if params.is_empty() {
@@ -175,7 +177,7 @@ impl Session {
         } else {
             ExecutionContext::with_params(params)
         };
-        let result = self.exec.execute_with_cached_plan(plan, &ctx);
+        let result = self.exec.execute_with_context(sql, &ctx);
         *lock(&self.stmt_tx) = self.exec.take_transaction();
         result
     }

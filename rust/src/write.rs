@@ -15,12 +15,33 @@
 //! both look the keys up first.
 
 use stoolap::core::{Error, Operator, Result, Row, Value};
+use stoolap::executor::Deadline;
 use stoolap::storage::expression::{
     AndExpr, ComparisonExpr, ConstBoolExpr, Expression, InListExpr,
 };
 use stoolap::storage::traits::{ScanAccess, Table};
 
 use crate::read::check_columns;
+
+/// Each UNIQUE index of `table`, its name and its columns' names: the
+/// primary key's first, as InnoDB reports its duplicate before another
+/// key's (ON DUPLICATE KEY UPDATE and REPLACE act on the row it names)
+fn unique_indexes(table: &dyn Table) -> Result<Vec<(String, Vec<String>)>> {
+    let mut out = Vec::new();
+    let schema = table.schema();
+    if let Some(pk) = schema.pk_column_index() {
+        if let Some(index) = table.get_index_on_column(&schema.columns[pk].name) {
+            if index.is_unique() && index.column_ids() == [pk as i32] {
+                out.push((index.name().to_string(), index.column_names().to_vec()));
+            }
+        }
+    }
+    table.for_each_unique_non_pk_index(&mut |index| {
+        out.push((index.name().to_string(), index.column_names().to_vec()));
+        Ok(())
+    })?;
+    Ok(out)
+}
 
 /// A row id no row has: the row an insert checks has none yet
 const NO_ROW: i64 = i64::MIN;
@@ -101,7 +122,7 @@ pub fn update(
     if !pk.is_some_and(|p| columns.contains(&p)) {
         if table.has_unique_non_pk_indexes() {
             let Some((_, mut row)) = table
-                .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr())?
+                .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr(), Deadline::NONE)?
                 .into_iter()
                 .next()
             else {
@@ -171,7 +192,7 @@ pub(crate) fn check_update(
 ) -> Result<()> {
     // Only a UNIQUE index over a changed column can conflict
     let schema = table.schema();
-    let touched = table.get_unique_indexes().iter().any(|(_, names)| {
+    let touched = unique_indexes(table)?.iter().any(|(_, names)| {
         names.iter().any(|n| {
             schema
                 .get_column_index(n)
@@ -182,7 +203,7 @@ pub(crate) fn check_update(
         return Ok(());
     }
     let Some((_, mut row)) = table
-        .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr())?
+        .fetch_rows_by_ids(&[row_id], &ConstBoolExpr::true_expr(), Deadline::NONE)?
         .into_iter()
         .next()
     else {
@@ -235,7 +256,7 @@ pub fn delete(table: &mut dyn Table, row_id: i64, read: &ReadCheck) -> Result<i6
 /// rows, which no index holds, once for every row.
 fn check_unique_batch(table: &dyn Table, rows: &[Row]) -> Result<()> {
     let schema = table.schema();
-    for (index, names) in table.get_unique_indexes() {
+    for (index, names) in unique_indexes(table)? {
         let Some(ids) = names
             .iter()
             .map(|n| schema.get_column_index(n))
@@ -280,7 +301,7 @@ fn check_unique_batch(table: &dyn Table, rows: &[Row]) -> Result<()> {
             Some(p) => ScanAccess::Index(p),
             None => ScanAccess::Seq,
         };
-        let mut scanner = table.scan_access(access, &[], None, Some(&filter))?;
+        let mut scanner = table.scan_access(access, &[], None, Some(&filter), Deadline::NONE)?;
         if scanner.next() {
             let value = scanner.row().get(column).cloned();
             return Err(conflict(
@@ -299,7 +320,7 @@ fn check_unique_batch(table: &dyn Table, rows: &[Row]) -> Result<()> {
 /// one of the `changed` columns holds its key for another row
 fn check_unique(table: &dyn Table, row_id: i64, row: &Row, changed: &[usize]) -> Result<()> {
     let schema = table.schema();
-    for (index, names) in table.get_unique_indexes() {
+    for (index, names) in unique_indexes(table)? {
         let Some(ids) = names
             .iter()
             .map(|n| schema.get_column_index(n))
@@ -339,7 +360,8 @@ fn check_unique(table: &dyn Table, row_id: i64, row: &Row, changed: &[usize]) ->
             Some(p) => ScanAccess::Index(p),
             None => ScanAccess::Seq,
         };
-        let mut scanner = table.scan_access(access, &[], None, Some(filter.as_ref()))?;
+        let mut scanner =
+            table.scan_access(access, &[], None, Some(filter.as_ref()), Deadline::NONE)?;
         while scanner.next() {
             let other = scanner.current_row_id();
             if other != row_id {
