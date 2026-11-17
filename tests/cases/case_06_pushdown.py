@@ -1428,3 +1428,51 @@ INSERT INTO reck VALUES (1);
                             "SELECT STRAIGHT_JOIN k.id, x.t, x.d, x.v FROM reck k JOIN "
                             "(SELECT id, t, d, v FROM recr WHERE id > 0) x "
                             "ON x.id = k.id ORDER BY k.id")
+
+    h.section("sql_select_limit.sql shapes push")
+    limit2 = ["SET SESSION sql_select_limit = 2"]
+    h.assert_pushed("under sql_select_limit", "SELECT id FROM recr ORDER BY id",
+                    setup=limit2)
+    h.assert_pushed("a GROUP BY under sql_select_limit",
+                    "SELECT t, COUNT(*) FROM recr GROUP BY t", setup=limit2)
+    h.assert_pushed("a derived table under sql_select_limit",
+                    "SELECT d.id FROM (SELECT id FROM recr) d ORDER BY d.id DESC",
+                    setup=limit2)
+    h.assert_pushed_union("a UNION under sql_select_limit",
+                          "SELECT id FROM recr UNION ALL SELECT i FROM recr "
+                          "ORDER BY 1", setup=limit2)
+
+    h.section("division_by_zero.sql: a division by a column stays with MariaDB")
+    h.exec_script(f"""
+CREATE TABLE pdz (id INT NOT NULL PRIMARY KEY, d DOUBLE, e DOUBLE) ENGINE={h.engine};
+INSERT INTO pdz VALUES (1, 10, 4), (2, 20, 2);
+""")
+    for label, stmt, direct in (
+            ("a division by a non-zero literal runs direct",
+             "UPDATE pdz SET d = d / 2", True),
+            ("a division by a column does not",
+             "UPDATE pdz SET d = d / e", False),
+            ("nor in the WHERE",
+             "UPDATE pdz SET d = 1 WHERE d / e > 1", False),
+            ("outside strict mode it runs direct",
+             "SET SESSION sql_mode = ''; UPDATE pdz SET d = d / e", True)):
+        before = _direct_hits(h)
+        h.run_client(f"USE {h.db}; {stmt}", use_db=False)
+        took = _direct_hits(h) > before
+        if took == direct:
+            h._pass(label)
+        else:
+            h._fail(label, f"direct={took}")
+
+    h.section("outer_aggregate.sql: an outer query's aggregate stays with MariaDB")
+    h.exec_script(f"""
+CREATE TABLE poa1 (id INT NOT NULL PRIMARY KEY, a INT) ENGINE={h.engine};
+CREATE TABLE poa2 (id INT NOT NULL PRIMARY KEY, b INT) ENGINE={h.engine};
+""")
+    h.assert_not_pushed("an outer column's aggregate in a subquery",
+                        "SELECT (SELECT SUM(poa1.a) FROM poa2) FROM poa1")
+    h.assert_pushed("the subquery's own aggregate of an outer column",
+                    "SELECT id, (SELECT SUM(poa2.b + poa1.a) FROM poa2) FROM poa1")
+    h.assert_pushed("a correlated subquery's aggregate",
+                    "SELECT id, (SELECT SUM(b) FROM poa2 WHERE poa2.id <= poa1.id) "
+                    "FROM poa1")

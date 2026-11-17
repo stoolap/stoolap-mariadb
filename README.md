@@ -293,6 +293,10 @@ marked `-- known-diff-file:` (or `-- known-diff:` on its statements),
 which fails once the scenario matches, so the list stays current.
 
 Types and keys:
+- **DOUBLE arithmetic past the largest DOUBLE** gives infinity in Stoolap,
+  which reads back as `1.7976931348623157e308`, matches in a WHERE and is
+  stored by a direct UPDATE; InnoDB fails the statement (1690)
+  ([stoolap#1102](https://github.com/stoolap/stoolap/issues/1102)).
 - **A single-column PRIMARY KEY** must be stored as an INTEGER (see the
   [DDL table](#ddl)): a `VARCHAR`, `BINARY`, `DECIMAL` or `DOUBLE` one is
   refused (1296). A composite PRIMARY KEY may hold any type.
