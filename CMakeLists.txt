@@ -26,7 +26,7 @@ endif()
 # MariaDB_ROOT    MariaDB install prefix. MARIADB_PREFIX is accepted as a
 #                 backwards-compatible alias.
 # STOOLAP_DIR     Optional: a local stoolap checkout to build against
-#                 instead of the git dependency in rust/Cargo.toml.
+#                 instead of the crates.io release rust/Cargo.toml names.
 # ---------------------------------------------------------------------------
 
 find_package(MariaDB REQUIRED)
@@ -52,9 +52,9 @@ set(STOOLAP_DIR "" CACHE PATH "Local stoolap checkout to build against")
 if(STOOLAP_DIR)
     message(STATUS "stoolap: local checkout ${STOOLAP_DIR}")
     list(APPEND CARGO_ARGS --config
-        "patch.'https://github.com/stoolap/stoolap'.stoolap.path='${STOOLAP_DIR}'")
+        "patch.crates-io.stoolap.path='${STOOLAP_DIR}'")
 else()
-    message(STATUS "stoolap: git main (rust/Cargo.toml)")
+    message(STATUS "stoolap: crates.io release (rust/Cargo.toml)")
 endif()
 # Always runs: cargo decides what is out of date.
 add_custom_target(stoolap_mariadb_rust ALL

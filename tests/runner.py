@@ -266,13 +266,15 @@ class ServerCtx:
                                      stderr=subprocess.DEVNULL,
                                      start_new_session=True)
 
-        # Wait up to ~5s for the socket.
-        for _ in range(50):
-            if os.path.exists(self.sock):
+        # Wait for the socket while the server runs: a restart replays its
+        # logs first, which on a loaded CI runner can take several seconds.
+        for _ in range(300):
+            if os.path.exists(self.sock) or self.proc.poll() is not None:
                 break
             time.sleep(0.1)
-        else:
-            print("runner: server did not come up within 5s; tail of "
+        if not os.path.exists(self.sock):
+            print("runner: server did not come up (exited, or no socket "
+                  "after 30s); tail of "
                   f"{self.errlog}:", file=sys.stderr)
             self._dump_errlog()
             self.stop()
