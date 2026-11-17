@@ -22,7 +22,7 @@ Two things make it fast:
 The aim is InnoDB's behaviour, not just its syntax: results, errors,
 affected-row counts and constraint checks should match. The remaining
 differences are listed under [Known differences](#known-differences),
-each with a scenario in `tests/diff/` that fails once it is fixed.
+most with a scenario in `tests/diff/` that fails once it is fixed.
 
 ## Status
 
@@ -31,7 +31,7 @@ warns on any other series.
 
 CI builds and runs the suite on Ubuntu and macOS against the current
 MariaDB 11.4 release, twice: on the in-memory DSN and on persistent
-`file://` storage (21 case files, about 800 assertions each). The suite
+`file://` storage (23 case files, about 1,100 assertions each). The suite
 includes a differential harness that runs every `tests/diff/*.sql`
 scenario on STOOLAP and on InnoDB and compares each statement's rows,
 errno and affected-row count, and a restart test that stops and kills
@@ -74,9 +74,9 @@ CMakeLists.txt              Build glue: finds MariaDB's headers, builds rust/
                             with cargo and links it in, sets ABI flags,
                             wires the vendored third_party/ headers.
 rust/                       The plugin's Rust crate (static library), with
-                            Stoolap as a dependency (git main; the commit
-                            is pinned in rust/Cargo.lock). Its C ABI is
-                            rust/include/stoolap_mariadb.h.
+                            the Stoolap release from crates.io that
+                            rust/Cargo.toml names as a dependency. Its C
+                            ABI is rust/include/stoolap_mariadb.h.
   src/session.rs            One plugin session: its executor and open
                             transaction, shared by SQL and direct access.
   src/read.rs, key.rs       Scans and key lookups on table handles; key
@@ -101,13 +101,16 @@ src/
                             set operations, derived tables, UPDATE, DELETE.
   stoolap_types.h           How each MariaDB type is stored in Stoolap.
   stoolap_bridge.{h,cc}     RAII wrappers over the C ABI, the process-wide
-                            engine handle, statistics counters, table names.
+                            engine handle, statistics counters, table
+                            names, and the ids of an AUTO_INCREMENT column
+                            other than the PRIMARY KEY.
   stoolap_thd_context.{h,cc} Per-connection state: the session's engine
-                            handle, its transaction, record-count and
-                            AUTO_INCREMENT caches.
+                            handle, its transaction and record-count
+                            cache.
   stoolap_thd_inspect.{h,cc} The few readers of THD / LEX internals
                             (FOREIGN KEYs from the parser, ALTER renames).
-  stoolap_packet.h          Parsers for Stoolap's packed result buffers.
+  stoolap_packet.h          Stoolap's packed values into MariaDB's fields,
+                            as stored, whatever the session's sql_mode.
 third_party/                Vendored wsrep headers MariaDB's headers need
                             (see NOTICE).
 tests/                      Python integration harness (see Testing).
@@ -179,8 +182,9 @@ than a statement Stoolap parses and plans for one row.
 
 DELETE without WHERE is such a statement too: inside the transaction,
 with the foreign keys' ON DELETE actions. `TRUNCATE TABLE` runs Stoolap's
-TRUNCATE, resets AUTO_INCREMENT and refuses a table a foreign key
-references.
+TRUNCATE and resets AUTO_INCREMENT; on a table a FOREIGN KEY names, it
+is refused only while a child row names one of its rows (see
+[Known differences](#known-differences)).
 
 ### Value storage
 
@@ -194,7 +198,8 @@ MariaDB's (`src/stoolap_types.h`):
 | ENUM / SET | INTEGER | the index / bit mask MariaDB sorts by |
 | BINARY / VARBINARY / BLOB, and text in latin1 etc. | TEXT | uppercase hex of the bytes, which keeps their order |
 | DECIMAL | TEXT | the decimal string |
-| integers, doubles, utf8 text | INTEGER / FLOAT / TEXT | as is |
+| INET6, UUID and other plugin types | TEXT | their text form |
+| integers, YEAR, BIT, doubles, utf8 text | INTEGER / FLOAT / TEXT | as is (a `BIGINT UNSIGNED` up to 2^63 - 1) |
 
 A pushed query or a direct UPDATE that would compare or compute with
 the stored form of a DECIMAL or hex-encoded column stays with MariaDB.
@@ -208,7 +213,9 @@ Tables created by an older build of the plugin must be re-created.
 | --- | --- |
 | Numeric, string, BLOB, DATE / TIME / DATETIME / TIMESTAMP, DECIMAL, ENUM / SET, JSON columns | Yes (stored as in [Value storage](#value-storage)) |
 | Character sets other than utf8 | Yes (stored as hex; not pushed) |
-| `PRIMARY KEY`, `UNIQUE`, single-column or composite | Yes |
+| `PRIMARY KEY` on one column stored as an INTEGER: integers, DATE / DATETIME / TIME / TIMESTAMP, ENUM / SET, YEAR, BIT | Yes |
+| `PRIMARY KEY` on one column of another type: strings, BINARY, DECIMAL, FLOAT / DOUBLE | Refused (1296): Stoolap's single-column PRIMARY KEY is an INTEGER. A composite PRIMARY KEY may hold any type |
+| Composite `PRIMARY KEY`; `UNIQUE`, single-column or composite | Yes |
 | `KEY` / `CREATE INDEX`, single-column or composite | Yes (one Stoolap index over all parts) |
 | `UNIQUE` on a case-insensitive collation (`_ci`, `VARCHAR` / `CHAR`) | Yes: kept on a hidden column of each value's collation key (its `WEIGHT_STRING`), so it refuses what the collation holds equal; exact lookups by the key read it |
 | `PRIMARY KEY` on a case-insensitive collation; `UNIQUE` on a case-insensitive `TEXT`, a `CHAR` under a `NO PAD` collation, or under a Czech or big5 collation | Refused (Stoolap compares bytes: use a `_bin` collation) |
@@ -216,11 +223,11 @@ Tables created by an older build of the plugin must be re-created.
 | `FOREIGN KEY` | Yes: single-column, to a PRIMARY KEY or UNIQUE column, of another table or its own; RESTRICT, NO ACTION, CASCADE, SET NULL |
 | Composite `FOREIGN KEY` | Refused |
 | FOREIGN KEYs through a copying `ALTER TABLE` | A table's own keys are kept, following renamed columns (a table other tables' keys name is refused, see [Known differences](#known-differences)); the copy is checked whole once its rows are in (1452), so the order they are copied in does not matter; dropping a key column is refused |
-| `DROP TABLE` of a referenced parent | Refused with 1451, as InnoDB does (not with `foreign_key_checks = 0`); `DROP DATABASE` drops its own children first |
+| `DROP TABLE` of a referenced parent | Refused with 1451, as InnoDB does, and also under `foreign_key_checks = 0`, where InnoDB drops it (see [Known differences](#known-differences)); `DROP DATABASE` drops its own children first |
 | `RENAME TABLE` | Yes (children's FOREIGN KEYs follow the parent) |
 | `ALTER TABLE` ADD / DROP / CHANGE COLUMN, ADD / DROP INDEX | Yes |
-| `ALTER TABLE` in place (`ALGORITHM=INPLACE`) | One column added at the end (with a constant default), dropped or renamed, non-unique indexes added and dropped, defaults changed (`INSTANT`); any other ALTER, or one changing more than one column, copies the table, as does a column change of a table with a case-insensitive `UNIQUE` key |
-| `TRUNCATE TABLE` | Yes |
+| `ALTER TABLE` in place (`ALGORITHM=INPLACE`) | One column added at the end (with a constant default), dropped or renamed, non-unique indexes added and dropped, `AUTO_INCREMENT = n`, defaults changed (`INSTANT`); any other ALTER, or one changing more than one column, copies the table, as does a column change of a table with a case-insensitive `UNIQUE` key |
+| `TRUNCATE TABLE` | Yes (resets AUTO_INCREMENT) |
 | `AUTO_INCREMENT` | Yes (see [Known differences](#known-differences)) |
 | Generated columns (VIRTUAL / STORED) | Refused (1910) |
 | `COMPRESSED` BLOB / TEXT | Refused (`COMPRESSED` VARCHAR works) |
@@ -282,31 +289,33 @@ class covers increments `Stoolap_unmapped_errors`.
 ## Known differences
 
 Differences from InnoDB that remain. Each has a scenario in `tests/diff/`
-marked `-- known-diff-file:`, which fails once the scenario matches, so
-the list stays current.
+marked `-- known-diff-file:` (or `-- known-diff:` on its statements),
+which fails once the scenario matches, so the list stays current.
 
-- **`ALTER TABLE ... AUTO_INCREMENT = N`** below the next id stops past
-  the ids of rows deleted after stoolap wrote them to disk (file://),
-  until compaction drops them; InnoDB goes down to `MAX + 1`. No scenario
-  in `tests/diff/`: the runner cannot make stoolap write rows to disk.
-- **AUTO_INCREMENT on a column other than the PRIMARY KEY** is recomputed
-  from `MAX(col) + 1` after DDL.
+Types and keys:
+- **A single-column PRIMARY KEY** must be stored as an INTEGER (see the
+  [DDL table](#ddl)): a `VARCHAR`, `BINARY`, `DECIMAL` or `DOUBLE` one is
+  refused (1296). A composite PRIMARY KEY may hold any type.
+- **A `BIGINT UNSIGNED` value past 2^63 - 1** is refused (1112): Stoolap's
+  INTEGER is signed 64-bit.
 - **`utf8mb4_bin` UNIQUE** ignores PAD SPACE (`'a'` and `'a '` are both
   accepted).
+- **`HA_READ_PREFIX_LAST`** (MAX with a prefix bound) is not supported.
+
+AUTO_INCREMENT:
+- **AUTO_INCREMENT on a column other than the PRIMARY KEY** is recomputed
+  from `MAX(col) + 1` after a copying ALTER, a RENAME or an index change,
+  so the ids of deleted top rows are handed out again. A PRIMARY KEY's
+  ids come from Stoolap's own counter and match InnoDB's.
+
+FOREIGN KEYs:
 - **A FOREIGN KEY to an indexed non-unique column** is refused.
-- **A copying `ALTER TABLE` of a table another table's FOREIGN KEY names**
-  is refused (1296): MariaDB swaps the copy in by renames, and a rename
-  takes the keys to the old table
-  ([stoolap#987](https://github.com/stoolap/stoolap/issues/987)). An
-  ALTER done in place keeps the table, and runs.
-- **A parent whose child stays is not dropped under
-  `foreign_key_checks = 0`** (1451). InnoDB drops it and keeps the child's
-  key naming no table, which stoolap cannot keep. Listed with its children
-  in one `DROP TABLE`, it is dropped.
-- **A copying `ALTER TABLE` does not run online**: `LOCK=NONE` is refused
-  (1846), and writes wait for the ALTER. MariaDB replays the writes made
-  during an online ALTER from their row events, which a direct UPDATE or
-  DELETE does not write.
+- **A FOREIGN KEY to a case-insensitive `UNIQUE` column** is refused
+  (1296): Stoolap keeps that key on the hidden key column, so it finds no
+  UNIQUE index on the column the key names.
+- **A FOREIGN KEY on a case-insensitive `UNIQUE` column** with ON UPDATE
+  CASCADE / SET NULL or ON DELETE SET NULL is refused (1296): Stoolap's
+  actions would write the column without its hidden key.
 - **A row whose FOREIGN KEY names that row itself** is deleted, or its
   key moved together with the value naming it, as that leaves no row
   naming a missing one; InnoDB refuses both (1451), also under RESTRICT.
@@ -316,33 +325,45 @@ the list stays current.
 - **On a table a FOREIGN KEY names that has no primary key**, the row
   pump cannot name a row: an UPDATE with ORDER BY / LIMIT fails (1296),
   and an UPDATE of a UNIQUE column is checked as a set.
-- **A FOREIGN KEY to a case-insensitive `UNIQUE` column** is refused
-  (1296): Stoolap keeps that key on the hidden key column, so it finds no
-  UNIQUE index on the column the key names.
-- **A FOREIGN KEY on a case-insensitive `UNIQUE` column** with ON UPDATE
-  CASCADE / SET NULL or ON DELETE SET NULL is refused (1296): Stoolap's
-  actions would write the column without its hidden key.
-- **`HA_READ_PREFIX_LAST`** (MAX with a prefix bound) is not supported.
+- **`TRUNCATE` of a table a FOREIGN KEY names** is refused (1451) only
+  while a child row names one of its rows; InnoDB refuses it always
+  (1701).
+- **A parent whose child stays is not dropped under
+  `foreign_key_checks = 0`** (1451). InnoDB drops it and keeps the child's
+  key naming no table, which Stoolap cannot keep. Listed with its children
+  in one `DROP TABLE`, it is dropped.
+
+DDL and locking:
+- **A copying `ALTER TABLE` of a table another table's FOREIGN KEY names**
+  is refused (1296): MariaDB swaps the copy in by renames, and a Stoolap
+  rename takes the keys with the table, by design
+  ([stoolap#987](https://github.com/stoolap/stoolap/issues/987)). An
+  ALTER done in place keeps the table, and runs.
+- **A copying `ALTER TABLE` does not run online**: `LOCK=NONE` is refused
+  (1846), and writes wait for the ALTER. MariaDB replays the writes made
+  during an online ALTER from their row events, which a direct UPDATE or
+  DELETE does not write.
 - **`LOCK TABLES` with `autocommit = 0`** runs the statements after
   COMMIT in autocommit.
 
-Also:
+Also, without a scenario:
 - **Case-insensitive collations** compare in MariaDB, not in Stoolap: a
   query or UPDATE that compares such strings stays with MariaDB, unless
   `stoolap_trust_binary_strings = 1`.
 - **"Rows matched"** of a direct UPDATE comes from a count before the
-  UPDATE; in autocommit, a commit between the two can make it off
-  ([stoolap#936](https://github.com/stoolap/stoolap/issues/936)).
+  UPDATE; in autocommit, a commit between the two can make it off.
   Affected rows are exact.
 - **A strict-mode range or length error** from a direct UPDATE names row
   1, since the failing row is not known.
 - **Tables a FOREIGN KEY names** are written through SQL, so Stoolap's
   executor checks the keys: slower than the direct write path.
-- **A FOREIGN KEY under concurrent writes**: a child INSERT does not see a
-  parent DELETE another transaction has not committed yet, and both
-  commit, leaving the child without its parent (InnoDB makes the INSERT
-  wait on the parent's lock)
-  ([stoolap#953](https://github.com/stoolap/stoolap/issues/953)).
+- **A child INSERT beside an uncommitted parent DELETE** fails at once
+  with 1213; InnoDB waits for the parent's lock and fails with 1452 once
+  the DELETE commits. Neither leaves an orphan row.
+- **`ALTER TABLE ... AUTO_INCREMENT = N`** below the next id stops past
+  the ids of rows deleted after Stoolap wrote them to disk (`file://`),
+  until compaction drops them; InnoDB goes down to `MAX + 1`. The test
+  runner cannot make Stoolap write rows to disk.
 
 ## Build
 
@@ -361,11 +382,10 @@ Also:
    It also tries `mariadb_config --prefix`. Pass `-DMariaDB_ROOT=<path>`
    to override (`MARIADB_PREFIX` is accepted too).
 
-2. **A stable Rust toolchain** (`cargo`). The build fetches Stoolap from
-   git at the commit pinned in `rust/Cargo.lock`;
-   `cargo update --manifest-path rust/Cargo.toml -p stoolap` moves it to
-   main's head. CI does that nightly, so upstream changes that break the
-   crate show up there first.
+2. **A stable Rust toolchain** (`cargo`). The build takes Stoolap from
+   crates.io, at the release `rust/Cargo.toml` names. CI's nightly run
+   builds against Stoolap's main branch instead, so upstream changes that
+   break the crate show up there first.
 
 ### Compile
 
@@ -386,9 +406,9 @@ Set in `CMakeLists.txt`; worth knowing when something fails to load:
 - No `-fvisibility=hidden`: `maria_declare_plugin` emits its symbols
   without default visibility, and the server would not find them.
 - No `-fno-rtti`: MariaDB's `field.h` uses `dynamic_cast`.
-- `ha_stoolap.cc` does not include `sql_class.h`; the files that read
-  THD / LEX internals do, with the wsrep headers it needs vendored under
-  `third_party/` (Homebrew's MariaDB does not ship them).
+- `sql_class.h`, which the code reading THD / LEX internals includes,
+  needs wsrep headers that Homebrew's MariaDB does not ship; they are
+  vendored under `third_party/`.
 - Server symbols resolve when `mariadbd` loads the plugin
   (`-undefined dynamic_lookup` on macOS,
   `--unresolved-symbols=ignore-in-shared-libs` on Linux); on macOS the
@@ -396,7 +416,10 @@ Set in `CMakeLists.txt`; worth knowing when something fails to load:
 
 ## Install
 
-Stoolap is linked into `ha_stoolap.so`, so it is the only file to copy:
+Each [release](https://github.com/stoolap/stoolap-mariadb/releases) has
+`ha_stoolap.so` built for macOS (arm64, Homebrew's MariaDB 11.4) and
+Linux (x86_64, MariaDB 11.4 from MariaDB's repository). Stoolap is
+linked into it, so it is the only file to copy:
 
 ```sh
 sudo install -m 0755 build/ha_stoolap.so "$(mariadb_config --plugindir)/"
@@ -471,25 +494,25 @@ To add a regression for a difference from InnoDB, add a scenario there.
 
 `benchmarks/bench.py` runs the same workload on STOOLAP and InnoDB under
 one server (10K rows; the shapes of Stoolap's own
-`examples/benchmark.rs`). One run on an Apple M5, MariaDB 11.4.13,
-in-memory DSN: Stoolap won 44 operations and InnoDB none, the rest tied.
-Some of them:
+`examples/benchmark.rs`). One run of v0.5.0 (Stoolap 0.5.0) on an Apple
+M5, MariaDB 11.4.13, in-memory DSN: Stoolap won 46 operations and InnoDB
+none, the rest tied. Some of them:
 
 | Operation | STOOLAP | InnoDB | Ratio |
 | --- | ---: | ---: | ---: |
-| Nested subquery (3 levels) | 150 us | 9886 us | 66x |
-| Compare with subquery | 134 us | 4335 us | 32x |
-| Window ROW_NUMBER (PK) | 58 us | 1687 us | 29x |
-| NOT IN subquery | 147 us | 3318 us | 23x |
-| UNION ALL | 66 us | 1311 us | 20x |
-| INNER JOIN | 104 us | 1038 us | 10x |
-| Aggregation (GROUP BY) | 153 us | 1055 us | 6.9x |
-| UPDATE complex (a range) | 141 us | 307 us | 2.2x |
-| Batch INSERT (100 rows) | 300 us | 383 us | 1.3x |
-| INSERT single | 17 us | 20 us | 1.2x |
-| UPDATE by ID | 19 us | 22 us | 1.15x |
-| DELETE by ID | 16 us | 18 us | 1.15x |
-| SELECT by ID | 26 us | 24 us | 0.95x |
+| Nested subquery (3 levels) | 235 us | 16307 us | 69x |
+| Compare with subquery | 179 us | 5625 us | 31x |
+| Window ROW_NUMBER (PK) | 77 us | 2178 us | 28x |
+| NOT IN subquery | 195 us | 4365 us | 22x |
+| UNION ALL | 82 us | 1604 us | 20x |
+| INNER JOIN | 125 us | 1285 us | 10x |
+| Aggregation (GROUP BY) | 204 us | 1380 us | 6.8x |
+| UPDATE complex (a range) | 181 us | 446 us | 2.5x |
+| Batch INSERT (100 rows) | 390 us | 562 us | 1.4x |
+| DELETE by ID | 20 us | 23 us | 1.18x |
+| INSERT single | 23 us | 26 us | 1.17x |
+| UPDATE by ID | 21 us | 25 us | 1.17x |
+| SELECT by ID | 34 us | 31 us | 0.93x |
 
 Analytical shapes (joins, subqueries, window functions, aggregates) are
 where Stoolap's executor pulls ahead. Point lookups and writes are close
