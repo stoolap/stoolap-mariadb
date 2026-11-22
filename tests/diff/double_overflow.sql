@@ -1,4 +1,5 @@
--- known-diff-file: DOUBLE arithmetic past the largest DOUBLE gives infinity in Stoolap, which reads back as 1.7976931348623157e308, matches in a WHERE and is stored by a direct UPDATE; InnoDB fails the statement (1690) (stoolap#1102)
+-- DOUBLE arithmetic past the largest DOUBLE fails the statement (1690),
+-- in the SELECT list, a WHERE and a direct UPDATE (stoolap#1102)
 CREATE TABLE o (id INT PRIMARY KEY, d DOUBLE) ENGINE={E};
 INSERT INTO o VALUES (1, 1e308), (2, 1);
 SELECT id, d * 10 FROM o ORDER BY id;

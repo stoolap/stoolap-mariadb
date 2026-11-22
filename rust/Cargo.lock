@@ -749,9 +749,9 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "stoolap"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3766221eabe72eb6675091a2cc1ed6d019bdf9942cecb205ac87f6103a7e3837"
+checksum = "0882476f585354fb4724001d370ca92aff8d4ce2502438726e0c50f982c3323e"
 dependencies = [
  "ahash",
  "chrono",
@@ -771,7 +771,6 @@ dependencies = [
  "rayon",
  "regex",
  "roaring",
- "rustc-hash",
  "serde",
  "serde_json",
  "sha1",
@@ -787,9 +786,9 @@ dependencies = [
 
 [[package]]
 name = "stoolap-jemalloc"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "686a6d083a8743ab9f88ddc1240c4619345fd90a9d32491102f29b878378a51b"
+checksum = "775ad052d82e2e6c076e64bd6908996c0ae0a86897c04f4bcfa52f721317f548"
 dependencies = [
  "backtrace",
  "libc",
@@ -798,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "stoolap_mariadb"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "rustc-hash",
