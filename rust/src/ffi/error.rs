@@ -182,8 +182,10 @@ fn class_of_text(m: &str) -> (i32, i32) {
         STOOLAP_ERR_UNSUPPORTED
     } else if starts("type error: Integer overflow in arithmetic operation: ")
         || starts("type error: Integer overflow in ABS: ")
+        || starts("type error: Float overflow in arithmetic operation: ")
     {
-        // As MariaDB's BIGINT arithmetic fails (a SUM is a DECIMAL there)
+        // As MariaDB's BIGINT and DOUBLE arithmetic fail (a SUM is a
+        // DECIMAL there)
         STOOLAP_ERR_OUT_OF_RANGE
     } else if [
         "parse error",
@@ -274,6 +276,10 @@ mod tests {
         );
         assert_eq!(
             c("type error: Integer overflow in ABS: -9223372036854775808").0,
+            STOOLAP_ERR_OUT_OF_RANGE
+        );
+        assert_eq!(
+            c("type error: Float overflow in arithmetic operation: 1e308 and 10").0,
             STOOLAP_ERR_OUT_OF_RANGE
         );
         assert_eq!(

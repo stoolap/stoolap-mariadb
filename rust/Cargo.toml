@@ -1,6 +1,6 @@
 [package]
 name = "stoolap_mariadb"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "The MariaDB plugin's native interface to the stoolap engine"
@@ -10,7 +10,7 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-stoolap = { version = "0.5.0", default-features = false, features = ["parallel", "jemalloc"] }
+stoolap = { version = "0.5.1", default-features = false, features = ["parallel", "jemalloc"] }
 
 rustc-hash = "1.1"
 chrono = "0.4"

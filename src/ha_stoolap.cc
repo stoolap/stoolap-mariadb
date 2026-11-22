@@ -3223,8 +3223,8 @@ maria_declare_plugin(stoolap){
     PLUGIN_LICENSE_BSD, /* see README: revisit Apache vs MariaDB plugin license */
     stoolap_init_func,
     stoolap_done_func,
-    0x0500,              /* version 5.0 */
+    0x0501,              /* version 5.1 */
     stoolap_status_vars, /* status variables */
     stoolap_system_variables,
-    "0.5.0",
+    "0.5.1",
     MariaDB_PLUGIN_MATURITY_ALPHA} maria_declare_plugin_end;

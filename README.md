@@ -280,7 +280,7 @@ by its wording only where no value is kept) and raised as MariaDB's own:
 | Parent row or table still referenced | `ER_ROW_IS_REFERENCED_2` 1451 |
 | Write conflict, lock, schema change mid-statement | `ER_LOCK_DEADLOCK` 1213 |
 | Table exists / table not found | 1050 / 1146 |
-| Integer arithmetic past BIGINT (`+ - *`, negation, ABS) | `ER_DATA_OUT_OF_RANGE` 1690, naming the operands |
+| Integer arithmetic past BIGINT (`+ - *`, negation, ABS), DOUBLE arithmetic past the largest DOUBLE | `ER_DATA_OUT_OF_RANGE` 1690, naming the operands |
 | Anything else | 1296 with Stoolap's message |
 
 An error found at COMMIT is raised with the same class. A message no
@@ -293,10 +293,6 @@ marked `-- known-diff-file:` (or `-- known-diff:` on its statements),
 which fails once the scenario matches, so the list stays current.
 
 Types and keys:
-- **DOUBLE arithmetic past the largest DOUBLE** gives infinity in Stoolap,
-  which reads back as `1.7976931348623157e308`, matches in a WHERE and is
-  stored by a direct UPDATE; InnoDB fails the statement (1690)
-  ([stoolap#1102](https://github.com/stoolap/stoolap/issues/1102)).
 - **A single-column PRIMARY KEY** must be stored as an INTEGER (see the
   [DDL table](#ddl)): a `VARCHAR`, `BINARY`, `DECIMAL` or `DOUBLE` one is
   refused (1296). A composite PRIMARY KEY may hold any type.
